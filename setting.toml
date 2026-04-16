@@ -1,0 +1,27 @@
+[logging]
+level = "INFO"
+directory = "logs"
+
+[server]
+protocol_version = "2025-06-18"
+server_name = "ida-stdio-mcp"
+server_version = "0.1.0"
+
+[directory_analysis]
+recursive = true
+max_candidates = 20
+max_deep_analysis = 5
+include_extensions = [
+  ".exe",
+  ".dll",
+  ".sys",
+  ".elf",
+  ".so",
+  ".bin",
+]
+exclude_patterns = [
+  "*.i64",
+  "*.idb",
+  "*.nam",
+  "*.til",
+]

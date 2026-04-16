@@ -1,0 +1,17 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+*.i64
+*.idb
+*.nam
+*.til
+
+# Virtual environments
+.venv
+
+# 运行产物
+logs/

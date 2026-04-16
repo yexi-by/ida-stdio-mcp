@@ -1,0 +1,42 @@
+[project]
+name = "ida-stdio-mcp"
+version = "0.1.0"
+description = "仅支持 IDA Headless + 原生 stdio 的 MCP 服务"
+readme = "README.md"
+authors = [
+    { name = "yexi", email = "fanguojun066@gmail.com" }
+]
+requires-python = ">=3.11"
+dependencies = [
+    "idapro>=0.0.7",
+    "loguru>=0.7.3",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+ida-stdio-mcp = "ida_stdio_mcp.main:main"
+ida-stdio-mcp-test = "ida_stdio_mcp.test_runner:main"
+
+[build-system]
+requires = ["uv_build>=0.9.27,<0.10.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.39.1",
+]
+
+[tool.basedpyright]
+include = [
+    "src",
+    "tests",
+]
+typeCheckingMode = "basic"
+reportMissingModuleSource = "none"
+reportArgumentType = "none"
+reportReturnType = "none"
+reportIndexIssue = "none"
+reportOptionalSubscript = "none"
+reportCallIssue = "none"
+reportUninitializedInstanceVariable = "none"
+pythonVersion = "3.11"
