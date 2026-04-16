@@ -10,7 +10,7 @@ from typing import cast
 from loguru import logger
 
 from .models import JsonObject
-from .tool_registry import ToolRegistry
+from .tool_registry import ResourceRegistry, ToolRegistry
 
 
 @dataclass(slots=True, frozen=True)
@@ -23,10 +23,16 @@ class ServerIdentity:
 
 
 class StdioMcpServer:
-    """最小可用的 stdio MCP 服务器。"""
+    """支持 tools 与 resources 的最小 stdio MCP 服务。"""
 
-    def __init__(self, registry: ToolRegistry, identity: ServerIdentity) -> None:
-        self._registry = registry
+    def __init__(
+        self,
+        tools: ToolRegistry,
+        resources: ResourceRegistry,
+        identity: ServerIdentity,
+    ) -> None:
+        self._tools = tools
+        self._resources = resources
         self._identity = identity
 
     def serve(self) -> int:
@@ -91,7 +97,7 @@ class StdioMcpServer:
             return None
 
         if method == "tools/list":
-            return self._ok_response(request_id, {"tools": self._registry.list_tools()})
+            return self._ok_response(request_id, {"tools": self._tools.list_tools()})
 
         if method == "tools/call":
             params = request_obj.get("params")
@@ -102,7 +108,7 @@ class StdioMcpServer:
             if not isinstance(tool_name, str) or not isinstance(arguments, dict):
                 return self._error_response(request_id, -32602, "tools/call 参数格式错误")
             try:
-                result = self._registry.call(tool_name, cast(JsonObject, arguments))
+                result = self._tools.call(tool_name, cast(JsonObject, arguments))
             except Exception as exc:
                 logger.exception("工具调用失败：{}", tool_name)
                 return self._ok_response(
@@ -119,7 +125,39 @@ class StdioMcpServer:
                         "isError": True,
                     },
                 )
-            return self._ok_response(request_id, self._registry.format_tool_result(result))
+            return self._ok_response(request_id, self._tools.format_tool_result(result))
+
+        if method == "resources/list":
+            return self._ok_response(request_id, {"resources": self._resources.list_resources()})
+
+        if method == "resources/templates/list":
+            return self._ok_response(request_id, {"resourceTemplates": self._resources.list_templates()})
+
+        if method == "resources/read":
+            params = request_obj.get("params")
+            if not isinstance(params, dict):
+                return self._error_response(request_id, -32602, "resources/read 缺少 params")
+            uri = params.get("uri")
+            if not isinstance(uri, str):
+                return self._error_response(request_id, -32602, "resources/read 需要字符串 uri")
+            try:
+                contents, is_error = self._resources.read(uri)
+            except Exception as exc:
+                logger.exception("资源读取失败：{}", uri)
+                return self._ok_response(
+                    request_id,
+                    {
+                        "contents": [
+                            {
+                                "uri": uri,
+                                "mimeType": "application/json",
+                                "text": json.dumps({"error": str(exc)}, ensure_ascii=False),
+                            }
+                        ],
+                        "isError": True,
+                    },
+                )
+            return self._ok_response(request_id, {"contents": contents, "isError": is_error})
 
         return self._error_response(request_id, -32601, f"未知方法：{method}")
 

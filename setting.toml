@@ -5,7 +5,18 @@ directory = "logs"
 [server]
 protocol_version = "2025-06-18"
 server_name = "ida-stdio-mcp"
-server_version = "0.1.0"
+server_version = "0.2.0"
+default_input_path = ""
+
+[feature_gates]
+allow_unsafe = false
+allow_debugger = false
+
+[limits]
+default_page_size = 100
+max_page_size = 1000
+max_search_hits = 1000
+max_callgraph_depth = 4
 
 [directory_analysis]
 recursive = true

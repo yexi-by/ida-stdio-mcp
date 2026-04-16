@@ -1,6 +1,6 @@
 [project]
 name = "ida-stdio-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "仅支持 IDA Headless + 原生 stdio 的 MCP 服务"
 readme = "README.md"
 authors = [
@@ -30,6 +30,9 @@ dev = [
 include = [
     "src",
     "tests",
+]
+exclude = [
+    "tests/fixtures",
 ]
 typeCheckingMode = "basic"
 reportMissingModuleSource = "none"

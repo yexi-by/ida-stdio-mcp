@@ -1,4 +1,4 @@
-"""真实 headless 集成测试。"""
+"""真实 idalib headless 集成测试。"""
 
 from __future__ import annotations
 
@@ -6,45 +6,511 @@ import os
 import unittest
 from pathlib import Path
 
+from ida_stdio_mcp.config import load_config
+from ida_stdio_mcp.service import build_service
 from ida_stdio_mcp.runtime import HeadlessRuntime
+from ida_stdio_mcp.stdio_server import ServerIdentity, StdioMcpServer
 
 
 class HeadlessToolTests(unittest.TestCase):
-    """验证 runtime 的核心只读能力。"""
+    """覆盖多会话、资源读取、目录分析与危险工具。"""
+
+    @staticmethod
+    def _repo_root() -> Path:
+        return Path(__file__).resolve().parents[2]
 
     @classmethod
     def setUpClass(cls) -> None:
-        binary_path = os.environ.get("IDA_STDIO_MCP_TEST_BINARY")
-        if not binary_path:
-            raise unittest.SkipTest("缺少 IDA_STDIO_MCP_TEST_BINARY")
-        cls.runtime = HeadlessRuntime()
-        cls.runtime.open_binary(Path(binary_path))
+        cls.repo_root = cls._repo_root()
+        cls.elf_fixture = Path(
+            os.environ.get(
+                "IDA_STDIO_MCP_TEST_BINARY",
+                str(cls.repo_root / "tests" / "fixtures" / "crackme03.elf"),
+            )
+        ).resolve()
+        cls.pe_fixture = (cls.repo_root / "tests" / "fixtures" / "minimal_pe.exe").resolve()
+        cls.mixed_fixture = (cls.repo_root / "tests" / "fixtures" / "mixed").resolve()
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.runtime.close_binary()
+    def setUp(self) -> None:
+        self.config = load_config(self.repo_root / "setting.toml")
+        self.runtime = HeadlessRuntime()
+        self.service = build_service(
+            self.runtime,
+            self.config,
+            allow_unsafe=True,
+            allow_debugger=True,
+            profile_path=None,
+        )
+        self.server = StdioMcpServer(
+            tools=self.service.tools,
+            resources=self.service.resources,
+            identity=ServerIdentity(
+                protocol_version=self.config.server.protocol_version,
+                server_name=self.config.server.server_name,
+                server_version=self.config.server.server_version,
+            ),
+        )
 
-    def test_health_and_survey(self) -> None:
-        health = self.runtime.health()
-        self.assertTrue(health["runtime_ready"])
-        self.assertTrue(health["binary_open"])
-        survey = self.runtime.survey_binary()
-        stats = survey["statistics"]
-        self.assertGreater(stats["function_count"], 0)
+    def tearDown(self) -> None:
+        self.runtime.shutdown()
 
-    def test_list_functions_and_disassemble(self) -> None:
-        functions = self.runtime.list_functions()
-        self.assertGreater(len(functions), 0)
-        target = functions[0]["addr"]
-        lines = self.runtime.disassemble_function(target, max_lines=8)
-        self.assertGreater(len(lines), 0)
+    def _call_tool(self, name: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
+        response = self.server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": name, "arguments": arguments or {}},
+            }
+        )
+        self.assertIsNotNone(response)
+        assert response is not None
+        result = response["result"]["structuredContent"]
+        self.assertIsInstance(result, dict)
+        return result
 
-    def test_strings_and_decompile(self) -> None:
-        strings = self.runtime.list_strings()
-        self.assertIsInstance(strings, list)
-        functions = self.runtime.list_functions()
-        result = self.runtime.decompile_function(functions[0]["addr"])
-        self.assertIn(result["representation"], {"hexrays", "asm_fallback"})
+    def _read_resource(self, uri: str) -> dict[str, object]:
+        response = self.server._dispatch(
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "resources/read",
+                "params": {"uri": uri},
+            }
+        )
+        self.assertIsNotNone(response)
+        assert response is not None
+        result = response["result"]
+        self.assertIsInstance(result, dict)
+        return result
+
+    def test_multi_session_open_switch_close_and_resources(self) -> None:
+        opened_elf = self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "elf"})
+        self.assertEqual(opened_elf["status"], "ok")
+        opened_pe = self._call_tool("open_binary", {"path": str(self.pe_fixture), "session_id": "pe"})
+        self.assertEqual(opened_pe["status"], "ok")
+
+        listing = self._call_tool("list_binaries")
+        self.assertEqual(listing["status"], "ok")
+        data = listing["data"]
+        self.assertIsInstance(data, list)
+        assert isinstance(data, list)
+        session_ids = [
+            str(item["session_id"])
+            for item in data
+            if isinstance(item, dict) and isinstance(item.get("session_id"), str)
+        ]
+        self.assertIn("elf", session_ids)
+        self.assertIn("pe", session_ids)
+
+        switched = self._call_tool("switch_binary", {"session_id": "elf"})
+        self.assertEqual(switched["status"], "ok")
+
+        current_resource = self._read_resource("ida://session/current")
+        contents = current_resource["contents"]
+        self.assertIsInstance(contents, list)
+        self.assertGreater(len(contents), 0)
+        first = contents[0]
+        self.assertIsInstance(first, dict)
+        text = first.get("text")
+        self.assertIsInstance(text, str)
+        self.assertIn("elf", text)
+
+        metadata = self._read_resource("ida://idb/metadata")
+        self.assertFalse(bool(metadata.get("isError", False)))
+
+        close_pe = self._call_tool("close_binary", {"session_id": "pe"})
+        self.assertEqual(close_pe["status"], "ok")
+
+    def test_core_read_tools_and_unsafe_write_tool(self) -> None:
+        self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "elf-main"})
+
+        survey = self._call_tool("survey_binary", {"session_id": "elf-main"})
+        self.assertIn(survey["status"], ("ok", "degraded"))
+
+        functions = self._call_tool("list_functions", {"queries": [{"filter": "main", "count": 20}], "session_id": "elf-main"})
+        self.assertEqual(functions["status"], "ok")
+
+        single = self._call_tool("get_function", {"query": "main", "session_id": "elf-main"})
+        self.assertEqual(single["status"], "ok")
+
+        decompile = self._call_tool("decompile_function", {"addr": "main", "session_id": "elf-main"})
+        self.assertIn(decompile["status"], ("ok", "degraded", "unsupported"))
+
+        disasm = self._call_tool("disassemble_function", {"addr": "main", "session_id": "elf-main"})
+        self.assertEqual(disasm["status"], "ok")
+
+        strings_page = self._call_tool("list_strings", {"limit": 20, "session_id": "elf-main"})
+        self.assertEqual(strings_page["status"], "ok")
+
+        comment = self._call_tool(
+            "set_comments",
+            {
+                "items": [{"addr": "main", "comment": "ida-stdio-mcp 集成测试注释", "repeatable": False}],
+                "session_id": "elf-main",
+            },
+        )
+        self.assertEqual(comment["status"], "ok")
+
+        capabilities = self._read_resource("ida://idb/capabilities")
+        self.assertFalse(bool(capabilities.get("isError", False)))
+
+        survey_resource = self._read_resource("ida://survey")
+        self.assertFalse(bool(survey_resource.get("isError", False)))
+
+        functions_resource = self._read_resource("ida://functions")
+        self.assertFalse(bool(functions_resource.get("isError", False)))
+
+        strings_resource = self._read_resource("ida://strings")
+        self.assertFalse(bool(strings_resource.get("isError", False)))
+
+        imports_categories = self._read_resource("ida://imports/categories")
+        self.assertFalse(bool(imports_categories.get("isError", False)))
+
+        callgraph_summary = self._read_resource("ida://callgraph/summary")
+        self.assertFalse(bool(callgraph_summary.get("isError", False)))
+
+        managed_summary = self._read_resource("ida://managed/summary")
+        self.assertFalse(bool(managed_summary.get("isError", False)))
+
+        managed_types = self._read_resource("ida://managed/types")
+        self.assertFalse(bool(managed_types.get("isError", False)))
+
+        managed_namespaces = self._read_resource("ida://managed/namespaces")
+        self.assertFalse(bool(managed_namespaces.get("isError", False)))
+
+        function_profiles = self._read_resource("ida://functions/profiles")
+        self.assertFalse(bool(function_profiles.get("isError", False)))
+
+        function_resource = self._read_resource("ida://function/main")
+        self.assertFalse(bool(function_resource.get("isError", False)))
+
+        function_profile_resource = self._read_resource("ida://function-profile/main")
+        self.assertFalse(bool(function_profile_resource.get("isError", False)))
+
+        decompile_resource = self._read_resource("ida://decompile/main")
+        self.assertFalse(bool(decompile_resource.get("isError", False)))
+
+        basic_blocks_resource = self._read_resource("ida://basic-blocks/main")
+        self.assertFalse(bool(basic_blocks_resource.get("isError", False)))
+
+        stack_frame_resource = self._read_resource("ida://stack-frame/main")
+        self.assertFalse(bool(stack_frame_resource.get("isError", False)))
+
+        callgraph_resource = self._read_resource("ida://callgraph/main")
+        self.assertFalse(bool(callgraph_resource.get("isError", False)))
+
+        data_flow_resource = self._read_resource("ida://data-flow/main")
+        self.assertFalse(bool(data_flow_resource.get("isError", False)))
+
+        exported_json = self._call_tool(
+            "export_functions",
+            {"queries": ["main"], "format": "json", "session_id": "elf-main"},
+        )
+        self.assertEqual(exported_json["status"], "ok")
+        exported_json_data = exported_json["data"]
+        self.assertIsInstance(exported_json_data, list)
+        assert isinstance(exported_json_data, list)
+        self.assertGreater(len(exported_json_data), 0)
+        first_export = exported_json_data[0]
+        self.assertIsInstance(first_export, dict)
+        assert isinstance(first_export, dict)
+        self.assertEqual(first_export.get("format"), "json")
+        json_functions = first_export.get("functions")
+        self.assertIsInstance(json_functions, list)
+        assert isinstance(json_functions, list)
+        self.assertGreater(len(json_functions), 0)
+        json_function = json_functions[0]
+        self.assertIsInstance(json_function, dict)
+        assert isinstance(json_function, dict)
+        self.assertIn("asm", json_function)
+        self.assertIn("code", json_function)
+        self.assertIn("xrefs", json_function)
+        self.assertIn("stack_frame", json_function)
+
+        exported_header = self._call_tool(
+            "export_functions",
+            {"queries": ["main"], "format": "c_header", "session_id": "elf-main"},
+        )
+        self.assertEqual(exported_header["status"], "ok")
+        exported_header_data = exported_header["data"]
+        self.assertIsInstance(exported_header_data, list)
+        assert isinstance(exported_header_data, list)
+        header_first = exported_header_data[0]
+        self.assertIsInstance(header_first, dict)
+        assert isinstance(header_first, dict)
+        self.assertEqual(header_first.get("format"), "c_header")
+        self.assertIsInstance(header_first.get("content"), str)
+
+        exported_prototypes = self._call_tool(
+            "export_functions",
+            {"queries": ["main"], "format": "prototypes", "session_id": "elf-main"},
+        )
+        self.assertEqual(exported_prototypes["status"], "ok")
+        exported_prototypes_data = exported_prototypes["data"]
+        self.assertIsInstance(exported_prototypes_data, list)
+        assert isinstance(exported_prototypes_data, list)
+        proto_first = exported_prototypes_data[0]
+        self.assertIsInstance(proto_first, dict)
+        assert isinstance(proto_first, dict)
+        self.assertEqual(proto_first.get("format"), "prototypes")
+        proto_functions = proto_first.get("functions")
+        self.assertIsInstance(proto_functions, list)
+
+    def test_extended_type_stack_patch_and_trace_tools(self) -> None:
+        self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "elf-extended"})
+
+        type_name = f"__Stage2Struct_{os.getpid()}__"
+        stack_name = f"__stage2_stack_{os.getpid()}__"
+        declaration = f"""
+            struct {type_name} {{
+                int field1;
+                char field2;
+            }};
+        """
+
+        declared = self._call_tool(
+            "declare_types",
+            {"declarations": [declaration], "session_id": "elf-extended"},
+        )
+        self.assertEqual(declared["status"], "ok")
+
+        queried_types = self._call_tool(
+            "query_types",
+            {"filter": type_name, "session_id": "elf-extended"},
+        )
+        self.assertEqual(queried_types["status"], "ok")
+        queried_type_rows = queried_types["data"]
+        self.assertIsInstance(queried_type_rows, list)
+        assert isinstance(queried_type_rows, list)
+        self.assertTrue(
+            any(isinstance(item, dict) and item.get("name") == type_name for item in queried_type_rows)
+        )
+
+        type_resource = self._read_resource(f"ida://type/{type_name}")
+        self.assertFalse(bool(type_resource.get("isError", False)))
+
+        struct_resource = self._call_tool(
+            "read_struct",
+            {"name": type_name, "session_id": "elf-extended"},
+        )
+        self.assertEqual(struct_resource["status"], "ok")
+
+        inferred = self._call_tool(
+            "infer_types",
+            {"queries": ["main"], "session_id": "elf-extended"},
+        )
+        self.assertEqual(inferred["status"], "ok")
+        inferred_rows = inferred["data"]
+        self.assertIsInstance(inferred_rows, list)
+        assert isinstance(inferred_rows, list)
+        self.assertGreater(len(inferred_rows), 0)
+        first_inferred = inferred_rows[0]
+        self.assertIsInstance(first_inferred, dict)
+        assert isinstance(first_inferred, dict)
+        self.assertIsInstance(first_inferred.get("inferred_type"), str)
+        self.assertIsInstance(first_inferred.get("method"), str)
+
+        declared_stack = self._call_tool(
+            "declare_stack_variables",
+            {
+                "items": [{"addr": "main", "name": stack_name, "offset": -8, "type": "int"}],
+                "session_id": "elf-extended",
+            },
+        )
+        self.assertEqual(declared_stack["status"], "ok")
+
+        frame_after_create = self._call_tool(
+            "get_stack_frame",
+            {"addr": "main", "session_id": "elf-extended"},
+        )
+        self.assertEqual(frame_after_create["status"], "ok")
+        frame_after_create_data = frame_after_create["data"]
+        self.assertIsInstance(frame_after_create_data, dict)
+        assert isinstance(frame_after_create_data, dict)
+        created_members = frame_after_create_data.get("members")
+        self.assertIsInstance(created_members, list)
+        assert isinstance(created_members, list)
+        self.assertTrue(
+            any(isinstance(item, dict) and item.get("name") == stack_name for item in created_members)
+        )
+
+        deleted_stack = self._call_tool(
+            "delete_stack_variables",
+            {"items": [{"addr": "main", "name": stack_name}], "session_id": "elf-extended"},
+        )
+        self.assertEqual(deleted_stack["status"], "ok")
+
+        frame_after_delete = self._call_tool(
+            "get_stack_frame",
+            {"addr": "main", "session_id": "elf-extended"},
+        )
+        self.assertEqual(frame_after_delete["status"], "ok")
+        frame_after_delete_data = frame_after_delete["data"]
+        self.assertIsInstance(frame_after_delete_data, dict)
+        assert isinstance(frame_after_delete_data, dict)
+        deleted_members = frame_after_delete_data.get("members")
+        self.assertIsInstance(deleted_members, list)
+        assert isinstance(deleted_members, list)
+        self.assertFalse(
+            any(isinstance(item, dict) and item.get("name") == stack_name for item in deleted_members)
+        )
+
+        original_bytes = self._call_tool(
+            "read_bytes",
+            {"addrs": ["0x125e"], "size": 2, "session_id": "elf-extended"},
+        )
+        self.assertEqual(original_bytes["status"], "ok")
+        original_rows = original_bytes["data"]
+        self.assertIsInstance(original_rows, list)
+        assert isinstance(original_rows, list)
+        first_bytes = original_rows[0]
+        self.assertIsInstance(first_bytes, dict)
+        assert isinstance(first_bytes, dict)
+        original_hex = first_bytes.get("hex")
+        self.assertIsInstance(original_hex, str)
+
+        try:
+            patched = self._call_tool(
+                "patch_assembly",
+                {
+                    "items": [{"addr": "0x125e", "asm": "sub eax, eax"}],
+                    "session_id": "elf-extended",
+                },
+            )
+            self.assertEqual(patched["status"], "ok")
+
+            changed_bytes = self._call_tool(
+                "read_bytes",
+                {"addrs": ["0x125e"], "size": 2, "session_id": "elf-extended"},
+            )
+            self.assertEqual(changed_bytes["status"], "ok")
+            changed_rows = changed_bytes["data"]
+            self.assertIsInstance(changed_rows, list)
+            assert isinstance(changed_rows, list)
+            changed_first = changed_rows[0]
+            self.assertIsInstance(changed_first, dict)
+            assert isinstance(changed_first, dict)
+            self.assertEqual(changed_first.get("hex"), "29c0")
+        finally:
+            self._call_tool(
+                "patch_bytes",
+                {
+                    "items": [{"addr": "0x125e", "hex": original_hex}],
+                    "session_id": "elf-extended",
+                },
+            )
+
+        traced = self._call_tool(
+            "trace_data_flow",
+            {"addr": "main", "direction": "forward", "max_depth": 2, "session_id": "elf-extended"},
+        )
+        self.assertEqual(traced["status"], "ok")
+        traced_data = traced["data"]
+        self.assertIsInstance(traced_data, dict)
+        assert isinstance(traced_data, dict)
+        self.assertIsInstance(traced_data.get("nodes"), list)
+        self.assertIsInstance(traced_data.get("edges"), list)
+        self.assertIsInstance(traced_data.get("summary"), dict)
+        traced_edges = traced_data.get("edges")
+        self.assertIsInstance(traced_edges, list)
+        assert isinstance(traced_edges, list)
+        if traced_edges:
+            first_edge = traced_edges[0]
+            self.assertIsInstance(first_edge, dict)
+            assert isinstance(first_edge, dict)
+            self.assertIn("xref_type", first_edge)
+            self.assertIn("edge_kind", first_edge)
+            self.assertIn("source", first_edge)
+            self.assertIn("resolution", first_edge)
+        traced_summary = traced_data.get("summary")
+        self.assertIsInstance(traced_summary, dict)
+        assert isinstance(traced_summary, dict)
+        self.assertIn("edge_kind_histogram", traced_summary)
+        self.assertIn("xref_type_histogram", traced_summary)
+
+        callgraph = self._call_tool(
+            "build_callgraph",
+            {"query": "main", "max_depth": 2, "session_id": "elf-extended"},
+        )
+        self.assertEqual(callgraph["status"], "ok")
+        callgraph_data = callgraph["data"]
+        self.assertIsInstance(callgraph_data, dict)
+        assert isinstance(callgraph_data, dict)
+        self.assertIn("external_targets", callgraph_data)
+
+        component = self._call_tool(
+            "analyze_component",
+            {"root_query": "main", "max_depth": 2, "session_id": "elf-extended"},
+        )
+        self.assertEqual(component["status"], "ok")
+
+    def test_debug_registers_all_threads_without_debuggee_is_cleanly_unsupported(self) -> None:
+        result = self._call_tool("debug_registers_all_threads")
+        self.assertEqual(result["status"], "unsupported")
+        result_data = result["data"]
+        self.assertIsInstance(result_data, dict)
+        assert isinstance(result_data, dict)
+        reason = result_data.get("reason")
+        self.assertIsInstance(reason, str)
+        assert isinstance(reason, str)
+        self.assertNotIn("尚未实现", reason)
+        warnings = result["warnings"]
+        self.assertIsInstance(warnings, list)
+        assert isinstance(warnings, list)
+        self.assertFalse(any("暂未实现" in str(item) for item in warnings))
+
+    def test_analyze_directory_restores_previous_session(self) -> None:
+        self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "restore-target"})
+        before = self._call_tool("current_binary")
+        self.assertEqual(before["status"], "ok")
+
+        analyzed = self._call_tool(
+            "analyze_directory",
+            {
+                "path": str(self.mixed_fixture),
+                "recursive": True,
+                "max_candidates": 5,
+                "max_deep_analysis": 2,
+            },
+        )
+        self.assertIn(analyzed["status"], ("ok", "degraded"))
+        summary = analyzed["data"]
+        self.assertIsInstance(summary, dict)
+        self.assertIn("summary", summary)
+
+        after = self._call_tool("current_binary")
+        self.assertEqual(after["status"], "ok")
+        after_data = after["data"]
+        self.assertIsInstance(after_data, dict)
+        assert isinstance(after_data, dict)
+        self.assertEqual(after_data.get("session_id"), "restore-target")
+
+    def test_query_imports_alias_filters_work(self) -> None:
+        self._call_tool("open_binary", {"path": str(self.pe_fixture), "session_id": "pe-imports"})
+        imports_result = self._call_tool("list_imports", {"session_id": "pe-imports"})
+        self.assertEqual(imports_result["status"], "ok")
+        imports_data = imports_result["data"]
+        self.assertIsInstance(imports_data, list)
+        assert isinstance(imports_data, list)
+        if not imports_data:
+            self.skipTest("当前最小 PE fixture 不包含可枚举导入，跳过 query_imports alias 集成验证")
+        first_import = imports_data[0]
+        self.assertIsInstance(first_import, dict)
+        assert isinstance(first_import, dict)
+        import_name = first_import.get("name")
+        self.assertIsInstance(import_name, str)
+        assert isinstance(import_name, str)
+
+        filtered = self._call_tool("query_imports", {"name": import_name, "session_id": "pe-imports"})
+        self.assertEqual(filtered["status"], "ok")
+        filtered_data = filtered["data"]
+        self.assertIsInstance(filtered_data, list)
+        assert isinstance(filtered_data, list)
+        self.assertGreater(len(filtered_data), 0)
+        self.assertTrue(
+            all(isinstance(item, dict) and item.get("name") == import_name for item in filtered_data)
+        )
 
 
 if __name__ == "__main__":

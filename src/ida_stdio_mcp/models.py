@@ -12,6 +12,7 @@ JsonObject = dict[str, JsonValue]
 ToolStatus = Literal["ok", "degraded", "unsupported", "error"]
 BinaryKind = Literal["pe", "elf", "macho", "unknown"]
 AnalysisDomain = Literal["native", "managed", "unknown"]
+GateName = Literal["public", "unsafe", "debugger"]
 
 
 class ToolResult(TypedDict):
@@ -24,43 +25,27 @@ class ToolResult(TypedDict):
     data: JsonValue
 
 
-class FunctionRecord(TypedDict):
-    """函数摘要信息。"""
+class ResourceContent(TypedDict):
+    """MCP resource read 返回项。"""
 
-    addr: str
-    name: str
-    size: int
-    size_hex: str
-    segment: str
-
-
-class StringRecord(TypedDict):
-    """字符串摘要信息。"""
-
-    addr: str
-    length: int
+    uri: str
+    mimeType: str
     text: str
-
-
-class CallEdgeRecord(TypedDict):
-    """调用边信息。"""
-
-    caller_addr: str
-    caller_name: str
-    callee_addr: str
-    callee_name: str
-    source: str
 
 
 class BinarySummary(TypedDict):
     """当前二进制摘要。"""
 
+    session_id: str
     input_path: str
-    idb_path: str
-    module: str
-    binary_kind: BinaryKind
-    analysis_domain: AnalysisDomain
-    imagebase: str
+    filename: str
+    created_at: str
+    last_accessed: str
+    is_analyzing: bool
+    metadata: dict[str, JsonValue]
+    is_active: bool
+    is_current_context: bool
+    bound_contexts: int
 
 
 @dataclass(slots=True, frozen=True)

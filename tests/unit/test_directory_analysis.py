@@ -1,4 +1,4 @@
-"""目录扫描与 triage 单元测试。"""
+"""目录扫描单元测试。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,6 @@ class DirectoryAnalysisTests(unittest.TestCase):
 
     @staticmethod
     def _fixture_root() -> Path:
-        """返回测试 fixture 根目录。"""
         return Path(__file__).resolve().parents[1] / "fixtures"
 
     def test_detect_binary_kind_from_magic(self) -> None:
@@ -25,7 +24,6 @@ class DirectoryAnalysisTests(unittest.TestCase):
             self.assertEqual(detect_binary_kind(elf_path), "elf")
 
     def test_detect_binary_kind_from_minimal_pe_fixture(self) -> None:
-        """确认最小 PE fixture 能被识别为 pe。"""
         fixture = self._fixture_root() / "minimal_pe.exe"
         self.assertEqual(detect_binary_kind(fixture), "pe")
 

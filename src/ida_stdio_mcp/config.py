@@ -24,6 +24,25 @@ class ServerConfig:
     protocol_version: str
     server_name: str
     server_version: str
+    default_input_path: str
+
+
+@dataclass(slots=True, frozen=True)
+class FeatureGateConfig:
+    """功能门控默认值。"""
+
+    allow_unsafe: bool
+    allow_debugger: bool
+
+
+@dataclass(slots=True, frozen=True)
+class LimitConfig:
+    """工具默认限制。"""
+
+    default_page_size: int
+    max_page_size: int
+    max_search_hits: int
+    max_callgraph_depth: int
 
 
 @dataclass(slots=True, frozen=True)
@@ -43,8 +62,23 @@ class AppConfig:
 
     logging: LoggingConfig
     server: ServerConfig
+    feature_gates: FeatureGateConfig
+    limits: LimitConfig
     directory_analysis: DirectoryAnalysisConfig
     root: Path
+
+
+def _require_table(raw: dict[str, object], key: str) -> dict[str, object]:
+    value = raw.get(key)
+    if not isinstance(value, dict):
+        raise ConfigurationError(f"setting.toml 缺少 {key} 段")
+    return value
+
+
+def _to_str_tuple(value: object) -> tuple[str, ...]:
+    if not isinstance(value, list):
+        return ()
+    return tuple(str(item) for item in value)
 
 
 def load_config(config_path: Path) -> AppConfig:
@@ -53,13 +87,13 @@ def load_config(config_path: Path) -> AppConfig:
         raise ConfigurationError(f"配置文件不存在：{config_path}")
 
     raw = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    logging_raw = raw.get("logging")
-    server_raw = raw.get("server")
-    directory_raw = raw.get("directory_analysis")
-    if not isinstance(logging_raw, dict) or not isinstance(server_raw, dict) or not isinstance(directory_raw, dict):
-        raise ConfigurationError("setting.toml 缺少 logging/server/directory_analysis 段")
+    root = config_path.parent.resolve()
+    logging_raw = _require_table(raw, "logging")
+    server_raw = _require_table(raw, "server")
+    gates_raw = _require_table(raw, "feature_gates")
+    limits_raw = _require_table(raw, "limits")
+    directory_raw = _require_table(raw, "directory_analysis")
 
-    root = config_path.parent
     return AppConfig(
         logging=LoggingConfig(
             level=str(logging_raw.get("level", "INFO")),
@@ -68,14 +102,25 @@ def load_config(config_path: Path) -> AppConfig:
         server=ServerConfig(
             protocol_version=str(server_raw.get("protocol_version", "2025-06-18")),
             server_name=str(server_raw.get("server_name", "ida-stdio-mcp")),
-            server_version=str(server_raw.get("server_version", "0.1.0")),
+            server_version=str(server_raw.get("server_version", "0.2.0")),
+            default_input_path=str(server_raw.get("default_input_path", "")),
+        ),
+        feature_gates=FeatureGateConfig(
+            allow_unsafe=bool(gates_raw.get("allow_unsafe", False)),
+            allow_debugger=bool(gates_raw.get("allow_debugger", False)),
+        ),
+        limits=LimitConfig(
+            default_page_size=int(limits_raw.get("default_page_size", 100)),
+            max_page_size=int(limits_raw.get("max_page_size", 1000)),
+            max_search_hits=int(limits_raw.get("max_search_hits", 1000)),
+            max_callgraph_depth=int(limits_raw.get("max_callgraph_depth", 4)),
         ),
         directory_analysis=DirectoryAnalysisConfig(
             recursive=bool(directory_raw.get("recursive", True)),
             max_candidates=int(directory_raw.get("max_candidates", 20)),
             max_deep_analysis=int(directory_raw.get("max_deep_analysis", 5)),
-            include_extensions=tuple(str(item).lower() for item in directory_raw.get("include_extensions", [])),
-            exclude_patterns=tuple(str(item) for item in directory_raw.get("exclude_patterns", [])),
+            include_extensions=tuple(item.lower() for item in _to_str_tuple(directory_raw.get("include_extensions", []))),
+            exclude_patterns=_to_str_tuple(directory_raw.get("exclude_patterns", [])),
         ),
-        root=root.resolve(),
+        root=root,
     )
