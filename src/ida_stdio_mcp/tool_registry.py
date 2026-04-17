@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
-from typing import Callable
+from typing import Callable, cast
 
+from .errors import ToolInputValidationError
+from .models import GateName
 from .models import JsonObject, JsonValue, ResourceContent, ToolResult
+from .result import build_error_info
+from .schema_validation import validate_arguments
 
 ToolHandler = Callable[[JsonObject], ToolResult]
 ResourceHandler = Callable[[dict[str, str]], JsonValue]
@@ -22,6 +26,12 @@ class ToolSpec:
     input_schema: JsonObject
     output_schema: JsonObject
     handler: ToolHandler
+    validation_schema: JsonObject | None = None
+    requires_session: bool = False
+    feature_gate: GateName = "public"
+    preconditions: tuple[str, ...] = ()
+    empty_state_behavior: str = ""
+    input_example: JsonValue | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -33,6 +43,8 @@ class ResourceSpec:
     description: str
     mime_type: str
     handler: ResourceHandler
+    scope: str = "session"
+    requires_session: bool = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -46,6 +58,8 @@ class ResourceTemplateSpec:
     pattern: re.Pattern[str]
     parameter_names: tuple[str, ...]
     handler: ResourceHandler
+    scope: str = "session"
+    requires_session: bool = True
 
 
 class ToolRegistry:
@@ -75,6 +89,11 @@ class ToolRegistry:
                 "description": tool.description,
                 "inputSchema": tool.input_schema,
                 "outputSchema": tool.output_schema,
+                "inputExample": tool.input_example if tool.input_example is not None else self._input_example(tool.validation_schema or tool.input_schema),
+                "requiresSession": tool.requires_session,
+                "featureGate": tool.feature_gate,
+                "preconditions": list(tool.preconditions),
+                "emptyStateBehavior": tool.empty_state_behavior,
             }
             for tool in self._tools.values()
         ]
@@ -83,16 +102,125 @@ class ToolRegistry:
         tool = self._tools.get(name)
         if tool is None:
             raise KeyError(f"未知工具：{name}")
+        try:
+            validate_arguments(tool.validation_schema or tool.input_schema, arguments)
+        except ToolInputValidationError as exc:
+            return {
+                "status": "error",
+                "source": name,
+                "warnings": [],
+                "error": cast(
+                    JsonObject,
+                    build_error_info(
+                    code="invalid_arguments",
+                    message=str(exc),
+                    details={
+                        "tool": name,
+                        **{key: value for key, value in exc.details.items()},
+                    },
+                    next_steps=exc.next_steps,
+                    ),
+                ),
+                "data": None,
+            }
         return tool.handler(arguments)
 
     @staticmethod
     def format_tool_result(result: ToolResult) -> JsonObject:
         payload = json.dumps(result, ensure_ascii=False)
-        return {
+        return cast(
+            JsonObject,
+            {
             "content": [{"type": "text", "text": payload}],
             "structuredContent": result,
             "isError": result["status"] == "error",
+            },
+        )
+
+    def _input_example(self, schema: JsonObject) -> JsonValue:
+        """根据 schema 生成最小可用示例。"""
+        return self._example_for_schema(schema)
+
+    def _example_for_schema(self, schema: JsonObject, field_name: str | None = None) -> JsonValue:
+        one_of = schema.get("oneOf")
+        if isinstance(one_of, list) and one_of:
+            first = one_of[0]
+            if isinstance(first, dict):
+                return self._example_for_schema(first, field_name)
+
+        schema_type = schema.get("type")
+        if schema_type == "object":
+            result: JsonObject = {}
+            properties = schema.get("properties", {})
+            if not isinstance(properties, dict):
+                return result
+            required = schema.get("required", [])
+            required_names = [item for item in required if isinstance(item, str)] if isinstance(required, list) else []
+            for name in required_names:
+                property_schema = properties.get(name)
+                if isinstance(property_schema, dict):
+                    result[name] = self._example_for_schema(property_schema, name)
+            raw_required_any_of = schema.get("x-required-any-of")
+            if isinstance(raw_required_any_of, list) and raw_required_any_of:
+                first_branch = raw_required_any_of[0]
+                if isinstance(first_branch, list):
+                    for name in first_branch:
+                        if not isinstance(name, str) or name in result:
+                            continue
+                        property_schema = properties.get(name)
+                        if isinstance(property_schema, dict):
+                            result[name] = self._example_for_schema(property_schema, name)
+            return result
+        if schema_type == "array":
+            items = schema.get("items")
+            if isinstance(items, dict):
+                return [self._example_for_schema(items, field_name)]
+            return []
+        if schema_type == "string":
+            enum = schema.get("enum")
+            if isinstance(enum, list) and enum:
+                first = enum[0]
+                if isinstance(first, str):
+                    return first
+            return self._string_example(field_name)
+        if schema_type == "integer":
+            minimum = schema.get("minimum")
+            if isinstance(minimum, int):
+                return minimum
+            if field_name == "thread_id":
+                return 1
+            if field_name in {"offset"}:
+                return 0
+            if field_name in {"count", "limit", "max_hits", "max_depth", "size"}:
+                return 4
+            return 0
+        if schema_type == "boolean":
+            return True
+        return None
+
+    @staticmethod
+    def _string_example(field_name: str | None) -> str:
+        examples = {
+            "path": "D:/samples/sample.exe",
+            "session_id": "sess-001",
+            "addr": "main",
+            "query": "main",
+            "root": "main",
+            "filter": "main",
+            "pattern": "CreateFile",
+            "module": "kernel32",
+            "name": "main",
+            "comment": "示例注释",
+            "asm": "nop",
+            "hex": "90",
+            "type": "int",
+            "ty": "int",
+            "source": "eax",
+            "target": "ebx",
         }
+        if field_name is None:
+            return "example"
+        return examples.get(field_name, "example")
 
 
 class ResourceRegistry:
@@ -113,6 +241,8 @@ class ResourceRegistry:
         description: str,
         mime_type: str,
         handler: ResourceHandler,
+        scope: str = "session",
+        requires_session: bool = True,
     ) -> None:
         parameter_names = tuple(re.findall(r"\{([^{}]+)\}", uri_template))
         pattern_text = re.escape(uri_template)
@@ -128,6 +258,8 @@ class ResourceRegistry:
                 pattern=compiled,
                 parameter_names=parameter_names,
                 handler=handler,
+                scope=scope,
+                requires_session=requires_session,
             )
         )
 
@@ -138,6 +270,8 @@ class ResourceRegistry:
                 "name": spec.name,
                 "description": spec.description,
                 "mimeType": spec.mime_type,
+                "scope": spec.scope,
+                "requiresSession": spec.requires_session,
             }
             for spec in self._static_resources.values()
         ]
@@ -149,6 +283,8 @@ class ResourceRegistry:
                 "name": spec.name,
                 "description": spec.description,
                 "mimeType": spec.mime_type,
+                "scope": spec.scope,
+                "requiresSession": spec.requires_session,
             }
             for spec in self._templates
         ]
@@ -157,14 +293,14 @@ class ResourceRegistry:
         static = self._static_resources.get(uri)
         if static is not None:
             payload = static.handler({})
-            return [self._content(uri, static.mime_type, payload)], False
+            return [self._content(uri, static.mime_type, payload)], self._payload_is_error(payload)
 
         for template in self._templates:
             match = template.pattern.match(uri)
             if match is None:
                 continue
             payload = template.handler(match.groupdict())
-            return [self._content(uri, template.mime_type, payload)], False
+            return [self._content(uri, template.mime_type, payload)], self._payload_is_error(payload)
 
         raise KeyError(f"未知资源：{uri}")
 
@@ -175,3 +311,10 @@ class ResourceRegistry:
             "mimeType": mime_type,
             "text": json.dumps(payload, ensure_ascii=False, indent=2),
         }
+
+    @staticmethod
+    def _payload_is_error(payload: JsonValue) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        status = payload.get("status")
+        return isinstance(status, str) and status == "error"

@@ -1,7 +1,7 @@
 [project]
 name = "ida-stdio-mcp"
 version = "0.2.0"
-description = "仅支持 IDA Headless + 原生 stdio 的 MCP 服务"
+description = "IDA Headless + 原生 stdio 的 MCP 服务"
 readme = "README.md"
 authors = [
     { name = "yexi", email = "fanguojun066@gmail.com" }
@@ -34,12 +34,5 @@ include = [
 exclude = [
     "tests/fixtures",
 ]
-typeCheckingMode = "basic"
-reportMissingModuleSource = "none"
-reportArgumentType = "none"
-reportReturnType = "none"
-reportIndexIssue = "none"
-reportOptionalSubscript = "none"
-reportCallIssue = "none"
-reportUninitializedInstanceVariable = "none"
+typeCheckingMode = "strict"
 pythonVersion = "3.11"

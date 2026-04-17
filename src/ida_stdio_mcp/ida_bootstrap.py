@@ -14,5 +14,4 @@ def ensure_ida_environment() -> None:
     这里不返回任何对象，调用方只需要在模块顶部先执行一次即可。
     """
 
-    import idapro  # noqa: F401
-
+    __import__("idapro")

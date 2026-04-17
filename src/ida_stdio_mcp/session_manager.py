@@ -8,11 +8,13 @@ from datetime import datetime
 from pathlib import Path
 from threading import RLock
 
+from .errors import SessionNotFoundError, SessionRequiredError
 from .ida_bootstrap import ensure_ida_environment
+from .models import BinarySummary
 
 ensure_ida_environment()
 
-import ida_auto
+import ida_auto  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
 import idapro
 from loguru import logger
 
@@ -26,9 +28,24 @@ class IdaSession:
     created_at: datetime = field(default_factory=datetime.now)
     last_accessed: datetime = field(default_factory=datetime.now)
     is_analyzing: bool = False
+    dirty: bool = False
+    writeback_kind: str | None = None
+    persistent_after_save: bool = False
+    saved_path: str = ""
+    undo_supported: bool = False
 
-    def to_dict(self) -> dict[str, object]:
-        """把会话转换为可序列化字典。"""
+    def to_summary(
+        self,
+        *,
+        is_active: bool,
+        is_current_context: bool,
+        bound_contexts: int,
+    ) -> BinarySummary:
+        """把会话转换成统一摘要。
+
+        会话管理器只负责数据库生命周期，不直接维护样本 survey 元数据。
+        因此这里的 `metadata` 固定为空对象，由上层真正读取当前数据库后再补充。
+        """
         return {
             "session_id": self.session_id,
             "input_path": str(self.input_path),
@@ -36,6 +53,15 @@ class IdaSession:
             "created_at": self.created_at.isoformat(),
             "last_accessed": self.last_accessed.isoformat(),
             "is_analyzing": self.is_analyzing,
+            "metadata": {},
+            "is_active": is_active,
+            "is_current_context": is_current_context,
+            "bound_contexts": bound_contexts,
+            "dirty": self.dirty,
+            "writeback_kind": self.writeback_kind,
+            "persistent_after_save": self.persistent_after_save,
+            "saved_path": self.saved_path,
+            "undo_supported": self.undo_supported,
         }
 
 
@@ -90,7 +116,7 @@ class SessionManager:
         with self._lock:
             session_id = self._context_bindings.get(context_id)
             if session_id is None:
-                raise RuntimeError("当前没有绑定会话，请先调用 open_binary 或 switch_binary")
+                raise SessionRequiredError("当前没有绑定会话，请先调用 open_binary 或 switch_binary")
             session = self._require_session_locked(session_id)
             self._activate_session_locked(session.session_id)
             session.last_accessed = datetime.now()
@@ -110,7 +136,7 @@ class SessionManager:
                 return None
             return self._sessions.get(session_id)
 
-    def list_sessions(self, context_id: str | None = None) -> list[dict[str, object]]:
+    def list_sessions(self, context_id: str | None = None) -> list[BinarySummary]:
         """列出所有会话。"""
         with self._lock:
             current_context_session_id = self._context_bindings.get(context_id) if context_id is not None else None
@@ -118,13 +144,15 @@ class SessionManager:
             for bound_session_id in self._context_bindings.values():
                 binding_count[bound_session_id] = binding_count.get(bound_session_id, 0) + 1
 
-            result: list[dict[str, object]] = []
+            result: list[BinarySummary] = []
             for session in self._sessions.values():
-                item = session.to_dict()
-                item["is_active"] = session.session_id == self._active_session_id
-                item["is_current_context"] = session.session_id == current_context_session_id
-                item["bound_contexts"] = binding_count.get(session.session_id, 0)
-                result.append(item)
+                result.append(
+                    session.to_summary(
+                        is_active=session.session_id == self._active_session_id,
+                        is_current_context=session.session_id == current_context_session_id,
+                        bound_contexts=binding_count.get(session.session_id, 0),
+                    )
+                )
             return result
 
     def close_session(self, session_id: str) -> bool:
@@ -152,6 +180,26 @@ class SessionManager:
             self._sessions.clear()
             self._context_bindings.clear()
 
+    def mark_dirty(self, session_id: str, *, writeback_kind: str) -> IdaSession:
+        """把会话标记为存在未持久化写回。"""
+        with self._lock:
+            session = self._require_session_locked(session_id)
+            session.last_accessed = datetime.now()
+            session.dirty = True
+            session.writeback_kind = writeback_kind
+            session.persistent_after_save = False
+            return session
+
+    def mark_saved(self, session_id: str, *, saved_path: str) -> IdaSession:
+        """把会话标记为已保存。"""
+        with self._lock:
+            session = self._require_session_locked(session_id)
+            session.last_accessed = datetime.now()
+            session.dirty = False
+            session.persistent_after_save = True
+            session.saved_path = saved_path
+            return session
+
     def _activate_session_locked(self, session_id: str) -> None:
         if self._active_session_id == session_id:
             return
@@ -169,16 +217,16 @@ class SessionManager:
     def _require_session_locked(self, session_id: str) -> IdaSession:
         session = self._sessions.get(session_id)
         if session is None:
-            raise ValueError(f"找不到会话：{session_id}")
+            raise SessionNotFoundError(f"找不到会话：{session_id}")
         return session
 
 
-_SESSION_MANAGER: SessionManager | None = None
+_session_manager_singleton: SessionManager | None = None
 
 
 def get_session_manager() -> SessionManager:
     """返回全局会话管理器。"""
-    global _SESSION_MANAGER
-    if _SESSION_MANAGER is None:
-        _SESSION_MANAGER = SessionManager()
-    return _SESSION_MANAGER
+    global _session_manager_singleton
+    if _session_manager_singleton is None:
+        _session_manager_singleton = SessionManager()
+    return _session_manager_singleton

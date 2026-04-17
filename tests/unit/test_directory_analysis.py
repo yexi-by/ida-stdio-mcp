@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ida_stdio_mcp.directory_analysis import detect_binary_kind, iter_candidate_files
+from ida_stdio_mcp.directory_analysis import DirectoryAnalysisPolicy, detect_binary_kind, iter_candidate_files
 
 
 class DirectoryAnalysisTests(unittest.TestCase):
@@ -43,11 +43,45 @@ class DirectoryAnalysisTests(unittest.TestCase):
                 recursive=False,
                 include_extensions=(".exe", ".dll", ".elf"),
                 exclude_patterns=(),
+                policy=DirectoryAnalysisPolicy(
+                    prefer_managed=False,
+                    prefer_native=False,
+                    prefer_entry_binary=True,
+                    prefer_user_code=True,
+                    scoring_profile="default",
+                ),
             )
 
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0].binary_kind, "pe")
             self.assertEqual(results[0].path.name, "app.exe")
+
+    def test_iter_candidate_files_prioritizes_unity_user_code(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            managed = root / "Game_Data" / "Managed"
+            managed.mkdir(parents=True)
+            assembly = managed / "Assembly-CSharp.dll"
+            runtime_lib = managed / "UnityEngine.CoreModule.dll"
+            assembly.write_bytes(b"MZ" + b"\x01" * 128)
+            runtime_lib.write_bytes(b"MZ" + b"\x02" * 128)
+
+            results = iter_candidate_files(
+                root,
+                recursive=True,
+                include_extensions=(".dll",),
+                exclude_patterns=(),
+                policy=DirectoryAnalysisPolicy(
+                    prefer_managed=True,
+                    prefer_native=False,
+                    prefer_entry_binary=False,
+                    prefer_user_code=True,
+                    scoring_profile="managed_first",
+                ),
+            )
+
+            self.assertGreaterEqual(len(results), 2)
+            self.assertEqual(results[0].path.name, "Assembly-CSharp.dll")
 
 
 if __name__ == "__main__":

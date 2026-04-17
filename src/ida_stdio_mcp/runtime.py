@@ -4,28 +4,15 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import cast
+from typing import Callable, cast
 
 from loguru import logger
 
-from .errors import BinaryNotOpenError, RuntimeNotReadyError
-from .models import BinarySummary, JsonValue
+from .errors import RuntimeNotReadyError, SessionNotFoundError, SessionRequiredError
+from .models import BinarySummary, JsonObject
 from .session_manager import get_session_manager
 
 STDIO_CONTEXT_ID = "stdio:default"
-
-
-def _to_json_value(value: object) -> JsonValue:
-    """把运行时对象收敛到项目 JSON 类型。"""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, list):
-        return [_to_json_value(item) for item in value]
-    if isinstance(value, tuple):
-        return [_to_json_value(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _to_json_value(item) for key, item in value.items()}
-    return str(value)
 
 
 class HeadlessRuntime:
@@ -72,25 +59,25 @@ class HeadlessRuntime:
     def deactivate_binary(self) -> bool:
         """解除当前默认上下文与会话的绑定。"""
         removed = self._manager.unbind_context(STDIO_CONTEXT_ID)
-        if removed:
-            logger.info("已解除默认上下文绑定")
-        return removed
+        if not removed:
+            raise SessionRequiredError("当前没有绑定会话，无需解除")
+        logger.info("已解除默认上下文绑定")
+        return True
 
     def list_binaries(self) -> list[BinarySummary]:
         """列出所有打开的会话。"""
-        sessions = self._manager.list_sessions(context_id=STDIO_CONTEXT_ID)
-        return [self._normalize_session(item) for item in sessions]
+        return self._manager.list_sessions(context_id=STDIO_CONTEXT_ID)
 
     def current_binary(self) -> BinarySummary:
         """返回当前绑定会话。"""
         session = self._manager.get_context_session(STDIO_CONTEXT_ID)
         if session is None:
-            raise BinaryNotOpenError("当前没有绑定任何会话，请先调用 open_binary 或 switch_binary")
+            raise SessionRequiredError("当前没有绑定任何会话，请先调用 open_binary 或 switch_binary")
         listed = self._manager.list_sessions(context_id=STDIO_CONTEXT_ID)
         for item in listed:
-            if item.get("session_id") == session.session_id:
-                return self._normalize_session(item)
-        raise BinaryNotOpenError("当前上下文绑定的会话不存在")
+            if item["session_id"] == session.session_id:
+                return item
+        raise SessionNotFoundError("当前上下文绑定的会话不存在")
 
     def activate_for_request(self, session_id: str | None = None) -> BinarySummary:
         """按请求可选切换会话，并确保底层 IDB 已激活。"""
@@ -106,43 +93,45 @@ class HeadlessRuntime:
         if target_session_id is None:
             session = self._manager.get_context_session(STDIO_CONTEXT_ID)
             if session is None:
-                raise BinaryNotOpenError("当前没有可关闭的会话")
+                raise SessionRequiredError("当前没有可关闭的会话")
             target_session_id = session.session_id
         closed = self._manager.close_session(target_session_id)
         if not closed:
-            raise BinaryNotOpenError(f"找不到会话：{target_session_id}")
+            raise SessionNotFoundError(f"找不到会话：{target_session_id}")
         return True
 
-    def save_binary(self, path: str = "", session_id: str | None = None) -> dict[str, JsonValue]:
+    def save_binary(self, path: str = "", session_id: str | None = None) -> JsonObject:
         """保存当前或指定会话对应的 IDB。"""
-        self.activate_for_request(session_id)
-        import ida_loader
+        summary = self.activate_for_request(session_id)
+        import ida_loader  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
 
+        get_path = cast("Callable[[int], str]", ida_loader.get_path)
         save_path = path.strip() if path else ""
         if not save_path:
-            save_path = str(ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or "")
+            save_path = str(get_path(ida_loader.PATH_TYPE_IDB) or "")
         if not save_path:
             raise RuntimeNotReadyError("无法解析当前 IDB 路径")
         ok = bool(ida_loader.save_database(save_path, 0))
-        return {"ok": ok, "path": save_path, "error": None if ok else "save_database returned false"}
+        if ok:
+            self._manager.mark_saved(summary["session_id"], saved_path=save_path)
+        refreshed = self.current_binary()
+        return {
+            "ok": ok,
+            "path": save_path,
+            "error": None if ok else "save_database returned false",
+            "dirty": refreshed["dirty"],
+            "writeback_kind": refreshed["writeback_kind"],
+            "persistent_after_save": refreshed["persistent_after_save"],
+            "saved_path": refreshed["saved_path"],
+            "undo_supported": refreshed["undo_supported"],
+        }
+
+    def mark_writeback(self, *, writeback_kind: str, session_id: str | None = None) -> BinarySummary:
+        """把当前或指定会话标记为已发生写回。"""
+        summary = self.activate_for_request(session_id)
+        self._manager.mark_dirty(summary["session_id"], writeback_kind=writeback_kind)
+        return self.current_binary()
 
     def shutdown(self) -> None:
         """关闭所有会话。"""
         self._manager.close_all_sessions()
-
-    @staticmethod
-    def _normalize_session(raw: dict[str, object]) -> BinarySummary:
-        metadata_raw = raw.get("metadata")
-        metadata = cast(dict[str, JsonValue], _to_json_value(metadata_raw if isinstance(metadata_raw, dict) else {}))
-        return {
-            "session_id": str(raw.get("session_id", "")),
-            "input_path": str(raw.get("input_path", "")),
-            "filename": str(raw.get("filename", "")),
-            "created_at": str(raw.get("created_at", "")),
-            "last_accessed": str(raw.get("last_accessed", "")),
-            "is_analyzing": bool(raw.get("is_analyzing", False)),
-            "metadata": metadata,
-            "is_active": bool(raw.get("is_active", False)),
-            "is_current_context": bool(raw.get("is_current_context", False)),
-            "bound_contexts": int(raw.get("bound_contexts", 0)),
-        }

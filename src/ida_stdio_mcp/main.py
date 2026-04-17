@@ -35,7 +35,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # idapro 必须先于其它 ida_* 模块导入。
     import idapro
-    import ida_loader  # noqa: F401
 
     idapro.enable_console_messages(False)
 

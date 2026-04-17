@@ -7,9 +7,31 @@ import unittest
 from pathlib import Path
 
 from ida_stdio_mcp.config import load_config
+from ida_stdio_mcp.models import JsonObject, JsonValue
 from ida_stdio_mcp.service import build_service
 from ida_stdio_mcp.runtime import HeadlessRuntime
 from ida_stdio_mcp.stdio_server import ServerIdentity, StdioMcpServer
+
+
+def expect_object(value: JsonValue, *, name: str) -> JsonObject:
+    """把 JSON 值收窄为对象。"""
+    if not isinstance(value, dict):
+        raise AssertionError(f"{name} 应为对象，实际为 {type(value).__name__}")
+    return value
+
+
+def expect_list(value: JsonValue, *, name: str) -> list[JsonValue]:
+    """把 JSON 值收窄为数组。"""
+    if not isinstance(value, list):
+        raise AssertionError(f"{name} 应为数组，实际为 {type(value).__name__}")
+    return value
+
+
+def expect_string(value: JsonValue, *, name: str) -> str:
+    """把 JSON 值收窄为字符串。"""
+    if not isinstance(value, str):
+        raise AssertionError(f"{name} 应为字符串，实际为 {type(value).__name__}")
+    return value
 
 
 class HeadlessToolTests(unittest.TestCase):
@@ -54,8 +76,8 @@ class HeadlessToolTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.runtime.shutdown()
 
-    def _call_tool(self, name: str, arguments: dict[str, object] | None = None) -> dict[str, object]:
-        response = self.server._dispatch(
+    def _call_tool(self, name: str, arguments: JsonObject | None = None) -> JsonObject:
+        response = self.server.dispatch_message(
             {
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -65,12 +87,11 @@ class HeadlessToolTests(unittest.TestCase):
         )
         self.assertIsNotNone(response)
         assert response is not None
-        result = response["result"]["structuredContent"]
-        self.assertIsInstance(result, dict)
-        return result
+        response_result = expect_object(response["result"], name="tool.result")
+        return expect_object(response_result["structuredContent"], name="tool.structured")
 
-    def _read_resource(self, uri: str) -> dict[str, object]:
-        response = self.server._dispatch(
+    def _read_resource(self, uri: str) -> JsonObject:
+        response = self.server.dispatch_message(
             {
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -80,9 +101,7 @@ class HeadlessToolTests(unittest.TestCase):
         )
         self.assertIsNotNone(response)
         assert response is not None
-        result = response["result"]
-        self.assertIsInstance(result, dict)
-        return result
+        return expect_object(response["result"], name="resource.result")
 
     def test_multi_session_open_switch_close_and_resources(self) -> None:
         opened_elf = self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "elf"})
@@ -107,13 +126,10 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertEqual(switched["status"], "ok")
 
         current_resource = self._read_resource("ida://session/current")
-        contents = current_resource["contents"]
-        self.assertIsInstance(contents, list)
+        contents = expect_list(current_resource["contents"], name="current_resource.contents")
         self.assertGreater(len(contents), 0)
-        first = contents[0]
-        self.assertIsInstance(first, dict)
-        text = first.get("text")
-        self.assertIsInstance(text, str)
+        first = expect_object(contents[0], name="current_resource.contents[0]")
+        text = expect_string(first.get("text"), name="current_resource.contents[0].text")
         self.assertIn("elf", text)
 
         metadata = self._read_resource("ida://idb/metadata")
@@ -128,7 +144,7 @@ class HeadlessToolTests(unittest.TestCase):
         survey = self._call_tool("survey_binary", {"session_id": "elf-main"})
         self.assertIn(survey["status"], ("ok", "degraded"))
 
-        functions = self._call_tool("list_functions", {"queries": [{"filter": "main", "count": 20}], "session_id": "elf-main"})
+        functions = self._call_tool("list_functions", {"filter": "main", "count": 20, "session_id": "elf-main"})
         self.assertEqual(functions["status"], "ok")
 
         single = self._call_tool("get_function", {"query": "main", "session_id": "elf-main"})
@@ -151,9 +167,26 @@ class HeadlessToolTests(unittest.TestCase):
             },
         )
         self.assertEqual(comment["status"], "ok")
+        comment_data = comment["data"]
+        self.assertIsInstance(comment_data, dict)
+        assert isinstance(comment_data, dict)
+        self.assertTrue(bool(comment_data.get("dirty")))
+        self.assertEqual(comment_data.get("writeback_kind"), "comment")
+        self.assertFalse(bool(comment_data.get("persistent_after_save")))
+
+        saved = self._call_tool("save_binary", {"session_id": "elf-main"})
+        self.assertEqual(saved["status"], "ok")
+        saved_data = saved["data"]
+        self.assertIsInstance(saved_data, dict)
+        assert isinstance(saved_data, dict)
+        self.assertFalse(bool(saved_data.get("dirty")))
+        self.assertTrue(bool(saved_data.get("persistent_after_save")))
 
         capabilities = self._read_resource("ida://idb/capabilities")
         self.assertFalse(bool(capabilities.get("isError", False)))
+
+        capability_matrix = self._read_resource("ida://capability-matrix")
+        self.assertFalse(bool(capability_matrix.get("isError", False)))
 
         survey_resource = self._read_resource("ida://survey")
         self.assertFalse(bool(survey_resource.get("isError", False)))
@@ -179,6 +212,9 @@ class HeadlessToolTests(unittest.TestCase):
         managed_namespaces = self._read_resource("ida://managed/namespaces")
         self.assertFalse(bool(managed_namespaces.get("isError", False)))
 
+        tool_docs = self._read_resource("ida://docs/tools")
+        self.assertFalse(bool(tool_docs.get("isError", False)))
+
         function_profiles = self._read_resource("ida://functions/profiles")
         self.assertFalse(bool(function_profiles.get("isError", False)))
 
@@ -203,9 +239,12 @@ class HeadlessToolTests(unittest.TestCase):
         data_flow_resource = self._read_resource("ida://data-flow/main")
         self.assertFalse(bool(data_flow_resource.get("isError", False)))
 
+        tool_doc_resource = self._read_resource("ida://docs/tool/get_function")
+        self.assertFalse(bool(tool_doc_resource.get("isError", False)))
+
         exported_json = self._call_tool(
             "export_functions",
-            {"queries": ["main"], "format": "json", "session_id": "elf-main"},
+            {"items": ["main"], "format": "json", "session_id": "elf-main"},
         )
         self.assertEqual(exported_json["status"], "ok")
         exported_json_data = exported_json["data"]
@@ -230,7 +269,7 @@ class HeadlessToolTests(unittest.TestCase):
 
         exported_header = self._call_tool(
             "export_functions",
-            {"queries": ["main"], "format": "c_header", "session_id": "elf-main"},
+            {"items": ["main"], "format": "c_header", "session_id": "elf-main"},
         )
         self.assertEqual(exported_header["status"], "ok")
         exported_header_data = exported_header["data"]
@@ -244,7 +283,7 @@ class HeadlessToolTests(unittest.TestCase):
 
         exported_prototypes = self._call_tool(
             "export_functions",
-            {"queries": ["main"], "format": "prototypes", "session_id": "elf-main"},
+            {"items": ["main"], "format": "prototypes", "session_id": "elf-main"},
         )
         self.assertEqual(exported_prototypes["status"], "ok")
         exported_prototypes_data = exported_prototypes["data"]
@@ -271,7 +310,7 @@ class HeadlessToolTests(unittest.TestCase):
 
         declared = self._call_tool(
             "declare_types",
-            {"declarations": [declaration], "session_id": "elf-extended"},
+            {"items": [declaration], "session_id": "elf-extended"},
         )
         self.assertEqual(declared["status"], "ok")
 
@@ -286,6 +325,16 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertTrue(
             any(isinstance(item, dict) and item.get("name") == type_name for item in queried_type_rows)
         )
+        self.assertTrue(
+            all(
+                isinstance(item, dict)
+                and type_name.lower()
+                in (
+                    f"{item.get('name', '')} {item.get('declaration_or_signature', '')}"
+                ).lower()
+                for item in queried_type_rows
+            )
+        )
 
         type_resource = self._read_resource(f"ida://type/{type_name}")
         self.assertFalse(bool(type_resource.get("isError", False)))
@@ -298,10 +347,14 @@ class HeadlessToolTests(unittest.TestCase):
 
         inferred = self._call_tool(
             "infer_types",
-            {"queries": ["main"], "session_id": "elf-extended"},
+            {"items": ["main"], "session_id": "elf-extended"},
         )
         self.assertEqual(inferred["status"], "ok")
-        inferred_rows = inferred["data"]
+        inferred_data = inferred["data"]
+        self.assertIsInstance(inferred_data, dict)
+        assert isinstance(inferred_data, dict)
+        self.assertTrue(bool(inferred_data.get("dirty")))
+        inferred_rows = inferred_data.get("result")
         self.assertIsInstance(inferred_rows, list)
         assert isinstance(inferred_rows, list)
         self.assertGreater(len(inferred_rows), 0)
@@ -441,7 +494,7 @@ class HeadlessToolTests(unittest.TestCase):
 
         component = self._call_tool(
             "analyze_component",
-            {"root_query": "main", "max_depth": 2, "session_id": "elf-extended"},
+            {"query": "main", "max_depth": 2, "session_id": "elf-extended"},
         )
         self.assertEqual(component["status"], "ok")
 
@@ -472,21 +525,29 @@ class HeadlessToolTests(unittest.TestCase):
                 "recursive": True,
                 "max_candidates": 5,
                 "max_deep_analysis": 2,
+                "prefer_entry_binary": True,
+                "prefer_user_code": True,
+                "scoring_profile": "entry_only",
             },
         )
         self.assertIn(analyzed["status"], ("ok", "degraded"))
-        summary = analyzed["data"]
-        self.assertIsInstance(summary, dict)
+        summary = expect_object(analyzed["data"], name="analyze_directory.data")
         self.assertIn("summary", summary)
+        summary_block = expect_object(summary["summary"], name="analyze_directory.summary")
+        policy = expect_object(summary_block.get("policy"), name="analyze_directory.summary.policy")
+        self.assertEqual(policy.get("scoring_profile"), "entry_only")
 
         after = self._call_tool("current_binary")
         self.assertEqual(after["status"], "ok")
         after_data = after["data"]
         self.assertIsInstance(after_data, dict)
         assert isinstance(after_data, dict)
-        self.assertEqual(after_data.get("session_id"), "restore-target")
+        current_session = after_data.get("session")
+        self.assertIsInstance(current_session, dict)
+        assert isinstance(current_session, dict)
+        self.assertEqual(current_session.get("session_id"), "restore-target")
 
-    def test_query_imports_alias_filters_work(self) -> None:
+    def test_query_imports_filter_works(self) -> None:
         self._call_tool("open_binary", {"path": str(self.pe_fixture), "session_id": "pe-imports"})
         imports_result = self._call_tool("list_imports", {"session_id": "pe-imports"})
         self.assertEqual(imports_result["status"], "ok")
@@ -494,7 +555,7 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertIsInstance(imports_data, list)
         assert isinstance(imports_data, list)
         if not imports_data:
-            self.skipTest("当前最小 PE fixture 不包含可枚举导入，跳过 query_imports alias 集成验证")
+            self.skipTest("当前最小 PE fixture 不包含可枚举导入，跳过 query_imports 过滤验证")
         first_import = imports_data[0]
         self.assertIsInstance(first_import, dict)
         assert isinstance(first_import, dict)
@@ -502,7 +563,7 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertIsInstance(import_name, str)
         assert isinstance(import_name, str)
 
-        filtered = self._call_tool("query_imports", {"name": import_name, "session_id": "pe-imports"})
+        filtered = self._call_tool("query_imports", {"filter": import_name, "session_id": "pe-imports"})
         self.assertEqual(filtered["status"], "ok")
         filtered_data = filtered["data"]
         self.assertIsInstance(filtered_data, list)

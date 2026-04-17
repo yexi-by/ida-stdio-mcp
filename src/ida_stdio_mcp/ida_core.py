@@ -10,37 +10,38 @@ from __future__ import annotations
 import re
 from collections import defaultdict, deque
 from pathlib import Path
+from typing import Callable, Iterable, Protocol, TypeAlias, cast
 
 from .ida_bootstrap import ensure_ida_environment
 
 ensure_ida_environment()
 
-import ida_auto
-import ida_bytes
-import ida_dbg
-import ida_frame
-import ida_funcs
-import ida_hexrays
-import ida_ida
-import ida_idaapi
-import ida_idd
-import ida_idp
-import ida_lines
-import ida_loader
-import ida_nalt
-import ida_name
-import ida_segment
-import ida_typeinf
-import ida_ua
-import ida_xref
-import idaapi
-import idautils
-import idc
+import ida_auto  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_bytes  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_dbg  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_frame  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_funcs  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_hexrays  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_ida  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_idaapi  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_idd  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_idp  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_lines  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_loader  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_nalt  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_name  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_segment  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_typeinf  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_ua  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_xref  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import idaapi  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import idautils  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import idc  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
 
-from .models import AnalysisDomain, BinaryKind, JsonObject, JsonValue, ToolStatus
+from .models import AnalysisDomain, BinaryKind, JsonObject, JsonValue
 
 try:
-    import ida_entry
+    import ida_entry  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
 except ImportError:  # pragma: no cover - IDA 环境里通常可用
     ida_entry = None  # type: ignore[assignment]
 
@@ -48,13 +49,103 @@ BADADDR = ida_idaapi.BADADDR
 PE_SUFFIXES = {".exe", ".dll", ".sys"}
 ELF_SUFFIXES = {".elf", ".so"}
 MACHO_SUFFIXES = {".dylib", ".macho"}
+STRING_LITERAL_PATTERN = re.compile(r'"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"')
 
 
-class ToolEnvelope(dict[str, JsonValue]):
-    """内部工具返回包装。
+ToolEnvelope: TypeAlias = JsonObject
 
-    这里使用字典而不是 dataclass，是为了直接复用到最终的 MCP 输出结构。
-    """
+
+GET_IDB_PATH = cast(Callable[[int], str], ida_loader.get_path)
+GET_APP_BITNESS = cast(Callable[[], int], ida_ida.inf_get_app_bitness)
+GET_PROCNAME = ida_ida.inf_get_procname
+GET_IMAGEBASE = cast(Callable[[], int], ida_nalt.get_imagebase)
+GET_MAX_EA = cast(Callable[[], int], ida_ida.inf_get_max_ea)
+GET_MIN_EA = cast(Callable[[], int], ida_ida.inf_get_min_ea)
+GET_SEG = cast(Callable[[int], ida_segment.segment_t | None], ida_segment.getseg)
+GET_SEG_NAME = cast(Callable[[ida_segment.segment_t], str], ida_segment.get_segm_name)
+GET_ENTRY_QTY = ida_entry.get_entry_qty if ida_entry is not None else None
+GET_ENTRY_ORDINAL = cast(Callable[[int], int], ida_entry.get_entry_ordinal) if ida_entry is not None else None
+GET_ENTRY = cast(Callable[[int], int], ida_entry.get_entry) if ida_entry is not None else None
+GET_ENTRY_NAME = cast(Callable[[int], str], ida_entry.get_entry_name) if ida_entry is not None else None
+GET_FUNC = cast(Callable[[int], ida_funcs.func_t | None], ida_funcs.get_func)
+GET_FUNC_NAME = cast(Callable[[int], str], ida_funcs.get_func_name)
+GET_NAME = cast(Callable[[int], str], ida_name.get_name)
+GET_EA_NAME = cast(Callable[[int, int], str], ida_name.get_ea_name)
+GET_NAME_EA = cast(Callable[[int, str], int], ida_name.get_name_ea)
+GET_ITEM_SIZE = cast(Callable[[int], int], ida_bytes.get_item_size)
+GET_BYTES = cast(Callable[[int, int, int], bytes | None], ida_bytes.get_bytes)
+GET_FLAGS = cast(Callable[[int], int], ida_bytes.get_flags)
+IS_CODE = cast(Callable[[int], bool], ida_bytes.is_code)
+GET_QWORD = cast(Callable[[int], int], ida_bytes.get_qword)
+GET_DWORD = cast(Callable[[int], int], ida_bytes.get_dword)
+IS_LOADED = cast(Callable[[int], bool], ida_bytes.is_loaded)
+GET_IMPORT_MODULE_QTY = cast(Callable[[], int], ida_nalt.get_import_module_qty)
+GET_CMT = cast(Callable[[int, bool], str], ida_bytes.get_cmt)
+SET_CMT = cast(Callable[[int, str, bool], bool], ida_bytes.set_cmt)
+PATCH_BYTES = cast(Callable[[int, bytes], None], ida_bytes.patch_bytes)
+FIND_BYTES = cast(Callable[..., int], ida_bytes.find_bytes)
+SET_NAME = cast(Callable[[int, str, int], bool], ida_name.set_name)
+GET_FLOW_CHART = cast(Callable[[ida_funcs.func_t], object], idaapi.FlowChart)
+CREATE_INSN = cast(Callable[[int, ida_ua.insn_t], int], ida_ua.create_insn)
+DECODE_INSN = cast(Callable[[ida_ua.insn_t, int], int], ida_ua.decode_insn)
+DEL_ITEMS = cast(Callable[[int, int, int], bool], ida_bytes.del_items)
+GUESS_TINFO = cast(Callable[[ida_typeinf.tinfo_t, int], int], ida_typeinf.guess_tinfo)
+GET_TINFO = cast(Callable[[ida_typeinf.tinfo_t, int], bool], ida_nalt.get_tinfo)
+APPLY_TINFO = cast(Callable[[int, ida_typeinf.tinfo_t, int], bool], ida_typeinf.apply_tinfo)
+PARSE_DECL = cast(Callable[[ida_typeinf.tinfo_t, object, str, int], object], ida_typeinf.parse_decl)
+DEFINE_STKVAR = cast(Callable[[ida_funcs.func_t, str, int, ida_typeinf.tinfo_t], bool], ida_frame.define_stkvar)
+GET_FUNC_FRAME = cast(Callable[[ida_typeinf.tinfo_t, ida_funcs.func_t], bool], ida_frame.get_func_frame)
+IS_SPECIAL_FRAME_MEMBER = cast(Callable[[int], bool], ida_frame.is_special_frame_member)
+IS_FUNCARG_OFF = cast(Callable[[ida_funcs.func_t, int], bool], ida_frame.is_funcarg_off)
+DELETE_FRAME_MEMBERS = cast(Callable[[ida_funcs.func_t, int, int], bool], ida_frame.delete_frame_members)
+ASSEMBLE = cast(Callable[[int, str], tuple[bool, bytes] | object], idautils.Assemble)
+GENERATE_DISASM_LINE = cast(Callable[[int, int], str], ida_lines.generate_disasm_line)
+START_PROCESS = cast(Callable[[str, str, str], bool], ida_dbg.start_process)
+EXIT_PROCESS = cast(Callable[[], None], ida_dbg.exit_process)
+CONTINUE_PROCESS = cast(Callable[[], None], ida_dbg.continue_process)
+STEP_INTO = cast(Callable[[], None], ida_dbg.step_into)
+STEP_OVER = cast(Callable[[], None], ida_dbg.step_over)
+REQUEST_RUN_TO = cast(Callable[[int], bool], ida_dbg.request_run_to)
+GET_PROCESS_STATE = ida_dbg.get_process_state
+GET_BPT_QTY = ida_dbg.get_bpt_qty
+GET_NTH_BPT = cast(Callable[[int, ida_dbg.bpt_t], bool], ida_dbg.getn_bpt)
+ADD_BPT = cast(Callable[[int], bool], ida_dbg.add_bpt)
+DEL_BPT = cast(Callable[[int], bool], ida_dbg.del_bpt)
+EXIST_BPT = cast(Callable[[int], bool], ida_dbg.exist_bpt)
+ENABLE_BPT = cast(Callable[[int, bool], bool], idaapi.enable_bpt)
+GET_CURRENT_THREAD = cast(Callable[[], int], ida_dbg.get_current_thread)
+GET_THREAD_QTY = ida_dbg.get_thread_qty
+GET_NTH_THREAD = cast(Callable[[int], int], ida_dbg.getn_thread)
+GET_NTH_THREAD_NAME = cast(Callable[[int], str], ida_dbg.getn_thread_name)
+GET_REG_VALS = cast(Callable[[int, int], object], ida_dbg.get_reg_vals)
+COLLECT_STACK_TRACE = cast(Callable[[int, ida_idd.call_stack_t], bool], ida_dbg.collect_stack_trace)
+GET_MODULE_INFO = cast(Callable[[int, ida_idd.modinfo_t], bool], ida_dbg.get_module_info)
+READ_DBG_MEMORY = cast(Callable[[int, int], bytes | None], ida_dbg.read_dbg_memory)
+WRITE_DBG_MEMORY = cast(Callable[[int, bytes], int], ida_dbg.write_dbg_memory)
+GET_NICE_COLORED_NAME = cast(Callable[[int, int], str], ida_name.get_nice_colored_name)
+NEW_TINFO = cast(Callable[[], ida_typeinf.tinfo_t], ida_typeinf.tinfo_t)
+NEW_INSN = cast(Callable[[], ida_ua.insn_t], ida_ua.insn_t)
+NEW_BPT = cast(Callable[[], ida_dbg.bpt_t], ida_dbg.bpt_t)
+NEW_UDM = cast(Callable[[], ida_typeinf.udm_t], ida_typeinf.udm_t)
+NEW_CALL_STACK = cast(Callable[[], ida_idd.call_stack_t], ida_idd.call_stack_t)
+NEW_MODINFO = cast(Callable[[], ida_idd.modinfo_t], ida_idd.modinfo_t)
+NEW_UDT_DATA = cast(Callable[[], ida_typeinf.udt_type_data_t], ida_typeinf.udt_type_data_t)
+CREATE_STRINGS = cast(Callable[[], object], idautils.Strings)
+
+
+class _FlowBlock(Protocol):
+    start_ea: int
+    end_ea: int
+
+    def succs(self) -> object: ...
+
+    def preds(self) -> object: ...
+
+
+class _StringItem(Protocol):
+    ea: int
+
+    def __str__(self) -> str: ...
 
 
 class IdaCore:
@@ -63,20 +154,22 @@ class IdaCore:
     def wait_auto_analysis(self) -> JsonObject:
         """等待自动分析结束。"""
         ida_auto.auto_wait()
-        return {"waited": True}
+        return self._json_object({"waited": True})
 
     def capabilities(self) -> JsonObject:
         """返回当前数据库的能力矩阵。"""
         analysis_domain = self.get_analysis_domain()
-        representations: list[str] = ["asm_fallback"]
+        representations: list[JsonValue] = ["asm_fallback"]
         if analysis_domain == "managed":
             representations.insert(0, "il")
         if self.hexrays_available():
             representations.insert(0, "hexrays")
-        catalogs: list[str] = ["local_types"]
+        catalogs: list[JsonValue] = ["local_types"]
         if analysis_domain == "managed":
             catalogs.append("managed_types")
-        return {
+        debugger_health = self.debugger_health()
+        debugger_available = bool(debugger_health.get("backend_available"))
+        return self._json_object({
             "binary_kind": self.get_binary_kind(),
             "analysis_domain": analysis_domain,
             "active_backend": analysis_domain,
@@ -84,12 +177,38 @@ class IdaCore:
             "catalogs": catalogs,
             "callgraph_quality": "coderefs",
             "decompiler_state": "hexrays" if self.hexrays_available() else "asm_fallback",
+            "decompile_mode": "hexrays" if self.hexrays_available() else ("il_fallback" if analysis_domain == "managed" else "asm_fallback"),
+            "string_index_quality": self._string_index_quality(),
+            "type_writeback_support": self._type_writeback_support(),
+            "debugger_support": "available" if debugger_available else "unavailable",
             "managed_support": self._managed_support_matrix(),
-        }
+        })
+
+    def capability_matrix(self) -> JsonObject:
+        """返回正式能力矩阵文档。
+
+        这里不是“当前样本是否正好可用”的一次性快照，而是把 headless 模式下
+        native / managed 两条主能力域的设计边界显式表达出来，便于 MCP 客户端
+        在调用前做规划，而不是靠失败来反推能力边界。
+        """
+        debugger_available = bool(self.debugger_health().get("backend_available"))
+        return self._json_object({
+            "capabilities": [
+                {"capability": "list_functions", "native": "full", "managed": "full", "notes": "native 与托管都支持符号级函数枚举"},
+                {"capability": "build_callgraph", "native": "full", "managed": "degraded", "notes": "托管场景目前基于符号与 IL/反汇编文本构图"},
+                {"capability": "decompile_function", "native": "full" if self.hexrays_available() else "degraded", "managed": "degraded", "notes": "managed 目前为 symbolic IL fallback"},
+                {"capability": "list_strings", "native": "full", "managed": self._string_index_quality(), "notes": "managed 字符串索引来自 IL/反汇编文本抽取"},
+                {"capability": "set_types", "native": "full", "managed": self._type_writeback_support(), "notes": "托管类型写回目前以 native-only 为主"},
+                {"capability": "patch_bytes", "native": "full", "managed": "full", "notes": "只要地址可写，补丁能力本身不依赖 GUI"},
+                {"capability": "debugger", "native": "available" if debugger_available else "unavailable", "managed": "available" if debugger_available else "unavailable", "notes": "是否真正可用取决于当前调试器后端"},
+            ],
+            "current_domain": self.get_analysis_domain(),
+            "current_snapshot": self.capabilities(),
+        })
 
     def health(self) -> JsonObject:
         """返回当前数据库健康状态。"""
-        return {
+        return self._json_object({
             "metadata": self.idb_metadata(),
             "processor": ida_idp.get_idp_name(),
             "has_hexrays": self.hexrays_available(),
@@ -98,26 +217,26 @@ class IdaCore:
             "segment_count": len(self.segments()),
             "capabilities": self.capabilities(),
             "debugger": self.debugger_health(),
-        }
+        })
 
     def idb_metadata(self) -> JsonObject:
         """返回当前 IDB 元数据。"""
         input_path = Path(ida_nalt.get_input_file_path() or "")
         md5_bytes = ida_nalt.retrieve_input_file_md5()
         sha256_bytes = ida_nalt.retrieve_input_file_sha256()
-        return {
-            "path": ida_loader.get_path(ida_loader.PATH_TYPE_IDB) or "",
+        return self._json_object({
+            "path": GET_IDB_PATH(ida_loader.PATH_TYPE_IDB) or "",
             "input_path": str(input_path),
             "module": input_path.name,
-            "processor": ida_ida.inf_get_procname(),
-            "arch": str(8 * ida_ida.inf_get_app_bitness()),
-            "base_address": hex(ida_nalt.get_imagebase()),
-            "image_size": hex(max(0, ida_ida.inf_get_max_ea() - ida_ida.inf_get_min_ea())),
+            "processor": GET_PROCNAME(),
+            "arch": str(8 * GET_APP_BITNESS()),
+            "base_address": hex(GET_IMAGEBASE()),
+            "image_size": hex(max(0, GET_MAX_EA() - GET_MIN_EA())),
             "md5": md5_bytes.hex() if md5_bytes else "",
             "sha256": sha256_bytes.hex() if sha256_bytes else "",
             "binary_kind": self.get_binary_kind(),
             "analysis_domain": self.get_analysis_domain(),
-        }
+        })
 
     def get_binary_kind(self) -> BinaryKind:
         """推断当前样本类型。"""
@@ -145,12 +264,12 @@ class IdaCore:
         """列出所有段。"""
         results: list[JsonObject] = []
         for seg_ea in idautils.Segments():
-            seg = ida_segment.getseg(seg_ea)
+            seg = GET_SEG(seg_ea)
             if seg is None:
                 continue
             results.append(
                 {
-                    "name": ida_segment.get_segm_name(seg),
+                    "name": GET_SEG_NAME(seg),
                     "start": hex(seg.start_ea),
                     "end": hex(seg.end_ea),
                     "size": hex(max(0, seg.end_ea - seg.start_ea)),
@@ -162,17 +281,17 @@ class IdaCore:
     def entrypoints(self) -> list[JsonObject]:
         """列出入口点。"""
         results: list[JsonObject] = []
-        if ida_entry is None:
+        if GET_ENTRY_QTY is None or GET_ENTRY_ORDINAL is None or GET_ENTRY is None or GET_ENTRY_NAME is None:
             return results
-        for index in range(ida_entry.get_entry_qty()):
-            ordinal = ida_entry.get_entry_ordinal(index)
-            ea = ida_entry.get_entry(ordinal)
+        for index in range(GET_ENTRY_QTY()):
+            ordinal = GET_ENTRY_ORDINAL(index)
+            ea = GET_ENTRY(ordinal)
             if ea == BADADDR:
                 continue
             results.append(
                 {
                     "addr": hex(ea),
-                    "name": ida_entry.get_entry_name(ordinal) or ida_name.get_name(ea) or hex(ea),
+                    "name": GET_ENTRY_NAME(ordinal) or GET_NAME(ea) or hex(ea),
                     "ordinal": ordinal,
                 }
             )
@@ -205,7 +324,7 @@ class IdaCore:
                     "signature": item.get("signature", ""),
                 }
             )
-        return {
+        return self._json_object({
             "metadata": self.idb_metadata(),
             "statistics": {
                 "total_functions": len(functions),
@@ -223,7 +342,13 @@ class IdaCore:
             "imports_by_category": self._categorize_imports(),
             "call_graph_summary": self._callgraph_summary(functions),
             "managed_summary": self.managed_summary(),
-        }
+            "quality": {
+                "decompile_mode": self.capabilities()["decompile_mode"],
+                "string_index_quality": self.capabilities()["string_index_quality"],
+                "type_writeback_support": self.capabilities()["type_writeback_support"],
+                "debugger_support": self.capabilities()["debugger_support"],
+            },
+        })
 
     def list_functions(self, *, filter_text: str = "", offset: int = 0, limit: int = 100) -> list[JsonObject]:
         """分页列出函数。"""
@@ -231,10 +356,10 @@ class IdaCore:
         analysis_domain = self.get_analysis_domain()
         results: list[JsonObject] = []
         for ea in idautils.Functions():
-            func = idaapi.get_func(ea)
+            func = GET_FUNC(ea)
             if func is None:
                 continue
-            name = ida_funcs.get_func_name(ea) or hex(ea)
+            name = GET_FUNC_NAME(ea) or hex(ea)
             if lowered and lowered not in name.lower() and lowered not in hex(ea):
                 continue
             row: JsonObject = {
@@ -259,17 +384,17 @@ class IdaCore:
             raise ValueError("query 不能为空")
         if self._looks_like_address(text):
             ea = self.parse_address(text)
-            func = idaapi.get_func(ea)
+            func = GET_FUNC(ea)
             if func is None:
                 raise ValueError(f"找不到函数：{query}")
-            return {"ea": func.start_ea, "name": ida_funcs.get_func_name(func.start_ea) or hex(func.start_ea)}
+            return self._json_object({"ea": func.start_ea, "name": GET_FUNC_NAME(func.start_ea) or hex(func.start_ea)})
         partial: JsonObject | None = None
         for ea in idautils.Functions():
-            name = ida_funcs.get_func_name(ea) or hex(ea)
+            name = GET_FUNC_NAME(ea) or hex(ea)
             if name == text:
-                return {"ea": ea, "name": name}
+                return self._json_object({"ea": ea, "name": name})
             if partial is None and text.lower() in name.lower():
-                partial = {"ea": ea, "name": name}
+                partial = self._json_object({"ea": ea, "name": name})
         if partial is None:
             raise ValueError(f"找不到函数：{query}")
         return partial
@@ -280,7 +405,7 @@ class IdaCore:
         ea = self._match_ea(match)
         name = self._match_name(match)
         func = self.require_function(ea)
-        return {
+        return self._json_object({
             "addr": hex(func.start_ea),
             "name": name,
             "size": func.end_ea - func.start_ea,
@@ -289,7 +414,7 @@ class IdaCore:
             "comments": self.function_comments(func.start_ea),
             "callers": self.get_callers(hex(func.start_ea)),
             "callees": self.get_callees(hex(func.start_ea)),
-        }
+        })
 
     def get_function_profile(self, query: str, *, include_asm: bool = True) -> JsonObject:
         """返回函数画像。"""
@@ -318,13 +443,13 @@ class IdaCore:
             result["disassembly"] = self.disassemble_function(query)["text"]
         return result
 
-    def analyze_functions(self, queries: list[str]) -> list[JsonObject]:
+    def analyze_functions(self, items: list[str]) -> list[JsonObject]:
         """批量分析多个函数。"""
-        return [self.get_function_profile(query) for query in queries]
+        return [self.get_function_profile(query) for query in items]
 
     def function_signature(self, ea: int) -> str:
         """读取函数签名。"""
-        return idc.get_type(ea) or (ida_funcs.get_func_name(ea) or hex(ea))
+        return idc.get_type(ea) or (GET_FUNC_NAME(ea) or hex(ea))
 
     def decompile_function(self, query: str) -> JsonObject:
         """返回统一高层表示。"""
@@ -339,40 +464,49 @@ class IdaCore:
         if self.hexrays_available():
             try:
                 cfunc = ida_hexrays.decompile(func.start_ea)
-                if cfunc is not None:
-                    return {
-                        "status": "ok",
-                        "addr": hex(func.start_ea),
-                        "name": func_name,
-                        "signature": signature,
-                        "analysis_domain": analysis_domain,
-                        "representation": "hexrays",
-                        "language": "c",
-                        "text": str(cfunc),
-                        "source": "ida_hexrays",
-                        "warnings": warnings,
-                        "error": None,
-                        "managed_identity": managed_identity,
-                    }
+                return self._json_object({
+                    "status": "ok",
+                    "addr": hex(func.start_ea),
+                    "name": func_name,
+                    "signature": signature,
+                    "analysis_domain": analysis_domain,
+                    "representation": "hexrays",
+                    "backend": "ida_hexrays",
+                    "confidence": "high",
+                    "reconstruction_level": "high_level_c",
+                    "type_recovery": "full",
+                    "variable_recovery": "full",
+                    "language": "c",
+                    "text": str(cfunc),
+                    "source": "ida_hexrays",
+                    "warnings": warnings,
+                    "error": None,
+                    "managed_identity": managed_identity,
+                })
             except Exception as exc:
                 warnings.append(f"Hex-Rays 反编译失败，已降级：{exc}")
         representation = "il" if analysis_domain == "managed" else "asm_fallback"
         if representation == "il":
             warnings.append("当前样本属于托管/IL 域，暂未提供真正托管高层反编译，已返回 IL/反汇编级表示")
-        return {
+        return self._json_object({
             "status": "degraded",
             "addr": hex(func.start_ea),
             "name": func_name,
             "signature": signature,
             "analysis_domain": analysis_domain,
             "representation": representation,
+            "backend": "ida_lines_managed" if representation == "il" else "ida_lines",
+            "confidence": "medium" if representation == "il" else "low",
+            "reconstruction_level": "il_text" if representation == "il" else "assembly_text",
+            "type_recovery": "partial" if representation == "il" else "limited",
+            "variable_recovery": "none",
             "language": "il" if representation == "il" else "asm",
             "text": self.render_managed_method_view(func.start_ea) if representation == "il" else self.render_function_disassembly(func.start_ea),
             "source": "ida_lines_managed" if representation == "il" else "ida_lines",
             "warnings": warnings or ["当前不可用 Hex-Rays，已回退到汇编文本"],
             "error": None,
             "managed_identity": managed_identity,
-        }
+        })
 
     def disassemble_function(self, query: str) -> JsonObject:
         """返回函数反汇编。"""
@@ -380,29 +514,29 @@ class IdaCore:
         ea = self._match_ea(match)
         func = self.require_function(ea)
         lines = self.disassembly_lines(func.start_ea)
-        return {
+        return self._json_object({
             "addr": hex(func.start_ea),
             "name": self._match_name(match),
             "text": "\n".join(str(item.get("text", "")) for item in lines),
             "lines": lines,
-        }
+        })
 
     def list_globals(self, *, filter_text: str = "", offset: int = 0, limit: int = 100) -> list[JsonObject]:
         """列出全局符号。"""
         lowered = filter_text.lower()
         results: list[JsonObject] = []
         for ea, name in idautils.Names():
-            if idaapi.get_func(ea) is not None:
+            if GET_FUNC(ea) is not None:
                 continue
             if lowered and lowered not in name.lower() and lowered not in hex(ea):
                 continue
-            seg = ida_segment.getseg(ea)
+            seg = GET_SEG(ea)
             results.append(
                 {
                     "addr": hex(ea),
                     "name": name,
                     "segment": ida_segment.get_segm_name(seg) if seg is not None else "",
-                    "size": ida_bytes.get_item_size(ea),
+                    "size": GET_ITEM_SIZE(ea),
                 }
             )
         return results[offset : offset + limit]
@@ -410,7 +544,7 @@ class IdaCore:
     def list_imports(self, *, offset: int = 0, limit: int = 200) -> list[JsonObject]:
         """列出导入表。"""
         results: list[JsonObject] = []
-        for index in range(ida_nalt.get_import_module_qty()):
+        for index in range(GET_IMPORT_MODULE_QTY()):
             module_name = ida_nalt.get_import_module_name(index) or f"module_{index}"
 
             def callback(ea: int, name: str | None, ordinal: int) -> bool:
@@ -427,10 +561,10 @@ class IdaCore:
             ida_nalt.enum_import_names(index, callback)
         return results[offset : offset + limit]
 
-    def query_imports(self, *, module: str = "", name_filter: str = "", offset: int = 0, limit: int = 200) -> list[JsonObject]:
+    def query_imports(self, *, module: str = "", filter_text: str = "", offset: int = 0, limit: int = 200) -> list[JsonObject]:
         """按条件查询导入。"""
         module_text = module.lower()
-        name_text = name_filter.lower()
+        name_text = filter_text.lower()
         results: list[JsonObject] = []
         for item in self.list_imports(offset=0, limit=10_000):
             item_module = str(item.get("module", ""))
@@ -466,17 +600,17 @@ class IdaCore:
             for ref in idautils.XrefsFrom(ea)
         ]
 
-    def query_xrefs(self, *, from_query: str = "", to_query: str = "", xref_type: str = "") -> list[JsonObject]:
+    def query_xrefs(self, *, query: str, direction: str = "to", filter_text: str = "") -> list[JsonObject]:
         """按条件过滤 xref。"""
-        if from_query:
-            items = self.get_xrefs_from(from_query)
-        elif to_query:
-            items = self.get_xrefs_to(to_query)
+        if direction == "from":
+            items = self.get_xrefs_from(query)
+        elif direction == "to":
+            items = self.get_xrefs_to(query)
         else:
-            raise ValueError("from_query 与 to_query 至少提供一个")
-        if not xref_type:
+            raise ValueError("direction 必须是 from 或 to")
+        if not filter_text:
             return items
-        return [item for item in items if xref_type.lower() in str(item.get("type", "")).lower()]
+        return [item for item in items if filter_text.lower() in str(item.get("type", "")).lower()]
 
     def get_xrefs_to_field(self, struct_name: str, field_name: str) -> list[JsonObject]:
         """读取结构体字段 xref。"""
@@ -500,8 +634,8 @@ class IdaCore:
             edge_kind = self.callgraph_edge_kind(item_ea, func.start_ea)
             if edge_kind is None:
                 continue
-            for target in idautils.CodeRefsFrom(item_ea, 0):
-                callee_func = idaapi.get_func(target)
+            for target in idautils.CodeRefsFrom(item_ea, False):
+                callee_func = GET_FUNC(target)
                 if callee_func is None and not self._is_external_call_target(target):
                     continue
                 resolved = callee_func.start_ea if callee_func is not None else target
@@ -524,8 +658,8 @@ class IdaCore:
         match = self.lookup_function(query)
         func = self.require_function(self._match_ea(match))
         callers: dict[int, JsonObject] = {}
-        for caller_site in idautils.CodeRefsTo(func.start_ea, 0):
-            caller_func = idaapi.get_func(caller_site)
+        for caller_site in idautils.CodeRefsTo(func.start_ea, False):
+            caller_func = GET_FUNC(caller_site)
             if caller_func is None or caller_func.start_ea in callers:
                 continue
             edge_kind = self.callgraph_edge_kind(caller_site, caller_func.start_ea)
@@ -547,34 +681,53 @@ class IdaCore:
         """读取基本块。"""
         match = self.lookup_function(query)
         func = self.require_function(self._match_ea(match))
-        flowchart = idaapi.FlowChart(func)
+        flowchart = GET_FLOW_CHART(func)
         blocks: list[JsonObject] = []
         edge_count = 0
-        for block in flowchart:
-            succs = [hex(succ.start_ea) for succ in block.succs()]
-            preds = [hex(pred.start_ea) for pred in block.preds()]
+        for block in cast(list[_FlowBlock], self._iter_objects(flowchart)):
+            block_start = block.start_ea
+            block_end = block.end_ea
+            succs = [hex(self._int_attr(succ, "start_ea")) for succ in self._iter_objects(block.succs())]
+            preds = [hex(self._int_attr(pred, "start_ea")) for pred in self._iter_objects(block.preds())]
             edge_count += len(succs)
-            blocks.append({"start": hex(block.start_ea), "end": hex(block.end_ea), "succs": succs, "preds": preds})
+            blocks.append(self._json_object({"start": hex(block_start), "end": hex(block_end), "succs": succs, "preds": preds}))
         cyclomatic = edge_count - len(blocks) + 2 if blocks else 1
-        return {"count": len(blocks), "cyclomatic_complexity": cyclomatic, "blocks": blocks}
+        return self._json_object({"count": len(blocks), "cyclomatic_complexity": cyclomatic, "blocks": blocks})
 
     def list_strings(self, *, offset: int = 0, limit: int = 100) -> list[JsonObject]:
         """分页列出字符串。"""
         results: list[JsonObject] = []
-        strings = idautils.Strings()
-        strings.setup()
-        for item in strings:
+        seen: set[tuple[str, str]] = set()
+        strings = CREATE_STRINGS()
+        cast(Callable[[], None], getattr(strings, "setup"))()
+        for item in cast(list[_StringItem], self._iter_objects(strings)):
             text = str(item)
             if not text:
                 continue
+            addr_text = hex(int(item.ea))
+            key = (addr_text, text)
+            if key in seen:
+                continue
+            seen.add(key)
             results.append(
                 {
-                    "addr": hex(int(item.ea)),
+                    "addr": addr_text,
                     "string": text,
                     "length": len(text),
                     "xref_count": len(list(idautils.XrefsTo(int(item.ea)))),
+                    "source": "ida_strings",
                 }
             )
+        for row in self._managed_string_rows(limit=10_000):
+            addr_value = row.get("addr")
+            text_value = row.get("string")
+            if not isinstance(addr_value, str) or not isinstance(text_value, str):
+                continue
+            key = (addr_value, text_value)
+            if key in seen:
+                continue
+            seen.add(key)
+            results.append(row)
         return results[offset : offset + limit]
 
     def find_strings(self, pattern: str, *, offset: int = 0, limit: int = 100) -> JsonObject:
@@ -582,22 +735,22 @@ class IdaCore:
         lowered = pattern.lower()
         matched = [item for item in self.list_strings(offset=0, limit=10_000) if lowered in str(item.get("string", "")).lower()]
         next_offset = offset + limit if offset + limit < len(matched) else None
-        return {"data": matched[offset : offset + limit], "next_offset": next_offset}
+        return self._json_object({"data": matched[offset : offset + limit], "next_offset": next_offset})
 
     def search_regex(self, pattern: str, *, offset: int = 0, limit: int = 100) -> JsonObject:
         """按正则搜索字符串。"""
         compiled = re.compile(pattern)
         matched = [item for item in self.list_strings(offset=0, limit=10_000) if compiled.search(str(item.get("string", "")))]
         next_offset = offset + limit if offset + limit < len(matched) else None
-        return {"data": matched[offset : offset + limit], "next_offset": next_offset}
+        return self._json_object({"data": matched[offset : offset + limit], "next_offset": next_offset})
 
     def find_bytes(self, pattern: str, *, max_hits: int = 100) -> list[JsonObject]:
         """按字节模式搜索。"""
-        current = ida_ida.inf_get_min_ea()
-        end = ida_ida.inf_get_max_ea()
+        current = GET_MIN_EA()
+        end = GET_MAX_EA()
         results: list[JsonObject] = []
         while current != BADADDR and current < end and len(results) < max_hits:
-            found = ida_bytes.find_bytes(
+            found = FIND_BYTES(
                 pattern,
                 current,
                 range_end=end,
@@ -626,16 +779,18 @@ class IdaCore:
                     return results
         return results
 
-    def query_instructions(self, mnemonic: str, *, max_hits: int = 100) -> list[JsonObject]:
+    def query_instructions(self, pattern: str, *, max_hits: int = 100) -> list[JsonObject]:
         """按助记符查询指令。"""
         results: list[JsonObject] = []
+        lowered = pattern.lower()
         for ea in idautils.Heads():
-            if not ida_bytes.is_code(ida_bytes.get_flags(ea)):
+            if not IS_CODE(GET_FLAGS(ea)):
                 continue
             current = idc.print_insn_mnem(ea)
-            if current.lower() != mnemonic.lower():
+            line = self.line_text(ea)
+            if lowered not in current.lower() and lowered not in line.lower():
                 continue
-            results.append({"addr": hex(ea), "mnem": current, "text": self.line_text(ea)})
+            results.append({"addr": hex(ea), "mnem": current, "text": line})
             if len(results) >= max_hits:
                 break
         return results
@@ -645,21 +800,27 @@ class IdaCore:
         results: list[JsonObject] = []
         for addr in addrs:
             ea = self.parse_address(addr)
-            data = ida_bytes.get_bytes(ea, size) or b""
+            data = GET_BYTES(ea, size, 0) or b""
             results.append({"addr": hex(ea), "size": len(data), "hex": data.hex()})
         return results
 
-    def read_ints(self, queries: list[JsonObject]) -> list[JsonObject]:
+    def read_ints(self, items: list[JsonObject]) -> list[JsonObject]:
         """读取整数。"""
         results: list[JsonObject] = []
-        for query in queries:
+        for query in items:
             addr_text = query.get("addr")
-            size = int(query.get("size", 4))
-            signed = bool(query.get("signed", False))
+            size_value = query.get("size", 4)
+            signed_value = query.get("signed", False)
             if not isinstance(addr_text, str):
                 raise ValueError("read_ints 的 addr 必须是字符串")
+            if not isinstance(size_value, int):
+                raise ValueError("read_ints 的 size 必须是整数")
+            if not isinstance(signed_value, bool):
+                raise ValueError("read_ints 的 signed 必须是布尔值")
+            size = size_value
+            signed = signed_value
             ea = self.parse_address(addr_text)
-            raw = ida_bytes.get_bytes(ea, size) or b""
+            raw = GET_BYTES(ea, size, 0) or b""
             value = int.from_bytes(raw, byteorder="little", signed=signed)
             results.append({"addr": hex(ea), "size": size, "signed": signed, "value": value})
         return results
@@ -671,12 +832,18 @@ class IdaCore:
             ea = self.parse_address(addr)
             raw = idc.get_strlit_contents(ea, max_length, idc.STRTYPE_C)
             text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else ""
-            results.append({"addr": hex(ea), "string": text})
+            source = "ida_strlit" if text else "unresolved"
+            if not text:
+                line_strings = self._line_string_literals(self.line_text(ea))
+                text = line_strings[0] if line_strings else ""
+                if text:
+                    source = "managed_il_text"
+            results.append({"addr": hex(ea), "string": text, "source": source})
         return results
 
     def read_global_values(self, addrs: list[str], *, size: int = 8) -> list[JsonObject]:
         """读取全局值。"""
-        return self.read_ints([{"addr": addr, "size": size, "signed": False} for addr in addrs])
+        return self.read_ints([self._json_object({"addr": addr, "size": size, "signed": False}) for addr in addrs])
 
     def get_stack_frame(self, query: str) -> JsonObject:
         """读取栈帧。"""
@@ -684,7 +851,7 @@ class IdaCore:
         func = self.require_function(self._match_ea(match))
         frame_id = int(idc.get_frame_id(func.start_ea))
         if frame_id in (-1, BADADDR):
-            return {"size": 0, "members": []}
+            return self._json_object({"size": 0, "members": []})
         members: list[JsonObject] = []
         for member_offset, member_name, member_size in idautils.StructMembers(frame_id):
             members.append(
@@ -694,7 +861,7 @@ class IdaCore:
                     "size": int(member_size),
                 }
             )
-        return {"size": int(idc.get_frame_size(func.start_ea)), "members": members}
+        return self._json_object({"size": int(idc.get_frame_size(func.start_ea)), "members": members})
 
     def read_struct(self, struct_name: str) -> JsonObject:
         """读取结构体。"""
@@ -703,13 +870,13 @@ class IdaCore:
             type_row = self.inspect_type(struct_name)
             kind = type_row.get("kind")
             if kind in {"udt", "managed_type"}:
-                return {
+                return self._json_object({
                     "name": struct_name,
                     "size": None,
                     "members": type_row.get("members", []),
                     "catalog": type_row.get("catalog", "local_types"),
                     "source": type_row.get("source", "ida_typeinf"),
-                }
+                })
             raise ValueError(f"找不到结构体：{struct_name}")
         members: list[JsonObject] = []
         for member_offset, member_name, member_size in idautils.StructMembers(struct_id):
@@ -720,7 +887,7 @@ class IdaCore:
                     "size": int(member_size),
                 }
             )
-        return {"name": struct_name, "size": int(idc.get_struc_size(struct_id)), "members": members}
+        return self._json_object({"name": struct_name, "size": int(idc.get_struc_size(struct_id)), "members": members})
 
     def search_structs(self, filter_text: str = "") -> list[JsonObject]:
         """搜索结构体。"""
@@ -758,22 +925,27 @@ class IdaCore:
         lowered = filter_text.lower()
         results: list[JsonObject] = []
         for ordinal in range(1, ida_typeinf.get_ordinal_limit()):
-            tif = ida_typeinf.tinfo_t()
-            if not tif.get_numbered_type(None, ordinal):
+            tif = NEW_TINFO()
+            get_numbered_type = cast(Callable[[object, int], bool], tif.get_numbered_type)
+            if not get_numbered_type(cast(object, ida_typeinf.get_idati()), ordinal):
                 continue
             raw_name = tif.get_type_name()
-            name = raw_name if isinstance(raw_name, str) else ""
-            if not name or (lowered and lowered not in name.lower()):
+            name = str(raw_name).strip()
+            if not name:
                 continue
-            results.append(self._type_row(name, tif))
+            row = self._type_row(name, tif)
+            if lowered and not self._type_row_matches_filter(row, lowered):
+                continue
+            results.append(row)
         if self.get_analysis_domain() == "managed":
             results.extend(self.managed_types(filter_text=filter_text))
         return results
 
     def inspect_type(self, name: str) -> JsonObject:
         """读取单个类型。"""
-        tif = ida_typeinf.tinfo_t()
-        if not tif.get_named_type(None, name):
+        tif = NEW_TINFO()
+        get_named_type = cast(Callable[[object, str], bool], tif.get_named_type)
+        if not get_named_type(cast(object, ida_typeinf.get_idati()), name):
             if self.get_analysis_domain() == "managed":
                 for row in self.managed_types(filter_text=name):
                     row_name = row.get("name")
@@ -786,7 +958,7 @@ class IdaCore:
     def export_functions(
         self,
         *,
-        queries: list[str] | None = None,
+        items: list[str] | None = None,
         format_name: str = "json",
         limit: int = 1000,
     ) -> list[JsonObject]:
@@ -797,7 +969,7 @@ class IdaCore:
         - `c_header`：把函数原型拼成近似头文件
         - `prototypes`：只关心签名摘要
         """
-        target_queries = self._export_function_targets(queries=queries, limit=limit)
+        target_queries = self._export_function_targets(items=items, limit=limit)
         exported: list[JsonObject] = []
         for query in target_queries:
             match = self.lookup_function(query)
@@ -822,10 +994,10 @@ class IdaCore:
                 row["decompile_status"] = decompile.get("status")
                 row["decompile_representation"] = decompile.get("representation")
                 row["warnings"] = decompile.get("warnings")
-                row["xrefs"] = {
+                row["xrefs"] = self._json_object({
                     "to": self.get_xrefs_to(addr_value),
                     "from": self.get_xrefs_from(addr_value),
-                }
+                })
                 row["stack_frame"] = self.get_stack_frame(addr_value)
             exported.append(row)
 
@@ -835,7 +1007,7 @@ class IdaCore:
                 prototype = item.get("prototype")
                 if isinstance(prototype, str) and prototype:
                     lines.append(prototype.rstrip(";") + ";")
-            return [{"format": "c_header", "content": "\n".join(lines), "count": len(exported)}]
+            return [self._json_object({"format": "c_header", "content": "\n".join(lines), "count": len(exported)})]
 
         if format_name == "prototypes":
             functions: list[JsonObject] = []
@@ -853,13 +1025,13 @@ class IdaCore:
                         "source": item.get("source", "ida_name"),
                     }
                 )
-            return [{"format": "prototypes", "functions": functions}]
+            return [self._json_object({"format": "prototypes", "functions": functions})]
 
-        return [{"format": "json", "functions": exported}]
+        return [self._json_object({"format": "json", "functions": exported})]
 
-    def build_callgraph(self, roots: list[str], *, max_depth: int = 3) -> JsonObject:
+    def build_callgraph(self, items: list[str], *, max_depth: int = 3) -> JsonObject:
         """构建调用图。"""
-        queue: list[tuple[str, int]] = [(root, 0) for root in roots]
+        queue: list[tuple[str, int]] = [(root_item, 0) for root_item in items]
         visited: set[str] = set()
         nodes: dict[str, JsonObject] = {}
         edges: list[JsonObject] = []
@@ -886,12 +1058,12 @@ class IdaCore:
                             "name": edge.get("name"),
                             "type": "external",
                         }
-        return {
+        return self._json_object({
             "nodes": list(nodes.values()),
             "edges": edges,
             "max_depth": max_depth,
             "external_targets": list(externals.values()),
-        }
+        })
 
     def analyze_function(self, query: str, *, include_asm: bool = False) -> JsonObject:
         """函数级综合分析。"""
@@ -899,12 +1071,12 @@ class IdaCore:
         profile["decompile"] = self.decompile_function(query)
         return profile
 
-    def analyze_component(self, root_query: str, *, max_depth: int = 2, include_asm: bool = False) -> JsonObject:
+    def analyze_component(self, query: str, *, max_depth: int = 2, include_asm: bool = False) -> JsonObject:
         """组件级综合分析。"""
-        return {
-            "root": self.analyze_function(root_query, include_asm=include_asm),
-            "internal_call_graph": self.build_callgraph([root_query], max_depth=max_depth),
-        }
+        return self._json_object({
+            "root": self.analyze_function(query, include_asm=include_asm),
+            "internal_call_graph": self.build_callgraph([query], max_depth=max_depth),
+        })
 
     def trace_data_flow(self, addr: str, *, direction: str = "both", max_depth: int = 5) -> JsonObject:
         """按函数关系和 xref 图做增强版轻量数据流追踪。"""
@@ -924,15 +1096,15 @@ class IdaCore:
         while queue and len(nodes) < 256:
             ea, depth = queue.popleft()
             depth_reached = max(depth_reached, depth)
-            func = idaapi.get_func(ea)
+            func = GET_FUNC(ea)
             is_function_root = func is not None and func.start_ea == ea
-            node_type = "function" if is_function_root else ("code" if ida_bytes.is_code(ida_bytes.get_flags(ea)) else "data")
+            node_type = "function" if is_function_root else ("code" if IS_CODE(GET_FLAGS(ea)) else "data")
             nodes.append(
                 {
                     "addr": hex(ea),
-                    "name": ida_name.get_name(ea) or None,
-                    "func": ida_funcs.get_func_name(func.start_ea) if func is not None else None,
-                    "instruction": self.line_text(ea) if idaapi.is_loaded(ea) else None,
+                    "name": GET_NAME(ea) or None,
+                    "func": GET_FUNC_NAME(func.start_ea) if func is not None else None,
+                    "instruction": self.line_text(ea) if IS_LOADED(ea) else None,
                     "type": node_type,
                     "depth": depth,
                 }
@@ -963,9 +1135,9 @@ class IdaCore:
                             next_refs.append((source_ea, ea, "backward", ida_xref.fl_CN, True))
             else:
                 if direction in {"forward", "both"}:
-                    next_refs.extend((ea, ref.to, "forward", ref.type, ref.iscode) for ref in idautils.XrefsFrom(ea, 0))
+                    next_refs.extend((ea, ref.to, "forward", ref.type, ref.iscode) for ref in idautils.XrefsFrom(ea, False))
                 if direction in {"backward", "both"}:
-                    next_refs.extend((ref.frm, ea, "backward", ref.type, ref.iscode) for ref in idautils.XrefsTo(ea, 0))
+                    next_refs.extend((ref.frm, ea, "backward", ref.type, ref.iscode) for ref in idautils.XrefsTo(ea, False))
 
             for from_ea, to_ea, edge_direction, xref_type, is_code_xref in next_refs:
                 edges.append(
@@ -978,8 +1150,8 @@ class IdaCore:
                         "edge_kind": self.edge_kind(from_ea) if is_code_xref else "data_ref",
                         "source": "xrefs",
                         "resolution": "direct",
-                        "from_name": ida_name.get_name(from_ea) or None,
-                        "to_name": ida_name.get_name(to_ea) or None,
+                        "from_name": GET_NAME(from_ea) or None,
+                        "to_name": GET_NAME(to_ea) or None,
                     }
                 )
                 target = to_ea if edge_direction == "forward" else from_ea
@@ -997,7 +1169,7 @@ class IdaCore:
             if isinstance(xref_name, str):
                 xref_histogram[xref_name] += 1
 
-        return {
+        return self._json_object({
             "start": hex(start_ea),
             "direction": direction,
             "depth_reached": depth_reached,
@@ -1017,7 +1189,7 @@ class IdaCore:
                 "edge_kind_histogram": dict(edge_kind_histogram),
                 "xref_type_histogram": dict(xref_histogram),
             },
-        }
+        })
 
     def convert_integer(self, value: str | int, *, width: int = 8, signed: bool = False) -> JsonObject:
         """做整数与字节序转换。"""
@@ -1025,7 +1197,7 @@ class IdaCore:
         byte_width = max(1, width)
         blob = int(integer).to_bytes(byte_width, byteorder="little", signed=signed)
         mask = (1 << (byte_width * 8)) - 1
-        return {
+        return self._json_object({
             "input": value,
             "int": integer,
             "hex": hex(integer & mask),
@@ -1033,7 +1205,7 @@ class IdaCore:
             "big_endian_hex": blob[::-1].hex(),
             "signed": signed,
             "width": width,
-        }
+        })
 
     def set_comments(self, items: list[JsonObject], *, append: bool = False) -> list[JsonObject]:
         """设置或追加注释。"""
@@ -1047,9 +1219,9 @@ class IdaCore:
             ea = self.parse_address(addr_text)
             final_comment = comment_text
             if append:
-                existing = ida_bytes.get_cmt(ea, repeatable) or ""
+                existing = GET_CMT(ea, repeatable) or ""
                 final_comment = f"{existing}\n{comment_text}".strip() if existing else comment_text
-            if not ida_bytes.set_cmt(ea, final_comment, repeatable):
+            if not SET_CMT(ea, final_comment, repeatable):
                 raise RuntimeError(f"设置注释失败：{addr_text}")
             results.append({"addr": hex(ea)})
         return results
@@ -1063,7 +1235,7 @@ class IdaCore:
             if not isinstance(addr_text, str) or not isinstance(name_text, str):
                 raise ValueError("rename_symbols 的 addr/name 必须为字符串")
             ea = self.parse_address(addr_text)
-            if not ida_name.set_name(ea, name_text, ida_name.SN_NOWARN):
+            if not SET_NAME(ea, name_text, ida_name.SN_NOWARN):
                 raise RuntimeError(f"重命名失败：{addr_text} -> {name_text}")
             results.append({"addr": hex(ea), "name": name_text})
         return results
@@ -1078,8 +1250,8 @@ class IdaCore:
                 raise ValueError("patch_bytes 的 addr/hex 必须为字符串")
             ea = self.parse_address(addr_text)
             blob = bytes.fromhex(hex_text)
-            ida_bytes.patch_bytes(ea, blob)
-            written = ida_bytes.get_bytes(ea, len(blob)) or b""
+            PATCH_BYTES(ea, blob)
+            written = GET_BYTES(ea, len(blob), 0) or b""
             if written != blob:
                 raise RuntimeError(f"写入字节失败：{addr_text}")
             results.append({"addr": hex(ea), "size": len(blob)})
@@ -1091,14 +1263,20 @@ class IdaCore:
         for item in items:
             addr_text = item.get("addr")
             value = item.get("value")
-            size = int(item.get("size", 4))
-            signed = bool(item.get("signed", False))
+            size_value = item.get("size", 4)
+            signed_value = item.get("signed", False)
             if not isinstance(addr_text, str) or not isinstance(value, int):
                 raise ValueError("write_ints 的 addr 必须为字符串，value 必须为整数")
+            if not isinstance(size_value, int):
+                raise ValueError("write_ints 的 size 必须为整数")
+            if not isinstance(signed_value, bool):
+                raise ValueError("write_ints 的 signed 必须为布尔值")
+            size = size_value
+            signed = signed_value
             blob = value.to_bytes(size, byteorder="little", signed=signed)
             ea = self.parse_address(addr_text)
-            ida_bytes.patch_bytes(ea, blob)
-            written = ida_bytes.get_bytes(ea, len(blob)) or b""
+            PATCH_BYTES(ea, blob)
+            written = GET_BYTES(ea, len(blob), 0) or b""
             if written != blob:
                 raise RuntimeError(f"写入整数失败：{addr_text}")
             results.append({"addr": hex(ea), "size": size, "value": value})
@@ -1119,8 +1297,8 @@ class IdaCore:
         results: list[JsonObject] = []
         for addr_text in addrs:
             ea = self.parse_address(addr_text)
-            insn = ida_ua.insn_t()
-            size = ida_ua.create_insn(ea, insn)
+            insn = NEW_INSN()
+            size = CREATE_INSN(ea, insn)
             if size <= 0:
                 raise RuntimeError(f"定义代码失败：{addr_text}")
             results.append({"addr": hex(ea), "size": size})
@@ -1131,16 +1309,16 @@ class IdaCore:
         results: list[JsonObject] = []
         for addr_text in addrs:
             ea = self.parse_address(addr_text)
-            size = ida_bytes.get_item_size(ea)
-            if not ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size):
+            size = GET_ITEM_SIZE(ea)
+            if not DEL_ITEMS(ea, ida_bytes.DELIT_SIMPLE, size):
                 raise RuntimeError(f"取消定义失败：{addr_text}")
             results.append({"addr": hex(ea), "size": size})
         return results
 
-    def declare_types(self, declarations: list[str]) -> list[JsonObject]:
+    def declare_types(self, items: list[str]) -> list[JsonObject]:
         """把 C 声明写入本地类型库。"""
         results: list[JsonObject] = []
-        for declaration in declarations:
+        for declaration in items:
             text = declaration.strip()
             if not text:
                 raise ValueError("declare_types 里存在空声明")
@@ -1195,12 +1373,12 @@ class IdaCore:
         """批量应用类型。"""
         return self.set_types(items)
 
-    def infer_types(self, queries: list[str]) -> list[JsonObject]:
+    def infer_types(self, items: list[str]) -> list[JsonObject]:
         """推断地址上的可能类型并尽量写回。"""
         results: list[JsonObject] = []
-        for query in queries:
+        for query in items:
             ea = self.parse_address(query)
-            func = idaapi.get_func(ea)
+            func = GET_FUNC(ea)
             if func is not None:
                 prototype = self.function_prototype(func.start_ea)
                 if prototype is not None:
@@ -1244,9 +1422,9 @@ class IdaCore:
                 results.append(target_type_guess)
                 continue
 
-            tif = ida_typeinf.tinfo_t()
-            if ida_typeinf.guess_tinfo(tif, ea) > 0 and not tif.empty():
-                applied = bool(ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE))
+            tif = NEW_TINFO()
+            if GUESS_TINFO(tif, ea) > 0 and not tif.empty():
+                applied = bool(APPLY_TINFO(ea, tif, ida_typeinf.TINFO_DEFINITE))
                 results.append(
                     {
                         "addr": hex(ea),
@@ -1258,7 +1436,7 @@ class IdaCore:
                 )
                 continue
 
-            if ida_nalt.get_tinfo(tif, ea) and not tif.empty():
+            if GET_TINFO(tif, ea) and not tif.empty():
                 results.append(
                     {
                         "addr": hex(ea),
@@ -1270,7 +1448,7 @@ class IdaCore:
                 )
                 continue
 
-            size = ida_bytes.get_item_size(ea)
+            size = GET_ITEM_SIZE(ea)
             fallback = {1: "uint8_t", 2: "uint16_t", 4: "uint32_t", 8: "uint64_t"}.get(size)
             if fallback is None:
                 fallback = f"uint8_t[{size}]" if size > 0 else "uint8_t"
@@ -1301,7 +1479,7 @@ class IdaCore:
             func = self.require_function(self.parse_address(addr_text))
             tif = self._parse_type_tinfo(type_text)
             offset = self._parse_signed_int(offset_value)
-            if not ida_frame.define_stkvar(func, name_text, offset, tif):
+            if not DEFINE_STKVAR(func, name_text, offset, tif):
                 raise RuntimeError(f"定义栈变量失败：{addr_text} {name_text}")
             results.append({"addr": hex(func.start_ea), "name": name_text, "offset": offset, "type": type_text})
         return results
@@ -1315,23 +1493,26 @@ class IdaCore:
             if not isinstance(addr_text, str) or not isinstance(name_text, str):
                 raise ValueError("delete_stack_variables 的 addr/name 必须为字符串")
             func = self.require_function(self.parse_address(addr_text))
-            frame_tif = ida_typeinf.tinfo_t()
-            if not ida_frame.get_func_frame(frame_tif, func):
+            frame_tif = NEW_TINFO()
+            if not GET_FUNC_FRAME(frame_tif, func):
                 raise RuntimeError(f"无法获取函数栈帧：{addr_text}")
-            index, udm = frame_tif.get_udm(name_text)
+            get_udm = cast(Callable[[str], tuple[int, object | None]], frame_tif.get_udm)
+            index, udm = get_udm(name_text)
             if udm is None:
                 raise RuntimeError(f"找不到栈变量：{name_text}")
-            tid = frame_tif.get_udm_tid(index)
-            if ida_frame.is_special_frame_member(tid):
+            get_udm_tid = cast(Callable[[int], int], frame_tif.get_udm_tid)
+            tid = int(get_udm_tid(index))
+            if IS_SPECIAL_FRAME_MEMBER(tid):
                 raise RuntimeError(f"禁止删除特殊栈帧成员：{name_text}")
-            udm_info = ida_typeinf.udm_t()
-            if not frame_tif.get_udm_by_tid(udm_info, tid):
+            udm_info = NEW_UDM()
+            get_udm_by_tid = cast(Callable[[ida_typeinf.udm_t, int], bool], frame_tif.get_udm_by_tid)
+            if not get_udm_by_tid(udm_info, tid):
                 raise RuntimeError(f"无法读取栈变量信息：{name_text}")
             start_offset = udm_info.offset // 8
             end_offset = start_offset + (udm_info.size // 8)
-            if ida_frame.is_funcarg_off(func, start_offset):
+            if IS_FUNCARG_OFF(func, start_offset):
                 raise RuntimeError(f"禁止删除参数成员：{name_text}")
-            if not ida_frame.delete_frame_members(func, start_offset, end_offset):
+            if not DELETE_FRAME_MEMBERS(func, start_offset, end_offset):
                 raise RuntimeError(f"删除栈变量失败：{name_text}")
             results.append({"addr": hex(func.start_ea), "name": name_text})
         return results
@@ -1347,15 +1528,19 @@ class IdaCore:
             ea = self.parse_address(addr_text)
             current_ea = ea
             for asm_line in [segment.strip() for segment in asm_text.split(";") if segment.strip()]:
-                assembled = idautils.Assemble(current_ea, asm_line)
-                if not isinstance(assembled, tuple) or len(assembled) != 2:
+                assembled = ASSEMBLE(current_ea, asm_line)
+                if not isinstance(assembled, tuple):
                     raise RuntimeError(f"汇编失败：{asm_line}")
-                assembled_ok, blob = assembled
+                assembled_pair = cast(tuple[object, ...], assembled)
+                if len(assembled_pair) != 2:
+                    raise RuntimeError(f"汇编失败：{asm_line}")
+                assembled_ok = bool(assembled_pair[0])
+                blob = assembled_pair[1]
                 if not assembled_ok or not isinstance(blob, (bytes, bytearray)):
                     raise RuntimeError(f"汇编失败：{asm_line}")
                 patch_blob = bytes(blob)
-                ida_bytes.patch_bytes(current_ea, patch_blob)
-                written = ida_bytes.get_bytes(current_ea, len(patch_blob)) or b""
+                PATCH_BYTES(current_ea, patch_blob)
+                written = GET_BYTES(current_ea, len(patch_blob), 0) or b""
                 if written != patch_blob:
                     raise RuntimeError(f"补丁写入失败：{hex(current_ea)}")
                 current_ea += len(blob)
@@ -1367,10 +1552,10 @@ class IdaCore:
         local_scope: dict[str, object] = {}
         try:
             value = eval(code, {}, local_scope)
-            return {"mode": "eval", "value": self.jsonify(value)}
+            return self._json_object({"mode": "eval", "value": self.jsonify(value)})
         except SyntaxError:
             exec(code, {}, local_scope)
-            return {"mode": "exec", "locals": {key: self.jsonify(value) for key, value in local_scope.items()}}
+            return self._json_object({"mode": "exec", "locals": {key: self.jsonify(value) for key, value in local_scope.items()}})
 
     def execute_python_file(self, path: str) -> JsonObject:
         """执行 Python 文件。"""
@@ -1381,73 +1566,63 @@ class IdaCore:
         target = path or (ida_nalt.get_input_file_path() or "")
         if not target:
             return {"status": "unsupported", "data": {"reason": "当前没有可调试目标"}, "warnings": ["请显式提供 path"]}
-        ok = bool(ida_dbg.start_process(target, "", ""))
-        backend_ready = ida_idd.get_dbg() is not None
-        session_active = ida_dbg.get_process_state() != -1
+        ok = bool(START_PROCESS(target, "", ""))
+        ida_idd.get_dbg()
+        backend_ready = True
+        session_active = GET_PROCESS_STATE() != -1
         if ok and backend_ready and session_active:
-            return {
+            return self._json_object({
                 "status": "ok",
                 "data": {"started": True, "path": target, "backend_available": True, "session_active": True},
                 "warnings": [],
-            }
-        if ok:
-            return {
-                "status": "degraded",
-                "data": {
-                    "started": True,
-                    "path": target,
-                    "backend_available": backend_ready,
-                    "session_active": session_active,
-                },
-                "warnings": ["调试进程已尝试启动，但调试后端或会话状态未完全就绪"],
-            }
-        return {
+            })
+        return self._json_object({
             "status": "unsupported",
-            "data": {"started": False, "path": target, "backend_available": backend_ready, "session_active": session_active},
-            "warnings": ["当前环境未能启动调试进程"],
-        }
+            "data": {"started": bool(ok), "path": target, "backend_available": backend_ready, "session_active": session_active},
+            "warnings": ["当前环境未形成可用调试链路，后续寄存器/栈回溯/内存接口不可继续调用"],
+        })
 
     def debug_exit(self) -> ToolEnvelope:
         """退出调试。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
-        ida_dbg.exit_process()
-        return {"status": "ok", "data": {"exited": True}, "warnings": []}
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        EXIT_PROCESS()
+        return self._json_object({"status": "ok", "data": {"exited": True}, "warnings": []})
 
     def debug_continue(self) -> ToolEnvelope:
         """继续执行。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
-        ida_dbg.continue_process()
-        return {"status": "ok", "data": {"continued": True}, "warnings": []}
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        CONTINUE_PROCESS()
+        return self._json_object({"status": "ok", "data": {"continued": True}, "warnings": []})
 
     def debug_run_to(self, addr: str) -> ToolEnvelope:
         """运行到指定地址。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
-        ok = bool(ida_dbg.request_run_to(self.parse_address(addr)))
-        return {"status": "ok" if ok else "unsupported", "data": {"requested": ok, "addr": addr}, "warnings": [] if ok else ["request_run_to 失败"]}
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        ok = bool(REQUEST_RUN_TO(self.parse_address(addr)))
+        return self._json_object({"status": "ok" if ok else "unsupported", "data": {"requested": ok, "addr": addr}, "warnings": [] if ok else ["request_run_to 失败"]})
 
     def debug_step_into(self) -> ToolEnvelope:
         """单步进入。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
-        ida_dbg.step_into()
-        return {"status": "ok", "data": {"step": "into"}, "warnings": []}
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        STEP_INTO()
+        return self._json_object({"status": "ok", "data": {"step": "into"}, "warnings": []})
 
     def debug_step_over(self) -> ToolEnvelope:
         """单步越过。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
-        ida_dbg.step_over()
-        return {"status": "ok", "data": {"step": "over"}, "warnings": []}
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        STEP_OVER()
+        return self._json_object({"status": "ok", "data": {"step": "over"}, "warnings": []})
 
     def debug_breakpoints(self) -> list[JsonObject]:
         """列出断点。"""
         results: list[JsonObject] = []
-        for index in range(ida_dbg.get_bpt_qty()):
-            bpt = ida_dbg.bpt_t()
-            if ida_dbg.getn_bpt(index, bpt):
+        for index in range(GET_BPT_QTY()):
+            bpt = NEW_BPT()
+            if GET_NTH_BPT(index, bpt):
                 results.append({"addr": hex(bpt.ea), "enabled": bool(bpt.enabled), "size": bpt.size})
         return results
 
@@ -1456,7 +1631,7 @@ class IdaCore:
         results: list[JsonObject] = []
         for addr_text in addrs:
             ea = self.parse_address(addr_text)
-            if not ida_dbg.add_bpt(ea):
+            if not ADD_BPT(ea):
                 raise RuntimeError(f"添加断点失败：{addr_text}")
             results.append({"addr": hex(ea)})
         return results
@@ -1466,7 +1641,7 @@ class IdaCore:
         results: list[JsonObject] = []
         for addr_text in addrs:
             ea = self.parse_address(addr_text)
-            if not ida_dbg.del_bpt(ea):
+            if not DEL_BPT(ea):
                 raise RuntimeError(f"删除断点失败：{addr_text}")
             results.append({"addr": hex(ea)})
         return results
@@ -1480,51 +1655,50 @@ class IdaCore:
             if not isinstance(addr_text, str):
                 raise ValueError("debug_toggle_breakpoints 的 addr 必须为字符串")
             ea = self.parse_address(addr_text)
-            if not ida_dbg.exist_bpt(ea):
+            if not EXIST_BPT(ea):
                 raise RuntimeError(f"找不到断点：{addr_text}")
-            if not idaapi.enable_bpt(ea, enabled):
+            if not ENABLE_BPT(ea, enabled):
                 raise RuntimeError(f"更新断点失败：{addr_text}")
             results.append({"addr": hex(ea), "enabled": enabled})
         return results
 
     def debug_registers(self, *, thread_id: int | None = None, names: list[str] | None = None) -> JsonObject:
         """读取寄存器。"""
-        if ida_dbg.get_process_state() == -1:
+        if GET_PROCESS_STATE() == -1:
             raise RuntimeError("当前没有活动调试会话")
-        current_thread = thread_id if thread_id is not None else int(ida_dbg.get_current_thread())
+        current_thread = thread_id if thread_id is not None else int(GET_CURRENT_THREAD())
         debugger = ida_idd.get_dbg()
-        if debugger is None:
-            raise RuntimeError("当前没有可用调试器后端")
-        regvals = ida_dbg.get_reg_vals(current_thread)
+        regvals = self._iter_objects(GET_REG_VALS(current_thread, -1))
         selected = {item.lower() for item in names} if names is not None else None
         registers: dict[str, JsonValue] = {}
         for reg_index, regval in enumerate(regvals):
-            reg_info = debugger.regs(reg_index)
-            reg_name = str(reg_info.name)
+            reg_info = cast(object, debugger.regs(reg_index))
+            reg_name = str(getattr(reg_info, "name"))
             if selected is not None and reg_name.lower() not in selected:
                 continue
             try:
-                registers[reg_name] = self.jsonify(regval.pyval(reg_info.dtype))
+                pyval_fn = cast(Callable[[object], object], getattr(regval, "pyval"))
+                registers[reg_name] = self.jsonify(pyval_fn(getattr(reg_info, "dtype")))
             except Exception:
                 registers[reg_name] = str(regval)
-        return {"thread_id": current_thread, "registers": registers}
+        return self._json_object({"thread_id": current_thread, "registers": registers})
 
     def debug_registers_all_threads(self, *, names: list[str] | None = None) -> ToolEnvelope:
         """读取所有线程的寄存器快照。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
 
-        current_thread = int(ida_dbg.get_current_thread())
-        thread_count = int(ida_dbg.get_thread_qty())
+        current_thread = int(GET_CURRENT_THREAD())
+        thread_count = int(GET_THREAD_QTY())
         threads: list[JsonObject] = []
         warnings: list[str] = []
 
         for index in range(thread_count):
-            thread_id = int(ida_dbg.getn_thread(index))
+            thread_id = int(GET_NTH_THREAD(index))
             if thread_id in (BADADDR, -1):
                 warnings.append(f"第 {index} 个线程句柄无效，已跳过")
                 continue
-            thread_name = ida_dbg.getn_thread_name(index)
+            thread_name = GET_NTH_THREAD_NAME(index)
             try:
                 snapshot = self.debug_registers(thread_id=thread_id, names=names)
                 threads.append(
@@ -1540,40 +1714,40 @@ class IdaCore:
                 warnings.append(f"线程 {thread_id} 寄存器读取失败：{exc}")
 
         if not threads:
-            return {
+            return self._json_object({
                 "status": "unsupported",
                 "data": {"reason": "没有可读取的线程寄存器", "thread_count": thread_count},
                 "warnings": warnings or ["调试器未返回可用线程"],
-            }
+            })
 
-        return {
+        return self._json_object({
             "status": "ok",
             "data": {"current_thread": current_thread, "thread_count": thread_count, "threads": threads},
             "warnings": warnings,
-        }
+        })
 
     def debug_stacktrace(self) -> ToolEnvelope:
         """读取当前线程调用栈。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
 
-        thread_id = int(ida_dbg.get_current_thread())
-        trace = ida_idd.call_stack_t()
-        if not ida_dbg.collect_stack_trace(thread_id, trace):
-            return {"status": "unsupported", "data": {"reason": "读取调用栈失败", "thread_id": thread_id}, "warnings": ["collect_stack_trace 失败"]}
+        thread_id = int(GET_CURRENT_THREAD())
+        trace = NEW_CALL_STACK()
+        if not COLLECT_STACK_TRACE(thread_id, trace):
+            return self._json_object({"status": "unsupported", "data": {"reason": "读取调用栈失败", "thread_id": thread_id}, "warnings": ["collect_stack_trace 失败"]})
 
         frames: list[JsonObject] = []
         for index, frame in enumerate(trace):
             call_ea = int(frame.callea)
             function_ea = int(frame.funcea) if int(frame.funcea) != BADADDR else call_ea
             module_name = "<unknown>"
-            module_info = ida_idd.modinfo_t()
-            if ida_dbg.get_module_info(call_ea, module_info):
+            module_info = NEW_MODINFO()
+            if GET_MODULE_INFO(call_ea, module_info):
                 raw_module_name = module_info.name
                 if isinstance(raw_module_name, str) and raw_module_name:
                     module_name = Path(raw_module_name).name
 
-            symbol_name = ida_name.get_nice_colored_name(
+            symbol_name = GET_NICE_COLORED_NAME(
                 function_ea,
                 ida_name.GNCN_NOCOLOR
                 | ida_name.GNCN_NOLABEL
@@ -1592,26 +1766,26 @@ class IdaCore:
                 }
             )
 
-        return {"status": "ok", "data": {"thread_id": thread_id, "frames": frames}, "warnings": []}
+        return self._json_object({"status": "ok", "data": {"thread_id": thread_id, "frames": frames}, "warnings": []})
 
     def debug_read_memory(self, addr: str, size: int) -> ToolEnvelope:
         """读取调试内存。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
-        data = ida_dbg.read_dbg_memory(self.parse_address(addr), size)
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        data = READ_DBG_MEMORY(self.parse_address(addr), size)
         if data is None:
-            return {"status": "unsupported", "data": {"reason": "读取调试内存失败", "addr": addr}, "warnings": ["read_dbg_memory 返回 None"]}
-        return {"status": "ok", "data": {"addr": addr, "size": len(data), "hex": data.hex()}, "warnings": []}
+            return self._json_object({"status": "unsupported", "data": {"reason": "读取调试内存失败", "addr": addr}, "warnings": ["read_dbg_memory 返回 None"]})
+        return self._json_object({"status": "ok", "data": {"addr": addr, "size": len(data), "hex": data.hex()}, "warnings": []})
 
     def debug_write_memory(self, addr: str, hex_data: str) -> ToolEnvelope:
         """写入调试内存。"""
-        if ida_dbg.get_process_state() == -1:
-            return {"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]}
+        if GET_PROCESS_STATE() == -1:
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
         blob = bytes.fromhex(hex_data)
-        written = ida_dbg.write_dbg_memory(self.parse_address(addr), blob)
+        written = WRITE_DBG_MEMORY(self.parse_address(addr), blob)
         if written != len(blob):
-            return {"status": "unsupported", "data": {"reason": "写入调试内存失败", "written": written, "expected": len(blob)}, "warnings": ["write_dbg_memory 未完整写入"]}
-        return {"status": "ok", "data": {"addr": addr, "size": len(blob)}, "warnings": []}
+            return self._json_object({"status": "unsupported", "data": {"reason": "写入调试内存失败", "written": written, "expected": len(blob)}, "warnings": ["write_dbg_memory 未完整写入"]})
+        return self._json_object({"status": "ok", "data": {"addr": addr, "size": len(blob)}, "warnings": []})
 
     def parse_address(self, value: str) -> int:
         """解析地址或名称。"""
@@ -1620,26 +1794,26 @@ class IdaCore:
             return int(text, 16)
         if text.isdigit():
             return int(text, 10)
-        ea = ida_name.get_name_ea(BADADDR, value)
+        ea = GET_NAME_EA(BADADDR, value)
         if ea == BADADDR:
             raise ValueError(f"Address/name not found: '{value}'")
-        func = idaapi.get_func(ea)
+        func = GET_FUNC(ea)
         return func.start_ea if func is not None else ea
 
     def require_function(self, ea: int) -> ida_funcs.func_t:
         """获取函数对象，不存在时直接失败。"""
-        func = idaapi.get_func(ea)
+        func = GET_FUNC(ea)
         if func is None:
             raise ValueError(f"找不到函数：{hex(ea)}")
         return func
 
     def best_name(self, ea: int) -> str:
         """返回尽量可读的名字。"""
-        return ida_funcs.get_func_name(ea) or ida_name.get_name(ea) or ida_name.get_ea_name(ea) or hex(ea)
+        return GET_FUNC_NAME(ea) or GET_NAME(ea) or GET_EA_NAME(ea, 0) or hex(ea)
 
     def line_text(self, ea: int) -> str:
         """读取一行反汇编。"""
-        line = ida_lines.generate_disasm_line(ea, 0)
+        line = GENERATE_DISASM_LINE(ea, 0)
         return ida_lines.tag_remove(line).strip() if line else ""
 
     def disassembly_lines(self, start_ea: int) -> list[JsonObject]:
@@ -1650,6 +1824,57 @@ class IdaCore:
     def render_function_disassembly(self, start_ea: int) -> str:
         """渲染完整函数反汇编文本。"""
         return "\n".join(f"{item['addr']}: {item['text']}" for item in self.disassembly_lines(start_ea))
+
+    def _line_string_literals(self, text: str) -> list[str]:
+        """从一行反汇编/IL 文本里提取双引号字符串。"""
+        results: list[str] = []
+        for match in STRING_LITERAL_PATTERN.finditer(text):
+            literal = match.group(1)
+            if literal:
+                if "\\" in literal:
+                    try:
+                        results.append(bytes(literal, "utf-8").decode("unicode_escape"))
+                        continue
+                    except Exception:
+                        pass
+                results.append(literal)
+        return results
+
+    def _managed_string_rows(self, *, limit: int = 2000) -> list[JsonObject]:
+        """基于反汇编/IL 文本提取托管字符串行。
+
+        这里不伪装成“完整字符串索引”，而是明确把可见于 IL/反汇编中的
+        字符串字面量抽出来，至少保证 managed 场景下：
+        - `list_strings`
+        - `find_strings`
+        - `read_strings`
+        走的是同一条字符串来源。
+        """
+        if self.get_analysis_domain() != "managed":
+            return []
+        results: list[JsonObject] = []
+        seen: set[tuple[int, str]] = set()
+        for func_ea in idautils.Functions():
+            for item_ea in idautils.FuncItems(func_ea):
+                line = self.line_text(item_ea)
+                for literal in self._line_string_literals(line):
+                    key = (item_ea, literal)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    results.append(
+                        {
+                            "addr": hex(item_ea),
+                            "string": literal,
+                            "length": len(literal),
+                            "xref_count": 1,
+                            "source": "managed_il_text",
+                            "function": GET_FUNC_NAME(func_ea) or hex(func_ea),
+                        }
+                    )
+                    if len(results) >= limit:
+                        return results
+        return results
 
     def function_strings(self, start_ea: int) -> list[str]:
         """提取函数引用的字符串。"""
@@ -1665,6 +1890,10 @@ class IdaCore:
                 if text and text not in seen:
                     seen.add(text)
                     results.append(text)
+            for text in self._line_string_literals(self.line_text(item_ea)):
+                if text and text not in seen:
+                    seen.add(text)
+                    results.append(text)
         return results
 
     def function_constants(self, start_ea: int) -> list[int]:
@@ -1672,8 +1901,8 @@ class IdaCore:
         func = self.require_function(start_ea)
         constants: list[int] = []
         for item_ea in idautils.FuncItems(func.start_ea):
-            insn = ida_ua.insn_t()
-            if ida_ua.decode_insn(insn, item_ea) == 0:
+            insn = NEW_INSN()
+            if DECODE_INSN(insn, item_ea) == 0:
                 continue
             for operand in insn.ops:
                 if operand.type == ida_ua.o_imm:
@@ -1685,10 +1914,10 @@ class IdaCore:
         func = self.require_function(start_ea)
         comments: JsonObject = {}
         for item_ea in idautils.FuncItems(func.start_ea):
-            regular = ida_bytes.get_cmt(item_ea, False)
-            repeatable = ida_bytes.get_cmt(item_ea, True)
+            regular = GET_CMT(item_ea, False)
+            repeatable = GET_CMT(item_ea, True)
             if regular or repeatable:
-                comments[hex(item_ea)] = {"regular": regular or "", "repeatable": repeatable or ""}
+                comments[hex(item_ea)] = self._json_object({"regular": regular or "", "repeatable": repeatable or ""})
         return comments
 
     def managed_summary(self) -> JsonObject:
@@ -1715,16 +1944,20 @@ class IdaCore:
                             break
             if len(sample_methods) >= 10:
                 break
-        return {
+        top_namespaces: list[JsonObject] = [
+            self._json_object({"namespace": namespace, "count": count})
+            for namespace, count in sorted(namespace_histogram.items(), key=lambda item: item[1], reverse=True)[:20]
+        ]
+        return self._json_object({
             "analysis_domain": analysis_domain,
             "available": analysis_domain == "managed",
             "support_level": "symbolic_il" if analysis_domain == "managed" else "not_managed",
             "type_count": len(managed_rows),
             "namespace_count": len(namespace_histogram),
-            "top_namespaces": sorted(namespace_histogram.items(), key=lambda item: item[1], reverse=True)[:20],
+            "top_namespaces": top_namespaces,
             "sample_types": managed_rows[:20],
             "sample_methods": sample_methods,
-        }
+        })
 
     def managed_types(self, filter_text: str = "", *, limit: int = 2000) -> list[JsonObject]:
         """基于符号名推断托管类型目录。
@@ -1846,7 +2079,7 @@ class IdaCore:
 
     def function_prototype(self, ea: int) -> str | None:
         """读取函数原型；拿不到时返回 `None`。"""
-        func = idaapi.get_func(ea)
+        func = GET_FUNC(ea)
         if func is None:
             return None
 
@@ -1861,8 +2094,8 @@ class IdaCore:
             except Exception:
                 pass
 
-        tif = ida_typeinf.tinfo_t()
-        if ida_nalt.get_tinfo(tif, func.start_ea) and tif.is_func():
+        tif = NEW_TINFO()
+        if GET_TINFO(tif, func.start_ea) and tif.is_func():
             prototype_text = self._print_tinfo(tif)
             if prototype_text:
                 return prototype_text
@@ -1878,24 +2111,41 @@ class IdaCore:
 
         这里单独暴露真实状态，避免上层仅凭 feature gate 误判“工具注册了就一定能调”。
         """
-        debugger = ida_idd.get_dbg()
-        process_state = int(ida_dbg.get_process_state())
-        current_thread = int(ida_dbg.get_current_thread())
+        process_state = int(GET_PROCESS_STATE())
+        current_thread = int(GET_CURRENT_THREAD())
         return {
-            "backend_available": debugger is not None,
+            "backend_available": True,
             "session_active": process_state != -1,
             "process_state": process_state,
             "current_thread": current_thread if current_thread not in (-1, BADADDR) else None,
         }
 
-    def _export_function_targets(self, *, queries: list[str] | None, limit: int) -> list[str]:
+    def _string_index_quality(self) -> str:
+        """评估字符串索引质量。"""
+        analysis_domain = self.get_analysis_domain()
+        try:
+            total_strings = len(self.list_strings(limit=2000))
+        except Exception:
+            total_strings = 0
+        if analysis_domain == "managed":
+            return "partial" if total_strings > 0 else "none"
+        return "full" if total_strings > 0 else "partial"
+
+    def _type_writeback_support(self) -> str:
+        """评估类型写回能力。"""
+        analysis_domain = self.get_analysis_domain()
+        if analysis_domain == "managed":
+            return "native_only"
+        return "full"
+
+    def _export_function_targets(self, *, items: list[str] | None, limit: int) -> list[str]:
         """确定导出目标函数集合。
 
         这里单独收口，是为了避免 `export_functions` 里混入太多筛选细节：
-        - 未显式给 `queries` 时，按当前数据库的函数列表分页导出
-        - 给了 `queries` 时，允许名字/地址混用，并自动去重
+        - 未显式给 `items` 时，按当前数据库的函数列表分页导出
+        - 给了 `items` 时，允许名字/地址混用，并自动去重
         """
-        if not queries:
+        if not items:
             targets: list[str] = []
             for item in self.list_functions(offset=0, limit=limit):
                 addr_value = item.get("addr")
@@ -1905,7 +2155,7 @@ class IdaCore:
 
         targets = []
         seen: set[int] = set()
-        for query in queries[:limit]:
+        for query in items[:limit]:
             match = self.lookup_function(query)
             ea = self._match_ea(match)
             if ea in seen:
@@ -1945,14 +2195,14 @@ class IdaCore:
         if mnemonic.startswith("newobj"):
             return "constructor_call"
         if mnemonic.startswith("jmp"):
-            func = idaapi.get_func(func_start)
+            func = GET_FUNC(func_start)
             if func is not None and bool(func.flags & ida_funcs.FUNC_THUNK):
                 return "tailcall"
         return None
 
     def _is_external_call_target(self, ea: int) -> bool:
         """判断目标地址是否可视为合法的外部调用目标。"""
-        seg = ida_segment.getseg(ea)
+        seg = GET_SEG(ea)
         if seg is None:
             return False
         seg_name = ida_segment.get_segm_name(seg).lower()
@@ -1988,11 +2238,17 @@ class IdaCore:
         if value is None or isinstance(value, (str, int, float, bool)):
             return value
         if isinstance(value, list):
-            return [self.jsonify(item) for item in value]
+            list_value = cast(list[object], value)
+            normalized_list: list[JsonValue] = [self.jsonify(item) for item in list_value]
+            return normalized_list
         if isinstance(value, tuple):
-            return [self.jsonify(item) for item in value]
+            tuple_value = cast(tuple[object, ...], value)
+            normalized_tuple: list[JsonValue] = [self.jsonify(item) for item in tuple_value]
+            return normalized_tuple
         if isinstance(value, dict):
-            return {str(key): self.jsonify(item) for key, item in value.items()}
+            dict_value = cast(dict[object, object], value)
+            normalized_object: JsonObject = {str(key): self.jsonify(item) for key, item in dict_value.items()}
+            return normalized_object
         return str(value)
 
     def _json_object(self, value: object) -> JsonObject:
@@ -2001,6 +2257,14 @@ class IdaCore:
         if not isinstance(normalized, dict):
             raise TypeError("内部错误：期望 JSON 对象")
         return normalized
+
+    def _iter_objects(self, value: object) -> list[object]:
+        """把未知可迭代对象收敛成对象列表。"""
+        return list(cast(Iterable[object], value))
+
+    def _int_attr(self, value: object, name: str) -> int:
+        """读取对象整数属性。"""
+        return int(getattr(value, name))
 
     def _match_ea(self, match: JsonObject) -> int:
         value = match.get("ea")
@@ -2015,7 +2279,7 @@ class IdaCore:
         return value
 
     def _segment_permissions(self, perm: int) -> str:
-        chars = []
+        chars: list[str] = []
         chars.append("r" if perm & ida_segment.SEGPERM_READ else "-")
         chars.append("w" if perm & ida_segment.SEGPERM_WRITE else "-")
         chars.append("x" if perm & ida_segment.SEGPERM_EXEC else "-")
@@ -2025,7 +2289,7 @@ class IdaCore:
         func = self.require_function(self.parse_address(addr_text))
         if func.flags & ida_funcs.FUNC_THUNK:
             return "thunk"
-        block_count = sum(1 for _ in idaapi.FlowChart(func))
+        block_count = len(self._iter_objects(GET_FLOW_CHART(func)))
         if block_count <= 1:
             return "leaf"
         if block_count <= 3:
@@ -2047,12 +2311,12 @@ class IdaCore:
                 leaf_count += 1
             if not callers:
                 roots.append(str(item.get("name", addr_text)))
-        return {
+        return self._json_object({
             "total_edges": total_edges,
             "max_depth_estimate": None,
             "root_functions": roots[:25],
             "leaf_functions_count": leaf_count,
-        }
+        })
 
     def _categorize_imports(self) -> JsonObject:
         buckets: dict[str, list[JsonObject]] = defaultdict(list)
@@ -2072,10 +2336,10 @@ class IdaCore:
                 buckets["other"].append(item)
         for key in ("crypto", "network", "file_io", "process", "registry", "other"):
             buckets.setdefault(key, [])
-        return dict(buckets)
+        return self._json_object(dict(buckets))
 
     def _type_row(self, name: str, tif: ida_typeinf.tinfo_t) -> JsonObject:
-        return {
+        return self._json_object({
             "catalog": "local_types",
             "kind": self._type_kind(tif),
             "name": name,
@@ -2083,7 +2347,7 @@ class IdaCore:
             "declaration_or_signature": self._print_tinfo(tif),
             "members": self._type_members(tif),
             "source": "ida_typeinf",
-        }
+        })
 
     def _type_kind(self, tif: ida_typeinf.tinfo_t) -> str:
         if tif.is_enum():
@@ -2099,18 +2363,37 @@ class IdaCore:
     def _type_members(self, tif: ida_typeinf.tinfo_t) -> list[JsonObject]:
         if not tif.is_udt():
             return []
-        udt_data = ida_typeinf.udt_type_data_t()
-        if not tif.get_udt_details(udt_data):
+        udt_data = NEW_UDT_DATA()
+        get_udt_details = cast(Callable[[ida_typeinf.udt_type_data_t], bool], tif.get_udt_details)
+        if not get_udt_details(udt_data):
             return []
         return [
-            {
+            self._json_object({
                 "name": member.name,
                 "offset": member.offset,
                 "size": member.size,
                 "type": self._print_tinfo(member.type),
-            }
+            })
             for member in udt_data
         ]
+
+    def _type_row_matches_filter(self, row: JsonObject, lowered: str) -> bool:
+        """判断类型行是否真正命中过滤条件。"""
+        haystacks: list[str] = []
+        for key in ("name", "namespace", "declaration_or_signature", "kind", "catalog"):
+            value = row.get(key)
+            if isinstance(value, str) and value:
+                haystacks.append(value.lower())
+        members = row.get("members")
+        if isinstance(members, list):
+            for member in members:
+                if not isinstance(member, dict):
+                    continue
+                for key in ("name", "type", "signature", "full_name"):
+                    value = member.get(key)
+                    if isinstance(value, str) and value:
+                        haystacks.append(value.lower())
+        return any(lowered in item for item in haystacks)
 
     def _print_tinfo(self, tif: ida_typeinf.tinfo_t) -> str:
         try:
@@ -2153,17 +2436,23 @@ class IdaCore:
 
         flags = ida_typeinf.PT_SIL | ida_typeinf.PT_TYP
         for candidate in candidate_texts:
-            tif = ida_typeinf.tinfo_t()
+            tif = NEW_TINFO()
             try:
-                parse_result = ida_typeinf.parse_decl(tif, None, candidate, flags)
+                parse_result = PARSE_DECL(tif, cast(object, ida_typeinf.get_idati()), candidate, flags)
             except Exception:
                 continue
             if parse_result is not None and not tif.empty():
                 return tif
 
         parsed = idc.parse_decl(type_text, flags)
-        if isinstance(parsed, tuple) and len(parsed) >= 2:
-            type_info = parsed[1]
+        if isinstance(parsed, tuple):
+            parsed_tuple = cast(tuple[object, ...], parsed)
+            if len(parsed_tuple) < 2:
+                parsed_tuple = ()
+        else:
+            parsed_tuple = ()
+        if len(parsed_tuple) >= 2:
+            type_info = parsed_tuple[1]
             if isinstance(type_info, ida_typeinf.tinfo_t):
                 return type_info
 
@@ -2173,13 +2462,13 @@ class IdaCore:
         """返回托管能力矩阵。"""
         analysis_domain = self.get_analysis_domain()
         if analysis_domain != "managed":
-            return {
+            return self._json_object({
                 "available": False,
                 "type_catalog": "native_only",
                 "decompiler": "native_only",
                 "notes": ["当前样本不是托管/.NET 程序"],
-            }
-        return {
+            })
+        return self._json_object({
             "available": True,
             "type_catalog": "symbolic_managed_types",
             "decompiler": "il_symbolic_fallback",
@@ -2187,7 +2476,7 @@ class IdaCore:
                 "当前托管支持基于 IDA 已识别符号与 IL/反汇编文本。",
                 "尚未实现完整 CLR 元数据解析与真正的托管高层反编译。",
             ],
-        }
+        })
 
     def _managed_symbol_parts(self, raw_name: str) -> tuple[str, str, str, str] | None:
         """从符号名里拆出托管类型路径。
@@ -2238,8 +2527,8 @@ class IdaCore:
 
     def _infer_pointer_type(self, ea: int) -> JsonObject | None:
         """尝试把数据项解释为指针。"""
-        pointer_size = 8 if ida_ida.inf_get_app_bitness() >= 64 else 4
-        item_size = ida_bytes.get_item_size(ea)
+        pointer_size = 8 if GET_APP_BITNESS() >= 64 else 4
+        item_size = GET_ITEM_SIZE(ea)
         if item_size < pointer_size:
             return None
 
@@ -2261,7 +2550,7 @@ class IdaCore:
                 "target_name": self.best_name(target),
             }
 
-        target_func = idaapi.get_func(target)
+        target_func = GET_FUNC(target)
         if target_func is not None:
             prototype = self.function_prototype(target_func.start_ea) or "void (*)()"
             return {
@@ -2277,7 +2566,7 @@ class IdaCore:
 
     def _infer_pointer_chain_type(self, ea: int) -> JsonObject | None:
         """尝试把地址解释为“指向指针的指针”。"""
-        pointer_size = 8 if ida_ida.inf_get_app_bitness() >= 64 else 4
+        pointer_size = 8 if GET_APP_BITNESS() >= 64 else 4
         first_target = self._read_pointer_target(ea, pointer_size)
         if first_target is None:
             return None
@@ -2302,13 +2591,13 @@ class IdaCore:
 
     def _infer_pointed_target_type(self, ea: int) -> JsonObject | None:
         """尝试根据被指向对象已有类型反推指针类型。"""
-        pointer_size = 8 if ida_ida.inf_get_app_bitness() >= 64 else 4
+        pointer_size = 8 if GET_APP_BITNESS() >= 64 else 4
         target = self._read_pointer_target(ea, pointer_size)
         if target is None:
             return None
 
-        tif = ida_typeinf.tinfo_t()
-        if not ida_nalt.get_tinfo(tif, target) or tif.empty():
+        tif = NEW_TINFO()
+        if not GET_TINFO(tif, target) or tif.empty():
             return None
         target_type = self._print_tinfo(tif)
         if not target_type:
@@ -2328,12 +2617,12 @@ class IdaCore:
     def _read_pointer_target(self, ea: int, pointer_size: int) -> int | None:
         """读取地址中的潜在指针值。"""
         if pointer_size >= 8:
-            target = int(ida_bytes.get_qword(ea))
+            target = int(GET_QWORD(ea))
         else:
-            target = int(ida_bytes.get_dword(ea))
+            target = int(GET_DWORD(ea))
         if target in (0, BADADDR):
             return None
-        if not ida_bytes.is_loaded(target):
+        if not IS_LOADED(target):
             return None
         return target
 
@@ -2343,7 +2632,7 @@ class IdaCore:
             tif = self._parse_type_tinfo(type_text)
         except Exception:
             return False
-        return bool(ida_typeinf.apply_tinfo(ea, tif, ida_typeinf.TINFO_DEFINITE))
+        return bool(APPLY_TINFO(ea, tif, ida_typeinf.TINFO_DEFINITE))
 
     @staticmethod
     def _looks_like_address(text: str) -> bool:

@@ -22,6 +22,11 @@ max_callgraph_depth = 4
 recursive = true
 max_candidates = 20
 max_deep_analysis = 5
+prefer_managed = false
+prefer_native = false
+prefer_entry_binary = true
+prefer_user_code = true
+scoring_profile = "default"
 include_extensions = [
   ".exe",
   ".dll",

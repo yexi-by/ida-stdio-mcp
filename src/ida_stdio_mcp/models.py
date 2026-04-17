@@ -21,8 +21,17 @@ class ToolResult(TypedDict):
     status: ToolStatus
     source: str
     warnings: list[str]
-    error: str | None
+    error: JsonValue
     data: JsonValue
+
+
+class ErrorInfo(TypedDict):
+    """统一错误对象。"""
+
+    code: str
+    message: str
+    details: dict[str, JsonValue]
+    next_steps: list[str]
 
 
 class ResourceContent(TypedDict):
@@ -46,6 +55,11 @@ class BinarySummary(TypedDict):
     is_active: bool
     is_current_context: bool
     bound_contexts: int
+    dirty: bool
+    writeback_kind: str | None
+    persistent_after_save: bool
+    saved_path: str
+    undo_supported: bool
 
 
 @dataclass(slots=True, frozen=True)
