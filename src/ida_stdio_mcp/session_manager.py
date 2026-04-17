@@ -71,17 +71,37 @@ class SessionManager:
     def __init__(self) -> None:
         self._sessions: dict[str, IdaSession] = {}
         self._context_bindings: dict[str, str] = {}
+        self._context_sessions: dict[str, set[str]] = {}
         self._active_session_id: str | None = None
         self._lock = RLock()
 
-    def open_binary(self, input_path: Path, *, run_auto_analysis: bool, session_id: str | None) -> str:
+    def open_binary(
+        self,
+        input_path: Path,
+        *,
+        run_auto_analysis: bool,
+        session_id: str | None,
+        context_id: str | None = None,
+        isolated_contexts: bool = False,
+    ) -> str:
         """打开样本并创建会话。"""
         resolved = input_path.resolve()
         if not resolved.exists():
             raise FileNotFoundError(f"样本不存在：{resolved}")
 
         with self._lock:
-            for existing_id, session in self._sessions.items():
+            visible_session_ids: list[str]
+            if isolated_contexts:
+                if context_id is None:
+                    raise SessionRequiredError("当前启用了会话隔离，open_binary 必须显式提供 context_id")
+                visible_session_ids = list(self._context_sessions.get(context_id, set()))
+            else:
+                visible_session_ids = list(self._sessions.keys())
+
+            for existing_id in visible_session_ids:
+                session = self._sessions.get(existing_id)
+                if session is None:
+                    continue
                 if session.input_path == resolved:
                     session.last_accessed = datetime.now()
                     self._activate_session_locked(existing_id)
@@ -94,6 +114,8 @@ class SessionManager:
             self._open_database_locked(resolved, run_auto_analysis=run_auto_analysis)
             session = IdaSession(session_id=created_id, input_path=resolved, is_analyzing=run_auto_analysis)
             self._sessions[created_id] = session
+            if isolated_contexts and context_id is not None:
+                self._context_sessions.setdefault(context_id, set()).add(created_id)
             self._active_session_id = created_id
             if run_auto_analysis:
                 ida_auto.auto_wait()
@@ -101,10 +123,12 @@ class SessionManager:
             logger.info("已创建会话：{} -> {}", created_id, resolved)
             return created_id
 
-    def bind_context(self, context_id: str, session_id: str, *, activate: bool) -> IdaSession:
+    def bind_context(self, context_id: str, session_id: str, *, activate: bool, isolated_contexts: bool = False) -> IdaSession:
         """把上下文绑定到指定会话。"""
         with self._lock:
             session = self._require_session_locked(session_id)
+            if isolated_contexts:
+                self._require_context_owns_session_locked(context_id, session_id)
             self._context_bindings[context_id] = session_id
             session.last_accessed = datetime.now()
             if activate:
@@ -136,7 +160,7 @@ class SessionManager:
                 return None
             return self._sessions.get(session_id)
 
-    def list_sessions(self, context_id: str | None = None) -> list[BinarySummary]:
+    def list_sessions(self, context_id: str | None = None, *, isolated_contexts: bool = False) -> list[BinarySummary]:
         """列出所有会话。"""
         with self._lock:
             current_context_session_id = self._context_bindings.get(context_id) if context_id is not None else None
@@ -145,7 +169,12 @@ class SessionManager:
                 binding_count[bound_session_id] = binding_count.get(bound_session_id, 0) + 1
 
             result: list[BinarySummary] = []
-            for session in self._sessions.values():
+            if isolated_contexts and context_id is not None:
+                visible_session_ids = self._context_sessions.get(context_id, set())
+                sessions = [self._sessions[session_id] for session_id in visible_session_ids if session_id in self._sessions]
+            else:
+                sessions = list(self._sessions.values())
+            for session in sessions:
                 result.append(
                     session.to_summary(
                         is_active=session.session_id == self._active_session_id,
@@ -155,12 +184,16 @@ class SessionManager:
                 )
             return result
 
-    def close_session(self, session_id: str) -> bool:
+    def close_session(self, session_id: str, *, context_id: str | None = None, isolated_contexts: bool = False) -> bool:
         """关闭指定会话。"""
         with self._lock:
             session = self._sessions.get(session_id)
             if session is None:
                 return False
+            if isolated_contexts:
+                if context_id is None:
+                    raise SessionRequiredError("当前启用了会话隔离，close_session 必须显式提供 context_id")
+                self._require_context_owns_session_locked(context_id, session_id)
             if self._active_session_id == session_id:
                 idapro.close_database()
                 self._active_session_id = None
@@ -168,6 +201,8 @@ class SessionManager:
             for context_id, bound_session_id in list(self._context_bindings.items()):
                 if bound_session_id == session_id:
                     del self._context_bindings[context_id]
+            for owned_sessions in self._context_sessions.values():
+                owned_sessions.discard(session_id)
             logger.info("已关闭会话：{}", session_id)
             return True
 
@@ -179,6 +214,7 @@ class SessionManager:
                 self._active_session_id = None
             self._sessions.clear()
             self._context_bindings.clear()
+            self._context_sessions.clear()
 
     def mark_dirty(self, session_id: str, *, writeback_kind: str) -> IdaSession:
         """把会话标记为存在未持久化写回。"""
@@ -219,6 +255,11 @@ class SessionManager:
         if session is None:
             raise SessionNotFoundError(f"找不到会话：{session_id}")
         return session
+
+    def _require_context_owns_session_locked(self, context_id: str, session_id: str) -> None:
+        owned_sessions = self._context_sessions.get(context_id, set())
+        if session_id not in owned_sessions:
+            raise SessionNotFoundError(f"上下文 {context_id} 不拥有会话：{session_id}")
 
 
 _session_manager_singleton: SessionManager | None = None

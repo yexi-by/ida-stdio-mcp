@@ -487,6 +487,91 @@ class ProtocolTests(unittest.TestCase):
             json.dumps({"jsonrpc": "2.0", "id": 7, "result": {}}, ensure_ascii=False) + "\n",
         )
 
+    def test_isolated_context_mode_exposes_context_schema_and_resource_scope(self) -> None:
+        config = load_config(self._repo_root() / "setting.toml")
+        runtime = HeadlessRuntime(isolated_contexts=True)
+        service = build_service(
+            runtime,
+            config,
+            allow_unsafe=False,
+            allow_debugger=False,
+            profile_path=None,
+        )
+        server = StdioMcpServer(
+            tools=service.tools,
+            resources=service.resources,
+            identity=ServerIdentity(
+                protocol_version=config.server.protocol_version,
+                server_name=config.server.server_name,
+                server_version=config.server.server_version,
+            ),
+        )
+
+        tools = service.tools.list_tools()
+        by_name = {
+            str(item["name"]): item
+            for item in tools
+            if isinstance(item.get("name"), str)
+        }
+        self.assertTrue(bool(by_name["open_binary"]["requiresContext"]))
+        self.assertTrue(bool(by_name["list_binaries"]["requiresContext"]))
+        self.assertFalse(bool(by_name["health"]["requiresContext"]))
+        self.assertIn("context_id", schema_properties(by_name["open_binary"], name="open_binary"))
+        self.assertIn("context_id", schema_properties(by_name["health"], name="health"))
+        self.assertEqual(
+            by_name["open_binary"]["inputExample"],
+            {
+                "path": "D:/samples/sample.exe",
+                "run_auto_analysis": True,
+                "session_id": "sess-001",
+                "context_id": "agent-001",
+            },
+        )
+
+        resources = service.resources.list_resources()
+        by_uri = {
+            str(item["uri"]): item
+            for item in resources
+            if isinstance(item.get("uri"), str)
+        }
+        sessions_resource = by_uri["ida://sessions"]
+        self.assertEqual(sessions_resource.get("scope"), "context")
+        self.assertFalse(bool(sessions_resource.get("requiresSession")))
+        self.assertTrue(bool(sessions_resource.get("requiresContext")))
+        functions_resource = by_uri["ida://functions"]
+        self.assertEqual(functions_resource.get("scope"), "session")
+        self.assertTrue(bool(functions_resource.get("requiresSession")))
+        self.assertTrue(bool(functions_resource.get("requiresContext")))
+
+        no_context = server.dispatch_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "resources/read",
+                "params": {"uri": "ida://sessions"},
+            }
+        )
+        self.assertIsNotNone(no_context)
+        assert no_context is not None
+        no_context_payload = self._resource_payload(no_context)
+        self.assertEqual(no_context_payload.get("status"), "error")
+        no_context_error = expect_object(no_context_payload.get("error"), name="isolated.sessions.error")
+        self.assertEqual(no_context_error.get("code"), "session_required")
+
+        with_context = server.dispatch_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 52,
+                "method": "resources/read",
+                "params": {"uri": "ida://sessions", "context_id": "agent-1"},
+            }
+        )
+        self.assertIsNotNone(with_context)
+        assert with_context is not None
+        with_context_payload = self._resource_payload(with_context)
+        self.assertEqual(with_context_payload.get("status"), "ok")
+        self.assertEqual(with_context_payload.get("data"), [])
+
     def _assert_schema_is_explicit(self, schema: JsonObject, *, tool_name: str) -> None:
         """递归校验 tool schema 已明确暴露参数。"""
         schema_type = schema.get("type")

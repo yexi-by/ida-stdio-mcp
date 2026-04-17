@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import os
 import unittest
 from pathlib import Path
+from typing import cast
 
 from ida_stdio_mcp.config import load_config
 from ida_stdio_mcp.models import JsonObject, JsonValue
@@ -31,6 +33,13 @@ def expect_string(value: JsonValue, *, name: str) -> str:
     """把 JSON 值收窄为字符串。"""
     if not isinstance(value, str):
         raise AssertionError(f"{name} 应为字符串，实际为 {type(value).__name__}")
+    return value
+
+
+def expect_optional_object(value: JsonValue, *, name: str) -> JsonObject:
+    """把可空 JSON 值收窄为对象。"""
+    if not isinstance(value, dict):
+        raise AssertionError(f"{name} 应为对象，实际为 {type(value).__name__}")
     return value
 
 
@@ -90,13 +99,16 @@ class HeadlessToolTests(unittest.TestCase):
         response_result = expect_object(response["result"], name="tool.result")
         return expect_object(response_result["structuredContent"], name="tool.structured")
 
-    def _read_resource(self, uri: str) -> JsonObject:
+    def _read_resource(self, uri: str, params: JsonObject | None = None) -> JsonObject:
+        request_params: JsonObject = {"uri": uri}
+        if params is not None:
+            request_params.update(params)
         response = self.server.dispatch_message(
             {
                 "jsonrpc": "2.0",
                 "id": 2,
                 "method": "resources/read",
-                "params": {"uri": uri},
+                "params": request_params,
             }
         )
         self.assertIsNotNone(response)
@@ -445,6 +457,20 @@ class HeadlessToolTests(unittest.TestCase):
             self.assertIsInstance(changed_first, dict)
             assert isinstance(changed_first, dict)
             self.assertEqual(changed_first.get("hex"), "29c0")
+
+            decompile_after_patch = self._call_tool(
+                "decompile_function",
+                {"query": "main", "session_id": "elf-extended"},
+            )
+            self.assertIn(decompile_after_patch["status"], ("ok", "degraded", "unsupported"))
+            decompile_after_patch_data = decompile_after_patch["data"]
+            self.assertIsInstance(decompile_after_patch_data, dict)
+            assert isinstance(decompile_after_patch_data, dict)
+            if decompile_after_patch["status"] == "ok":
+                decompile_text = decompile_after_patch_data.get("text")
+                self.assertIsInstance(decompile_text, str)
+                assert isinstance(decompile_text, str)
+                self.assertNotEqual(decompile_text.strip(), "None")
         finally:
             self._call_tool(
                 "patch_bytes",
@@ -572,6 +598,152 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertTrue(
             all(isinstance(item, dict) and item.get("name") == import_name for item in filtered_data)
         )
+
+    def test_isolated_contexts_keep_sessions_and_resources_separate(self) -> None:
+        isolated_runtime = HeadlessRuntime(isolated_contexts=True)
+        isolated_service = build_service(
+            isolated_runtime,
+            self.config,
+            allow_unsafe=True,
+            allow_debugger=True,
+            profile_path=None,
+        )
+        isolated_server = StdioMcpServer(
+            tools=isolated_service.tools,
+            resources=isolated_service.resources,
+            identity=ServerIdentity(
+                protocol_version=self.config.server.protocol_version,
+                server_name=self.config.server.server_name,
+                server_version=self.config.server.server_version,
+            ),
+        )
+
+        def call(name: str, arguments: JsonObject) -> JsonObject:
+            response = isolated_server.dispatch_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 90,
+                    "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments},
+                }
+            )
+            self.assertIsNotNone(response)
+            assert response is not None
+            response_result = expect_object(response["result"], name="isolated.tool.result")
+            return expect_object(response_result["structuredContent"], name="isolated.tool.structured")
+
+        def read(uri: str, params: JsonObject) -> JsonObject:
+            response = isolated_server.dispatch_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 91,
+                    "method": "resources/read",
+                    "params": {"uri": uri, **params},
+                }
+            )
+            self.assertIsNotNone(response)
+            assert response is not None
+            return expect_object(response["result"], name="isolated.resource.result")
+
+        try:
+            self.assertEqual(
+                call(
+                    "open_binary",
+                    {"path": str(self.elf_fixture), "session_id": "agent1-elf", "context_id": "agent-1"},
+                )["status"],
+                "ok",
+            )
+            self.assertEqual(
+                call(
+                    "open_binary",
+                    {"path": str(self.pe_fixture), "session_id": "agent1-pe", "context_id": "agent-1"},
+                )["status"],
+                "ok",
+            )
+            self.assertEqual(
+                call(
+                    "open_binary",
+                    {"path": str(self.elf_fixture), "session_id": "agent2-elf", "context_id": "agent-2"},
+                )["status"],
+                "ok",
+            )
+
+            agent1_sessions = call("list_binaries", {"context_id": "agent-1"})
+            self.assertEqual(agent1_sessions["status"], "ok")
+            agent1_data = agent1_sessions["data"]
+            self.assertIsInstance(agent1_data, list)
+            assert isinstance(agent1_data, list)
+            self.assertEqual(
+                {str(item["session_id"]) for item in agent1_data if isinstance(item, dict)},
+                {"agent1-elf", "agent1-pe"},
+            )
+
+            agent2_sessions = call("list_binaries", {"context_id": "agent-2"})
+            self.assertEqual(agent2_sessions["status"], "ok")
+            agent2_data = agent2_sessions["data"]
+            self.assertIsInstance(agent2_data, list)
+            assert isinstance(agent2_data, list)
+            self.assertEqual(
+                {str(item["session_id"]) for item in agent2_data if isinstance(item, dict)},
+                {"agent2-elf"},
+            )
+
+            self.assertEqual(
+                expect_optional_object(
+                    expect_object(call("current_binary", {"context_id": "agent-1"})["data"], name="agent1.current")["session"],
+                    name="agent1.current.session",
+                )["session_id"],
+                "agent1-pe",
+            )
+            self.assertEqual(
+                expect_optional_object(
+                    expect_object(call("current_binary", {"context_id": "agent-2"})["data"], name="agent2.current")["session"],
+                    name="agent2.current.session",
+                )["session_id"],
+                "agent2-elf",
+            )
+
+            switched = call("switch_binary", {"session_id": "agent1-elf", "context_id": "agent-1"})
+            self.assertEqual(switched["status"], "ok")
+            self.assertEqual(
+                expect_optional_object(
+                    expect_object(call("current_binary", {"context_id": "agent-1"})["data"], name="agent1.current.after")["session"],
+                    name="agent1.current.after.session",
+                )["session_id"],
+                "agent1-elf",
+            )
+            self.assertEqual(
+                expect_optional_object(
+                    expect_object(call("current_binary", {"context_id": "agent-2"})["data"], name="agent2.current.after")["session"],
+                    name="agent2.current.after.session",
+                )["session_id"],
+                "agent2-elf",
+            )
+
+            forbidden = call("switch_binary", {"session_id": "agent2-elf", "context_id": "agent-1"})
+            self.assertEqual(forbidden["status"], "error")
+            forbidden_error = forbidden["error"]
+            self.assertIsInstance(forbidden_error, dict)
+            assert isinstance(forbidden_error, dict)
+            self.assertEqual(forbidden_error.get("code"), "session_not_found")
+
+            isolated_sessions_resource = read("ida://sessions", {"context_id": "agent-1"})
+            contents = expect_list(isolated_sessions_resource["contents"], name="isolated.sessions.contents")
+            first = expect_object(contents[0], name="isolated.sessions.contents[0]")
+            decoded_payload = json.loads(expect_string(first.get("text"), name="isolated.sessions.text"))
+            self.assertIsInstance(decoded_payload, dict)
+            assert isinstance(decoded_payload, dict)
+            payload = expect_object(cast(JsonObject, decoded_payload), name="isolated.sessions.payload")
+            self.assertEqual(payload.get("status"), "ok")
+            payload_data = payload.get("data")
+            self.assertIsInstance(payload_data, list)
+            assert isinstance(payload_data, list)
+            self.assertEqual(
+                {str(item["session_id"]) for item in payload_data if isinstance(item, dict)},
+                {"agent1-elf", "agent1-pe"},
+            )
+        finally:
+            isolated_runtime.shutdown()
 
 
 if __name__ == "__main__":

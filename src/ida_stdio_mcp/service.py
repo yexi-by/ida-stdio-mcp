@@ -97,6 +97,7 @@ def _object_param_schema(
 
 
 SESSION_ID_SCHEMA = _string_schema("可选。指定会话 ID；不传时默认作用于当前激活会话。")
+CONTEXT_ID_SCHEMA = _string_schema("上下文 ID；启用 --isolated-contexts 时必须显式提供，用于隔离不同 agent 的默认会话。")
 ADDR_OR_QUERY_PROPERTIES: dict[str, JsonObject] = {
     "addr": _string_schema("地址字符串，可写 0x 地址、十进制地址，或能解析到地址的符号名。"),
     "query": _string_schema("函数/符号查询文本；与 addr 二选一。"),
@@ -116,6 +117,7 @@ def _tool_input_schema(
     properties: dict[str, JsonObject] | None = None,
     required: tuple[str, ...] = (),
     include_session: bool = False,
+    include_context: bool = False,
     any_of: tuple[tuple[str, ...], ...] = (),
 ) -> JsonObject:
     """构造统一的 tool 输入 schema。
@@ -132,6 +134,8 @@ def _tool_input_schema(
         final_properties.update(deepcopy(properties))
     if include_session:
         final_properties["session_id"] = deepcopy(SESSION_ID_SCHEMA)
+    if include_context:
+        final_properties["context_id"] = deepcopy(CONTEXT_ID_SCHEMA)
     schema: JsonObject = {
         "type": "object",
         "properties": final_properties,
@@ -171,61 +175,72 @@ def _mapped_error_info(
     source: str,
     exc: Exception,
     session_required: bool,
+    context_required: bool,
 ) -> JsonObject:
     """把运行时异常映射为稳定、可恢复的结构化错误。"""
     if isinstance(exc, SessionRequiredError):
         return normalize_json_object(cast(JsonObject, build_error_info(
             code="session_required",
             message=str(exc),
-            details={"tool": name, "source": source, "requires_session": session_required},
-            next_steps=["先调用 open_binary 打开样本", "或调用 switch_binary 切换到已有会话"],
+            details={
+                "tool": name,
+                "source": source,
+                "requires_session": session_required,
+                "requires_context": context_required,
+            },
+            next_steps=["先调用 open_binary 打开样本", "或调用 switch_binary 切换到已有会话", "若启用了隔离模式，请补充 context_id"],
         )))
     if isinstance(exc, SessionNotFoundError):
         return normalize_json_object(cast(JsonObject, build_error_info(
             code="session_not_found",
             message=str(exc),
-            details={"tool": name, "source": source, "requires_session": session_required},
-            next_steps=["先调用 list_binaries 查看当前有效会话", "再使用正确的 session_id 重新调用"],
+            details={
+                "tool": name,
+                "source": source,
+                "requires_session": session_required,
+                "requires_context": context_required,
+            },
+            next_steps=["先调用 list_binaries 查看当前有效会话", "再使用正确的 session_id 重新调用", "若启用了隔离模式，请确认 session_id 属于当前 context_id"],
         )))
     if isinstance(exc, FileNotFoundError):
         return normalize_json_object(cast(JsonObject, build_error_info(
             code="path_not_found",
             message=str(exc),
-            details={"tool": name, "source": source, "requires_session": session_required},
+            details={"tool": name, "source": source, "requires_session": session_required, "requires_context": context_required},
             next_steps=["检查路径是否存在", "确认宿主进程对该路径有访问权限"],
         )))
     if isinstance(exc, NotADirectoryError):
         return normalize_json_object(cast(JsonObject, build_error_info(
             code="path_not_directory",
             message=str(exc),
-            details={"tool": name, "source": source, "requires_session": session_required},
+            details={"tool": name, "source": source, "requires_session": session_required, "requires_context": context_required},
             next_steps=["改传目录路径", "或改用 open_binary 打开单个文件"],
         )))
     if isinstance(exc, IsADirectoryError):
         return normalize_json_object(cast(JsonObject, build_error_info(
             code="path_is_directory",
             message=str(exc),
-            details={"tool": name, "source": source, "requires_session": session_required},
+            details={"tool": name, "source": source, "requires_session": session_required, "requires_context": context_required},
             next_steps=["改传具体文件路径", "不要把目录路径传给只接受文件的工具"],
         )))
     if isinstance(exc, RuntimeNotReadyError):
         return normalize_json_object(cast(JsonObject, build_error_info(
             code="runtime_not_ready",
             message=str(exc),
-            details={"tool": name, "source": source, "requires_session": session_required},
+            details={"tool": name, "source": source, "requires_session": session_required, "requires_context": context_required},
             next_steps=["检查 IDADIR 是否已设置且指向有效 IDA 安装目录"],
         )))
     if isinstance(exc, ValueError):
         return normalize_json_object(cast(JsonObject, build_error_info(
             code="invalid_request",
             message=str(exc),
-            details={"tool": name, "source": source, "requires_session": session_required},
+            details={"tool": name, "source": source, "requires_session": session_required, "requires_context": context_required},
             next_steps=["按当前工具的 inputSchema 修正字段值或查询目标"],
         )))
     return normalize_json_object(cast(JsonObject, build_error_info(
         code="tool_execution_failed",
         message=str(exc),
-        details={"tool": name, "source": source, "requires_session": session_required},
+        details={"tool": name, "source": source, "requires_session": session_required, "requires_context": context_required},
         next_steps=["检查当前数据库状态", "必要时查看文件日志中的异常上下文"],
     )))
 
@@ -236,6 +251,7 @@ def _error_result_from_exception(
     source: str,
     exc: Exception,
     session_required: bool,
+    context_required: bool,
 ) -> ToolResult:
     """把异常转换成统一 tool/resource envelope。"""
     return build_result(
@@ -247,6 +263,7 @@ def _error_result_from_exception(
             source=source,
             exc=exc,
             session_required=session_required,
+            context_required=context_required,
         ),
     )
 
@@ -327,9 +344,16 @@ STACK_VAR_DECLARE_ITEM_SCHEMA = _object_param_schema(
     required=("addr", "name", "offset"),
 )
 STACK_VAR_DELETE_ITEM_SCHEMA = _object_param_schema(
-    "单条栈变量删除请求。",
-    {"addr": _string_schema("函数地址或函数名。"), "name": _string_schema("栈变量名。")},
-    required=("addr", "name"),
+    "栈变量删除项。",
+    {
+        "addr": _string_schema("函数地址或名称。"),
+        "name": _string_schema("栈变量名称。"),
+        "offset": {
+            "description": "可选的精确偏移；传入后会优先按偏移删除，避免名称重名或参数区/局部区混淆。",
+            "oneOf": [{"type": "integer"}, {"type": "string"}],
+        },
+    },
+    required=("addr",),
 )
 BREAKPOINT_TOGGLE_ITEM_SCHEMA = _object_param_schema(
     "单条断点启停请求。",
@@ -349,7 +373,69 @@ class ServiceBundle:
 def _ensure_session(arguments: JsonObject, runtime: HeadlessRuntime) -> None:
     raw_session = arguments.get("session_id")
     session_id = raw_session if isinstance(raw_session, str) and raw_session else None
-    runtime.activate_for_request(session_id)
+    runtime.activate_for_request(session_id, context_id=_context_id(arguments))
+
+
+def _context_id(arguments: JsonObject) -> str | None:
+    """读取可选上下文 ID。"""
+    raw_context = arguments.get("context_id")
+    if raw_context is None:
+        return None
+    if not isinstance(raw_context, str):
+        raise ValueError("context_id 必须是字符串")
+    return raw_context or None
+
+
+def _context_enabled_schema(runtime: HeadlessRuntime, schema: JsonObject, *, required: bool) -> JsonObject:
+    """按运行模式把 context_id 暴露到公开 schema。"""
+    if not runtime.isolated_contexts:
+        return schema
+    schema_copy = deepcopy(schema)
+    properties = schema_copy.get("properties")
+    if not isinstance(properties, dict):
+        return schema_copy
+    properties["context_id"] = deepcopy(CONTEXT_ID_SCHEMA)
+    if required:
+        required_fields = schema_copy.get("required")
+        required_list: list[JsonValue] = [item for item in required_fields if isinstance(item, str)] if isinstance(required_fields, list) else []
+        if "context_id" not in required_list:
+            required_list.append("context_id")
+        schema_copy["required"] = required_list
+    return normalize_json_object(schema_copy)
+
+
+def _with_context_preconditions(
+    runtime: HeadlessRuntime,
+    preconditions: tuple[str, ...],
+    *,
+    required: bool,
+) -> tuple[str, ...]:
+    """按运行模式补充上下文隔离前置条件。"""
+    if not runtime.isolated_contexts or not required:
+        return preconditions
+    note = "启用 --isolated-contexts 后，必须显式提供 context_id。"
+    if note in preconditions:
+        return preconditions
+    return (*preconditions, note)
+
+
+def _with_context_example(
+    runtime: HeadlessRuntime,
+    input_example: JsonValue | None,
+    *,
+    required: bool,
+) -> JsonValue | None:
+    """按运行模式为示例补充 context_id。"""
+    if not runtime.isolated_contexts or not required:
+        return input_example
+    context_value = "agent-001"
+    if input_example is None:
+        return {"context_id": context_value}
+    if isinstance(input_example, dict):
+        example = deepcopy(input_example)
+        example.setdefault("context_id", context_value)
+        return normalize_json_object(cast(JsonObject, example))
+    return input_example
 
 
 def _normalize_tool_data(value: object) -> JsonValue:
@@ -405,12 +491,26 @@ def _tool(
     handler: Callable[[IdaCore, JsonObject], object],
     input_schema: JsonObject,
     session_required: bool = True,
+    context_required: bool | None = None,
     writeback_kind: str | None = None,
     feature_gate: GateName = "public",
     preconditions: tuple[str, ...] = (),
     empty_state_behavior: str = "",
     input_example: JsonValue | None = None,
 ) -> None:
+    effective_context_required = runtime.isolated_contexts if context_required is None else context_required
+    schema_with_context = _context_enabled_schema(runtime, input_schema, required=effective_context_required)
+    effective_preconditions = _with_context_preconditions(
+        runtime,
+        preconditions,
+        required=effective_context_required,
+    )
+    effective_input_example = _with_context_example(
+        runtime,
+        input_example,
+        required=effective_context_required,
+    )
+
     def wrapped(arguments: JsonObject) -> ToolResult:
         try:
             if session_required:
@@ -422,6 +522,7 @@ def _tool(
                 session = runtime.mark_writeback(
                     writeback_kind=writeback_kind,
                     session_id=_string_or_default(arguments, "session_id", "") or None,
+                    context_id=_context_id(arguments),
                 )
                 data = _with_writeback_state(data, session)
             return build_result(status=status, source=source, data=data, warnings=warnings)
@@ -431,21 +532,23 @@ def _tool(
                 source=source,
                 exc=exc,
                 session_required=session_required,
+                context_required=effective_context_required,
             )
 
     registry.register(
         ToolSpec(
             name=name,
             description=description,
-            input_schema=_public_tool_schema(input_schema),
+            input_schema=_public_tool_schema(schema_with_context),
             output_schema=COMMON_OUTPUT_SCHEMA,
             handler=wrapped,
-            validation_schema=input_schema,
+            validation_schema=schema_with_context,
             requires_session=session_required,
+            requires_context=effective_context_required,
             feature_gate=feature_gate,
-            preconditions=preconditions,
+            preconditions=effective_preconditions,
             empty_state_behavior=empty_state_behavior,
-            input_example=input_example,
+            input_example=effective_input_example,
         )
     )
 
@@ -470,16 +573,60 @@ def _management_tools(
         "deactivate_binary",
         "analyze_directory",
     }
+    context_required = runtime.isolated_contexts
 
-    def management_error_result(name: str, source: str, exc: Exception, *, session_required: bool) -> ToolResult:
+    def register_management_tool(
+        *,
+        name: str,
+        description: str,
+        schema: JsonObject,
+        handler: Callable[[JsonObject], ToolResult],
+        requires_session: bool,
+        requires_context: bool | None = None,
+        preconditions: tuple[str, ...] = (),
+        empty_state_behavior: str = "",
+        input_example: JsonValue | None = None,
+    ) -> None:
+        effective_requires_context = context_required if requires_context is None else requires_context
+        schema_with_context = _context_enabled_schema(
+            runtime,
+            schema,
+            required=effective_requires_context,
+        )
+        registry.register(
+            ToolSpec(
+                name=name,
+                description=description,
+                input_schema=_public_tool_schema(schema_with_context),
+                output_schema=COMMON_OUTPUT_SCHEMA,
+                handler=handler,
+                validation_schema=schema_with_context,
+                requires_session=requires_session,
+                requires_context=effective_requires_context,
+                preconditions=_with_context_preconditions(
+                    runtime,
+                    preconditions,
+                    required=effective_requires_context,
+                ),
+                empty_state_behavior=empty_state_behavior,
+                input_example=_with_context_example(
+                    runtime,
+                    input_example,
+                    required=effective_requires_context,
+                ),
+            )
+        )
+
+    def management_error_result(name: str, source: str, exc: Exception, *, session_required: bool, requires_context: bool) -> ToolResult:
         return _error_result_from_exception(
             name=name,
             source=source,
             exc=exc,
             session_required=session_required,
+            context_required=requires_context,
         )
 
-    def health_handler(_: JsonObject) -> ToolResult:
+    def health_handler(arguments: JsonObject) -> ToolResult:
         active: JsonValue = None
         health_data: JsonObject = normalize_json_object(
             {
@@ -490,12 +637,13 @@ def _management_tools(
                 "feature_gates": {
                     "unsafe": allow_unsafe,
                     "debugger": allow_debugger,
+                    "isolated_contexts": runtime.isolated_contexts,
                 },
             }
         )
         try:
-            active = _normalize_tool_data(runtime.current_binary())
-            runtime.activate_for_request(None)
+            active = _normalize_tool_data(runtime.current_binary(context_id=_context_id(arguments)))
+            runtime.activate_for_request(None, context_id=_context_id(arguments))
             core = IdaCore()
             payload = normalize_json_object(core.health())
             payload["active_session"] = active
@@ -503,6 +651,7 @@ def _management_tools(
                 {
                 "unsafe": allow_unsafe,
                 "debugger": allow_debugger,
+                "isolated_contexts": runtime.isolated_contexts,
                 }
             )
             health_data = payload
@@ -520,7 +669,13 @@ def _management_tools(
             data = core.wait_auto_analysis()
             return build_result(status="ok", source="runtime.warmup", data=data)
         except Exception as exc:
-            return management_error_result("warmup", "runtime.warmup", exc, session_required=True)
+            return management_error_result(
+                "warmup",
+                "runtime.warmup",
+                exc,
+                session_required=True,
+                requires_context=context_required,
+            )
 
     def open_binary_handler(arguments: JsonObject) -> ToolResult:
         try:
@@ -529,45 +684,65 @@ def _management_tools(
                 Path(raw_path),
                 run_auto_analysis=_bool_or_default(arguments, "run_auto_analysis", True),
                 session_id=_string_or_default(arguments, "session_id", "") or None,
+                context_id=_context_id(arguments),
             )
             return build_result(status="ok", source="runtime.open_binary", data=_normalize_tool_data(summary))
         except Exception as exc:
-            return management_error_result("open_binary", "runtime.open_binary", exc, session_required=False)
+            return management_error_result("open_binary", "runtime.open_binary", exc, session_required=False, requires_context=context_required)
 
     def close_binary_handler(arguments: JsonObject) -> ToolResult:
         try:
             raw_session = arguments.get("session_id")
             session_id = raw_session if isinstance(raw_session, str) else None
-            runtime.close_binary(session_id)
+            runtime.close_binary(session_id, context_id=_context_id(arguments))
             return build_result(
                 status="ok",
                 source="runtime.close_binary",
                 data=_normalize_tool_data({"closed": True, "session_id": session_id}),
             )
         except Exception as exc:
-            return management_error_result("close_binary", "runtime.close_binary", exc, session_required=True)
+            return management_error_result("close_binary", "runtime.close_binary", exc, session_required=True, requires_context=context_required)
 
     def switch_binary_handler(arguments: JsonObject) -> ToolResult:
         try:
             raw_session = _require_string(arguments, "session_id")
-            return build_result(status="ok", source="runtime.switch_binary", data=_normalize_tool_data(runtime.switch_binary(raw_session)))
+            return build_result(
+                status="ok",
+                source="runtime.switch_binary",
+                data=_normalize_tool_data(runtime.switch_binary(raw_session, context_id=_context_id(arguments))),
+            )
         except Exception as exc:
-            return management_error_result("switch_binary", "runtime.switch_binary", exc, session_required=False)
+            return management_error_result("switch_binary", "runtime.switch_binary", exc, session_required=False, requires_context=context_required)
 
-    def list_binaries_handler(_: JsonObject) -> ToolResult:
-        return build_result(status="ok", source="runtime.list_binaries", data=_normalize_tool_data(runtime.list_binaries()))
+    def list_binaries_handler(arguments: JsonObject) -> ToolResult:
+        try:
+            return build_result(
+                status="ok",
+                source="runtime.list_binaries",
+                data=_normalize_tool_data(runtime.list_binaries(context_id=_context_id(arguments))),
+            )
+        except Exception as exc:
+            return management_error_result("list_binaries", "runtime.list_binaries", exc, session_required=False, requires_context=context_required)
 
-    def current_binary_handler(_: JsonObject) -> ToolResult:
+    def current_binary_handler(arguments: JsonObject) -> ToolResult:
         try:
             return build_result(
                 status="ok",
                 source="runtime.current_binary",
-                data=_normalize_tool_data({"session": runtime.current_binary()}),
+                data=_normalize_tool_data({"session": runtime.current_binary(context_id=_context_id(arguments))}),
             )
         except SessionRequiredError:
+            if runtime.isolated_contexts and _context_id(arguments) is None:
+                return management_error_result(
+                    "current_binary",
+                    "runtime.current_binary",
+                    SessionRequiredError("当前启用了 --isolated-contexts，必须显式提供 context_id"),
+                    session_required=False,
+                    requires_context=True,
+                )
             return build_result(status="ok", source="runtime.current_binary", data=_normalize_tool_data({"session": None}))
         except Exception as exc:
-            return management_error_result("current_binary", "runtime.current_binary", exc, session_required=False)
+            return management_error_result("current_binary", "runtime.current_binary", exc, session_required=False, requires_context=context_required)
 
     def save_binary_handler(arguments: JsonObject) -> ToolResult:
         try:
@@ -576,20 +751,20 @@ def _management_tools(
             return build_result(
                 status="ok",
                 source="runtime.save_binary",
-                data=_normalize_tool_data(runtime.save_binary(path=path, session_id=session_id)),
+                data=_normalize_tool_data(runtime.save_binary(path=path, session_id=session_id, context_id=_context_id(arguments))),
             )
         except Exception as exc:
-            return management_error_result("save_binary", "runtime.save_binary", exc, session_required=True)
+            return management_error_result("save_binary", "runtime.save_binary", exc, session_required=True, requires_context=context_required)
 
-    def deactivate_binary_handler(_: JsonObject) -> ToolResult:
+    def deactivate_binary_handler(arguments: JsonObject) -> ToolResult:
         try:
             return build_result(
                 status="ok",
                 source="runtime.deactivate_binary",
-                data=_normalize_tool_data({"deactivated": runtime.deactivate_binary()}),
+                data=_normalize_tool_data({"deactivated": runtime.deactivate_binary(context_id=_context_id(arguments))}),
             )
         except Exception as exc:
-            return management_error_result("deactivate_binary", "runtime.deactivate_binary", exc, session_required=True)
+            return management_error_result("deactivate_binary", "runtime.deactivate_binary", exc, session_required=True, requires_context=context_required)
 
     def analyze_directory_handler(arguments: JsonObject) -> ToolResult:
         try:
@@ -618,7 +793,7 @@ def _management_tools(
 
             previous_session_id: str | None = None
             try:
-                current = runtime.current_binary()
+                current = runtime.current_binary(context_id=_context_id(arguments))
                 previous_session_id = current["session_id"]
             except Exception:
                 previous_session_id = None
@@ -641,7 +816,7 @@ def _management_tools(
                     continue
                 temp_session_id = f"batch-{index:03d}"
                 try:
-                    runtime.open_binary(candidate.path, session_id=temp_session_id)
+                    runtime.open_binary(candidate.path, session_id=temp_session_id, context_id=_context_id(arguments))
                     core = IdaCore()
                     survey = core.survey_binary()
                     try:
@@ -662,18 +837,18 @@ def _management_tools(
                     errors.append({"path": str(candidate.path), "error": str(exc)})
                 finally:
                     try:
-                        runtime.close_binary(temp_session_id)
+                        runtime.close_binary(temp_session_id, context_id=_context_id(arguments))
                     except Exception:
                         pass
 
             if previous_session_id is not None:
                 try:
-                    runtime.switch_binary(previous_session_id)
+                    runtime.switch_binary(previous_session_id, context_id=_context_id(arguments))
                 except Exception as exc:
                     errors.append({"path": "<restore>", "error": f"恢复原会话失败：{exc}"})
             else:
                 try:
-                    runtime.deactivate_binary()
+                    runtime.deactivate_binary(context_id=_context_id(arguments))
                 except Exception:
                     pass
 
@@ -718,146 +893,128 @@ def _management_tools(
                 warnings=warnings,
             )
         except Exception as exc:
-            return management_error_result("analyze_directory", "directory_analysis", exc, session_required=False)
+            return management_error_result("analyze_directory", "directory_analysis", exc, session_required=False, requires_context=context_required)
 
-    registry.register(ToolSpec("health", "返回运行时健康状态。", _tool_input_schema(), COMMON_OUTPUT_SCHEMA, health_handler))
-    registry.register(
-        ToolSpec(
-            "warmup",
-            "预热当前会话。",
-            _tool_input_schema(include_session=True),
-            COMMON_OUTPUT_SCHEMA,
-            warmup_handler,
-            requires_session=True,
-            preconditions=("必须已存在活动会话，或显式提供 session_id。",),
-            empty_state_behavior="无活动会话时返回 session_required。",
-            input_example={"session_id": "sess-001"},
-        )
+    register_management_tool(
+        name="health",
+        description="返回运行时健康状态。",
+        schema=_tool_input_schema(),
+        handler=health_handler,
+        requires_session=False,
+        requires_context=False,
+        empty_state_behavior="全局健康检查；未提供 context_id 时不强制绑定会话。",
+        input_example={},
     )
-    registry.register(
-        ToolSpec(
-            "open_binary",
-            "打开二进制并绑定当前会话。",
-            _tool_input_schema(
-                properties={
-                    "path": _string_schema("二进制文件路径。"),
-                    "run_auto_analysis": _boolean_schema("是否在打开后等待自动分析。默认 true。"),
-                },
-                required=("path",),
-                include_session=True,
-            ),
-            COMMON_OUTPUT_SCHEMA,
-            open_binary_handler,
-            requires_session=False,
-            empty_state_behavior="无需现有会话；成功后返回新绑定会话。",
-            input_example={"path": "D:/samples/sample.exe", "run_auto_analysis": True, "session_id": "sess-001"},
-        )
+    register_management_tool(
+        name="warmup",
+        description="预热当前会话。",
+        schema=_tool_input_schema(include_session=True),
+        handler=warmup_handler,
+        requires_session=True,
+        preconditions=("必须已存在活动会话，或显式提供 session_id。",),
+        empty_state_behavior="无活动会话时返回 session_required。",
+        input_example={"session_id": "sess-001"},
     )
-    registry.register(
-        ToolSpec(
-            "close_binary",
-            "关闭指定或当前会话。",
-            _tool_input_schema(include_session=True),
-            COMMON_OUTPUT_SCHEMA,
-            close_binary_handler,
-            requires_session=False,
-            preconditions=("若不传 session_id，则必须存在活动会话。",),
-            empty_state_behavior="无活动会话且未传 session_id 时返回 session_required。",
-            input_example={"session_id": "sess-001"},
-        )
+    register_management_tool(
+        name="open_binary",
+        description="打开二进制并绑定当前会话。",
+        schema=_tool_input_schema(
+            properties={
+                "path": _string_schema("二进制文件路径。"),
+                "run_auto_analysis": _boolean_schema("是否在打开后等待自动分析。默认 true。"),
+            },
+            required=("path",),
+            include_session=True,
+        ),
+        handler=open_binary_handler,
+        requires_session=False,
+        empty_state_behavior="无需现有会话；成功后返回新绑定会话。",
+        input_example={"path": "D:/samples/sample.exe", "run_auto_analysis": True, "session_id": "sess-001"},
     )
-    registry.register(
-        ToolSpec(
-            "switch_binary",
-            "切换当前默认会话。",
-            _tool_input_schema(required=("session_id",), include_session=True),
-            COMMON_OUTPUT_SCHEMA,
-            switch_binary_handler,
-            requires_session=False,
-            preconditions=("session_id 必须指向已存在会话。",),
-            empty_state_behavior="session_id 不存在时返回 session_not_found。",
-            input_example={"session_id": "sess-001"},
-        )
+    register_management_tool(
+        name="close_binary",
+        description="关闭指定或当前会话。",
+        schema=_tool_input_schema(include_session=True),
+        handler=close_binary_handler,
+        requires_session=False,
+        preconditions=("若不传 session_id，则必须存在活动会话。",),
+        empty_state_behavior="无活动会话且未传 session_id 时返回 session_required。",
+        input_example={"session_id": "sess-001"},
     )
-    registry.register(
-        ToolSpec(
-            "list_binaries",
-            "列出所有打开的会话。",
-            _tool_input_schema(),
-            COMMON_OUTPUT_SCHEMA,
-            list_binaries_handler,
-            requires_session=False,
-            empty_state_behavior="无会话时返回空列表。",
-            input_example={},
-        )
+    register_management_tool(
+        name="switch_binary",
+        description="切换当前默认会话。",
+        schema=_tool_input_schema(required=("session_id",), include_session=True),
+        handler=switch_binary_handler,
+        requires_session=False,
+        preconditions=("session_id 必须指向已存在会话。",),
+        empty_state_behavior="session_id 不存在时返回 session_not_found。",
+        input_example={"session_id": "sess-001"},
     )
-    registry.register(
-        ToolSpec(
-            "current_binary",
-            "返回当前默认会话。",
-            _tool_input_schema(),
-            COMMON_OUTPUT_SCHEMA,
-            current_binary_handler,
-            requires_session=False,
-            empty_state_behavior="无会话时返回 {session: null}，不视为错误。",
-            input_example={},
-        )
+    register_management_tool(
+        name="list_binaries",
+        description="列出所有打开的会话。",
+        schema=_tool_input_schema(),
+        handler=list_binaries_handler,
+        requires_session=False,
+        empty_state_behavior="无会话时返回空列表。",
+        input_example={},
     )
-    registry.register(
-        ToolSpec(
-            "save_binary",
-            "保存当前或指定会话对应的 IDB。",
-            _tool_input_schema(
-                properties={"path": _string_schema("可选。保存目标路径；为空时覆盖/使用 IDA 默认路径。")},
-                include_session=True,
-            ),
-            COMMON_OUTPUT_SCHEMA,
-            save_binary_handler,
-            requires_session=False,
-            preconditions=("若不传 session_id，则必须存在活动会话。",),
-            empty_state_behavior="无活动会话且未传 session_id 时返回 session_required。",
-            input_example={"session_id": "sess-001"},
-        )
+    register_management_tool(
+        name="current_binary",
+        description="返回当前默认会话。",
+        schema=_tool_input_schema(),
+        handler=current_binary_handler,
+        requires_session=False,
+        empty_state_behavior="无会话时返回 {session: null}，不视为错误。",
+        input_example={},
     )
-    registry.register(
-        ToolSpec(
-            "deactivate_binary",
-            "解除默认会话绑定。",
-            _tool_input_schema(),
-            COMMON_OUTPUT_SCHEMA,
-            deactivate_binary_handler,
-            requires_session=False,
-            preconditions=("必须存在活动会话。",),
-            empty_state_behavior="无活动会话时返回 session_required。",
-            input_example={},
-        )
+    register_management_tool(
+        name="save_binary",
+        description="保存当前或指定会话对应的 IDB。",
+        schema=_tool_input_schema(
+            properties={"path": _string_schema("可选。保存目标路径；为空时覆盖/使用 IDA 默认路径。")},
+            include_session=True,
+        ),
+        handler=save_binary_handler,
+        requires_session=False,
+        preconditions=("若不传 session_id，则必须存在活动会话。",),
+        empty_state_behavior="无活动会话且未传 session_id 时返回 session_required。",
+        input_example={"session_id": "sess-001"},
     )
-    registry.register(
-        ToolSpec(
-            "analyze_directory",
-            "扫描目录、挑选候选二进制并做批量深度分析。",
-            _tool_input_schema(
-                properties={
-                    "path": _string_schema("要扫描的目录路径。"),
-                    "recursive": _boolean_schema("是否递归扫描子目录。"),
-                    "max_candidates": _integer_schema("最多保留多少个候选文件进入筛选结果。", minimum=1),
-                    "max_deep_analysis": _integer_schema("最多对多少个候选样本做深度分析。", minimum=1),
-                    "include_extensions": _array_schema("允许的扩展名白名单，例如 ['.exe', '.dll', '.elf']。", _string_schema("扩展名。")),
-                    "exclude_patterns": _array_schema("排除文件/目录名模式。", _string_schema("排除模式。")),
-                    "prefer_managed": _boolean_schema("是否优先托管/.NET 候选。"),
-                    "prefer_native": _boolean_schema("是否优先原生候选。"),
-                    "prefer_entry_binary": _boolean_schema("是否优先入口二进制。"),
-                    "prefer_user_code": _boolean_schema("是否优先用户代码而非插件/运行库。"),
-                    "scoring_profile": _string_schema("评分档位，例如 default / managed_first / entry_only。"),
-                },
-                required=("path",),
-            ),
-            COMMON_OUTPUT_SCHEMA,
-            analyze_directory_handler,
-            requires_session=False,
-            empty_state_behavior="无需现有会话；内部会临时创建分析会话并在结束后恢复原上下文。",
-            input_example={"path": "D:/samples", "recursive": True, "max_candidates": 20, "max_deep_analysis": 5},
-        )
+    register_management_tool(
+        name="deactivate_binary",
+        description="解除默认会话绑定。",
+        schema=_tool_input_schema(),
+        handler=deactivate_binary_handler,
+        requires_session=False,
+        preconditions=("必须存在活动会话。",),
+        empty_state_behavior="无活动会话时返回 session_required。",
+        input_example={},
+    )
+    register_management_tool(
+        name="analyze_directory",
+        description="扫描目录、挑选候选二进制并做批量深度分析。",
+        schema=_tool_input_schema(
+            properties={
+                "path": _string_schema("要扫描的目录路径。"),
+                "recursive": _boolean_schema("是否递归扫描子目录。"),
+                "max_candidates": _integer_schema("最多保留多少个候选文件进入筛选结果。", minimum=1),
+                "max_deep_analysis": _integer_schema("最多对多少个候选样本做深度分析。", minimum=1),
+                "include_extensions": _array_schema("允许的扩展名白名单，例如 ['.exe', '.dll', '.elf']。", _string_schema("扩展名。")),
+                "exclude_patterns": _array_schema("排除文件/目录名模式。", _string_schema("排除模式。")),
+                "prefer_managed": _boolean_schema("是否优先托管/.NET 候选。"),
+                "prefer_native": _boolean_schema("是否优先原生候选。"),
+                "prefer_entry_binary": _boolean_schema("是否优先入口二进制。"),
+                "prefer_user_code": _boolean_schema("是否优先用户代码而非插件/运行库。"),
+                "scoring_profile": _string_schema("评分档位，例如 default / managed_first / entry_only。"),
+            },
+            required=("path",),
+        ),
+        handler=analyze_directory_handler,
+        requires_session=False,
+        empty_state_behavior="无需现有会话；内部会临时创建分析会话并在结束后恢复原上下文。",
+        input_example={"path": "D:/samples", "recursive": True, "max_candidates": 20, "max_deep_analysis": 5},
     )
     return protected
 
@@ -1864,6 +2021,10 @@ def _register_resources(
     allow_unsafe: bool,
     allow_debugger: bool,
 ) -> None:
+    session_requires_context = runtime.isolated_contexts
+    session_scope = "session"
+    context_scope = "context" if runtime.isolated_contexts else "global"
+
     def resource_payload(
         *,
         source: str,
@@ -1874,12 +2035,46 @@ def _register_resources(
     ) -> JsonObject:
         return cast(JsonObject, build_result(status=status, source=source, data=data, warnings=warnings, error=error))
 
+    def request_context_id(params: dict[str, str], *, required: bool) -> str | None:
+        context_id = params.get("context_id")
+        if context_id is None and required:
+            raise SessionRequiredError("当前启用了 --isolated-contexts，资源读取必须显式提供 context_id")
+        return context_id
+
     def global_reader(source: str, reader: Callable[[], object]) -> Callable[[dict[str, str]], JsonValue]:
         def wrapped(_: dict[str, str]) -> JsonValue:
             try:
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader())))
             except Exception as exc:
-                return _normalize_tool_data(_error_result_from_exception(name=source, source=source, exc=exc, session_required=False))
+                return _normalize_tool_data(
+                    _error_result_from_exception(
+                        name=source,
+                        source=source,
+                        exc=exc,
+                        session_required=False,
+                        context_required=False,
+                    )
+                )
+
+        return wrapped
+
+    def global_param_reader(
+        source: str,
+        reader: Callable[[dict[str, str]], object],
+    ) -> Callable[[dict[str, str]], JsonValue]:
+        def wrapped(params: dict[str, str]) -> JsonValue:
+            try:
+                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(params))))
+            except Exception as exc:
+                return _normalize_tool_data(
+                    _error_result_from_exception(
+                        name=source,
+                        source=source,
+                        exc=exc,
+                        session_required=False,
+                        context_required=False,
+                    )
+                )
 
         return wrapped
 
@@ -1888,106 +2083,210 @@ def _register_resources(
             try:
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(params))))
             except Exception as exc:
-                return _normalize_tool_data(_error_result_from_exception(name=source, source=source, exc=exc, session_required=False))
+                return _normalize_tool_data(
+                    _error_result_from_exception(
+                        name=source,
+                        source=source,
+                        exc=exc,
+                        session_required=False,
+                        context_required=False,
+                    )
+                )
 
         return wrapped
 
     def active_reader(source: str, reader: Callable[[IdaCore], object]) -> Callable[[dict[str, str]], JsonValue]:
-        def wrapped(_: dict[str, str]) -> JsonValue:
+        def wrapped(params: dict[str, str]) -> JsonValue:
             try:
-                runtime.activate_for_request(None)
+                runtime.activate_for_request(None, context_id=request_context_id(params, required=session_requires_context))
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(IdaCore()))))
             except Exception as exc:
-                return _normalize_tool_data(_error_result_from_exception(name=source, source=source, exc=exc, session_required=True))
+                return _normalize_tool_data(
+                    _error_result_from_exception(
+                        name=source,
+                        source=source,
+                        exc=exc,
+                        session_required=True,
+                        context_required=session_requires_context,
+                    )
+                )
 
         return wrapped
 
     def template_reader(source: str, reader: Callable[[IdaCore, dict[str, str]], object]) -> Callable[[dict[str, str]], JsonValue]:
         def wrapped(params: dict[str, str]) -> JsonValue:
             try:
-                runtime.activate_for_request(None)
+                runtime.activate_for_request(None, context_id=request_context_id(params, required=session_requires_context))
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(IdaCore(), params))))
             except Exception as exc:
-                return _normalize_tool_data(_error_result_from_exception(name=source, source=source, exc=exc, session_required=True))
+                return _normalize_tool_data(
+                    _error_result_from_exception(
+                        name=source,
+                        source=source,
+                        exc=exc,
+                        session_required=True,
+                        context_required=session_requires_context,
+                    )
+                )
 
         return wrapped
 
-    def capability_matrix_document() -> JsonObject:
+    def context_reader(
+        source: str,
+        reader: Callable[[str | None], object],
+    ) -> Callable[[dict[str, str]], JsonValue]:
+        def wrapped(params: dict[str, str]) -> JsonValue:
+            try:
+                context_id = request_context_id(params, required=session_requires_context)
+                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(context_id))))
+            except Exception as exc:
+                return _normalize_tool_data(
+                    _error_result_from_exception(
+                        name=source,
+                        source=source,
+                        exc=exc,
+                        session_required=False,
+                        context_required=session_requires_context,
+                    )
+                )
+
+        return wrapped
+
+    def current_session_resource(context_id: str | None) -> JsonObject:
+        try:
+            session: JsonValue = _normalize_tool_data(runtime.current_binary(context_id=context_id))
+        except SessionRequiredError:
+            session = None
+        return normalize_json_object({"session": session})
+
+    def capability_matrix_document(params: dict[str, str]) -> JsonObject:
+        context_id = request_context_id(params, required=False)
         current_session: JsonValue = None
         current_snapshot: JsonValue = None
         try:
-            current_session = _normalize_tool_data(runtime.current_binary())
-            runtime.activate_for_request(None)
+            current_session = _normalize_tool_data(runtime.current_binary(context_id=context_id))
+            runtime.activate_for_request(None, context_id=context_id)
             current_snapshot = IdaCore().capabilities()
         except Exception:
             current_session = None
             current_snapshot = None
+        resource_scopes: JsonObject = {
+            "global": [
+                "ida://capability-matrix",
+                "ida://docs/tools",
+            ],
+            session_scope: [
+                "ida://idb/metadata",
+                "ida://idb/segments",
+                "ida://idb/entrypoints",
+                "ida://idb/capabilities",
+                "ida://survey",
+                "ida://types",
+                "ida://structs",
+                "ida://functions",
+                "ida://functions/profiles",
+                "ida://globals",
+                "ida://imports",
+                "ida://imports/categories",
+                "ida://strings",
+                "ida://callgraph/summary",
+                "ida://managed/summary",
+                "ida://managed/types",
+                "ida://managed/namespaces",
+            ],
+        }
+        context_resources: list[JsonValue] = ["ida://session/current", "ida://sessions"]
+        if runtime.isolated_contexts:
+            resource_scopes[context_scope] = context_resources
+        else:
+            global_resources = cast(list[JsonValue], resource_scopes["global"])
+            global_resources.extend(context_resources)
         return {
             "service": {
                 "headless_only": True,
                 "stdio_only": True,
                 "multi_session": True,
-                "feature_gates": {"unsafe": allow_unsafe, "debugger": allow_debugger},
+                "feature_gates": {
+                    "unsafe": allow_unsafe,
+                    "debugger": allow_debugger,
+                    "isolated_contexts": runtime.isolated_contexts,
+                },
             },
-            "resource_scopes": {
-                "global": [
-                    "ida://capability-matrix",
-                    "ida://docs/tools",
-                    "ida://session/current",
-                    "ida://sessions",
-                ],
-                "session": [
-                    "ida://idb/metadata",
-                    "ida://idb/segments",
-                    "ida://idb/entrypoints",
-                    "ida://idb/capabilities",
-                    "ida://survey",
-                    "ida://types",
-                    "ida://structs",
-                    "ida://functions",
-                    "ida://functions/profiles",
-                    "ida://globals",
-                    "ida://imports",
-                    "ida://imports/categories",
-                    "ida://strings",
-                    "ida://callgraph/summary",
-                    "ida://managed/summary",
-                    "ida://managed/types",
-                    "ida://managed/namespaces",
-                ],
+            "resource_scopes": resource_scopes,
+            "context_requirements": {
+                "isolated_contexts": runtime.isolated_contexts,
+                "session_scoped_tools_require_context": runtime.isolated_contexts,
+                "session_scoped_resources_require_context": runtime.isolated_contexts,
             },
+            "requested_context": context_id,
             "current_session": current_session,
             "current_snapshot": current_snapshot,
         }
 
-    resources.register_static(ResourceSpec("ida://idb/metadata", "idb_metadata", "当前 IDB 元数据。", "application/json", active_reader("resource.idb_metadata", lambda core: core.idb_metadata())))
-    resources.register_static(ResourceSpec("ida://idb/segments", "idb_segments", "当前 IDB 段信息。", "application/json", active_reader("resource.idb_segments", lambda core: core.segments())))
-    resources.register_static(ResourceSpec("ida://idb/entrypoints", "idb_entrypoints", "当前 IDB 入口点。", "application/json", active_reader("resource.idb_entrypoints", lambda core: core.entrypoints())))
-    resources.register_static(ResourceSpec("ida://idb/capabilities", "idb_capabilities", "当前活动会话的实时能力矩阵。", "application/json", active_reader("resource.idb_capabilities", lambda core: core.capabilities())))
+    resources.register_static(
+        ResourceSpec(
+            "ida://idb/metadata",
+            "idb_metadata",
+            "当前 IDB 元数据。",
+            "application/json",
+            active_reader("resource.idb_metadata", lambda core: core.idb_metadata()),
+            requires_context=session_requires_context,
+        )
+    )
+    resources.register_static(
+        ResourceSpec(
+            "ida://idb/segments",
+            "idb_segments",
+            "当前 IDB 段信息。",
+            "application/json",
+            active_reader("resource.idb_segments", lambda core: core.segments()),
+            requires_context=session_requires_context,
+        )
+    )
+    resources.register_static(
+        ResourceSpec(
+            "ida://idb/entrypoints",
+            "idb_entrypoints",
+            "当前 IDB 入口点。",
+            "application/json",
+            active_reader("resource.idb_entrypoints", lambda core: core.entrypoints()),
+            requires_context=session_requires_context,
+        )
+    )
+    resources.register_static(
+        ResourceSpec(
+            "ida://idb/capabilities",
+            "idb_capabilities",
+            "当前活动会话的实时能力矩阵。",
+            "application/json",
+            active_reader("resource.idb_capabilities", lambda core: core.capabilities()),
+            requires_context=session_requires_context,
+        )
+    )
     resources.register_static(
         ResourceSpec(
             "ida://capability-matrix",
             "capability_matrix",
             "全局能力边界文档；即使当前没有活动会话也可读取。",
             "application/json",
-            global_reader("resource.capability_matrix", capability_matrix_document),
+            global_param_reader("resource.capability_matrix", capability_matrix_document),
             scope="global",
             requires_session=False,
         )
     )
-    resources.register_static(ResourceSpec("ida://survey", "survey", "当前样本的综合概览。", "application/json", active_reader("resource.survey", lambda core: core.survey_binary())))
-    resources.register_static(ResourceSpec("ida://types", "types", "当前类型目录。", "application/json", active_reader("resource.types", lambda core: core.query_types())))
-    resources.register_static(ResourceSpec("ida://structs", "structs", "当前结构体列表。", "application/json", active_reader("resource.structs", lambda core: core.search_structs())))
-    resources.register_static(ResourceSpec("ida://functions", "functions", "当前函数列表。", "application/json", active_reader("resource.functions", lambda core: core.list_functions(limit=2000))))
-    resources.register_static(ResourceSpec("ida://functions/profiles", "function_profiles", "当前函数画像摘要。", "application/json", active_reader("resource.function_profiles", lambda core: [core.get_function_profile(str(item.get("addr")), include_asm=False) for item in core.list_functions(limit=200)])))
-    resources.register_static(ResourceSpec("ida://globals", "globals", "当前全局符号列表。", "application/json", active_reader("resource.globals", lambda core: core.list_globals(limit=2000))))
-    resources.register_static(ResourceSpec("ida://imports", "imports", "当前导入表。", "application/json", active_reader("resource.imports", lambda core: core.list_imports(limit=2000))))
-    resources.register_static(ResourceSpec("ida://imports/categories", "imports_categories", "当前导入的分类视图。", "application/json", active_reader("resource.imports_categories", lambda core: core.survey_binary()["imports_by_category"])))
-    resources.register_static(ResourceSpec("ida://strings", "strings", "当前字符串列表。", "application/json", active_reader("resource.strings", lambda core: core.list_strings(limit=2000))))
-    resources.register_static(ResourceSpec("ida://callgraph/summary", "callgraph_summary", "当前样本的调用图摘要。", "application/json", active_reader("resource.callgraph_summary", lambda core: core.survey_binary()["call_graph_summary"])))
-    resources.register_static(ResourceSpec("ida://managed/summary", "managed_summary", "托管/.NET 能力与符号级摘要。", "application/json", active_reader("resource.managed_summary", lambda core: core.managed_summary())))
-    resources.register_static(ResourceSpec("ida://managed/types", "managed_types", "托管/.NET 符号级类型目录。", "application/json", active_reader("resource.managed_types", lambda core: core.managed_types(limit=2000))))
-    resources.register_static(ResourceSpec("ida://managed/namespaces", "managed_namespaces", "托管/.NET 命名空间统计。", "application/json", active_reader("resource.managed_namespaces", lambda core: core.managed_summary()["top_namespaces"])))
+    resources.register_static(ResourceSpec("ida://survey", "survey", "当前样本的综合概览。", "application/json", active_reader("resource.survey", lambda core: core.survey_binary()), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://types", "types", "当前类型目录。", "application/json", active_reader("resource.types", lambda core: core.query_types()), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://structs", "structs", "当前结构体列表。", "application/json", active_reader("resource.structs", lambda core: core.search_structs()), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://functions", "functions", "当前函数列表。", "application/json", active_reader("resource.functions", lambda core: core.list_functions(limit=2000)), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://functions/profiles", "function_profiles", "当前函数画像摘要。", "application/json", active_reader("resource.function_profiles", lambda core: [core.get_function_profile(str(item.get("addr")), include_asm=False) for item in core.list_functions(limit=200)]), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://globals", "globals", "当前全局符号列表。", "application/json", active_reader("resource.globals", lambda core: core.list_globals(limit=2000)), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://imports", "imports", "当前导入表。", "application/json", active_reader("resource.imports", lambda core: core.list_imports(limit=2000)), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://imports/categories", "imports_categories", "当前导入的分类视图。", "application/json", active_reader("resource.imports_categories", lambda core: core.survey_binary()["imports_by_category"]), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://strings", "strings", "当前字符串列表。", "application/json", active_reader("resource.strings", lambda core: core.list_strings(limit=2000)), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://callgraph/summary", "callgraph_summary", "当前样本的调用图摘要。", "application/json", active_reader("resource.callgraph_summary", lambda core: core.survey_binary()["call_graph_summary"]), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://managed/summary", "managed_summary", "托管/.NET 能力与符号级摘要。", "application/json", active_reader("resource.managed_summary", lambda core: core.managed_summary()), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://managed/types", "managed_types", "托管/.NET 符号级类型目录。", "application/json", active_reader("resource.managed_types", lambda core: core.managed_types(limit=2000)), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://managed/namespaces", "managed_namespaces", "托管/.NET 命名空间统计。", "application/json", active_reader("resource.managed_namespaces", lambda core: core.managed_summary()["top_namespaces"]), requires_context=session_requires_context))
     resources.register_static(
         ResourceSpec(
             "ida://docs/tools",
@@ -2005,9 +2304,10 @@ def _register_resources(
             "session_current",
             "当前默认会话；未绑定时返回 null。",
             "application/json",
-            global_reader("resource.session_current", lambda: {"session": runtime.current_binary() if runtime.list_binaries() else None}),
-            scope="global",
+            context_reader("resource.session_current", current_session_resource),
+            scope=context_scope,
             requires_session=False,
+            requires_context=session_requires_context,
         )
     )
     resources.register_static(
@@ -2016,9 +2316,10 @@ def _register_resources(
             "sessions",
             "当前所有会话；即使为空也返回统一 envelope。",
             "application/json",
-            global_reader("resource.sessions", lambda: runtime.list_binaries()),
-            scope="global",
+            context_reader("resource.sessions", lambda context_id: runtime.list_binaries(context_id=context_id)),
+            scope=context_scope,
             requires_session=False,
+            requires_context=session_requires_context,
         )
     )
 
@@ -2028,6 +2329,7 @@ def _register_resources(
         description="读取指定结构体定义。",
         mime_type="application/json",
         handler=template_reader("resource.struct_name", lambda core, params: core.read_struct(params["name"])),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://function/{query}",
@@ -2035,6 +2337,7 @@ def _register_resources(
         description="读取指定函数详情。",
         mime_type="application/json",
         handler=template_reader("resource.function_query", lambda core, params: core.get_function(params["query"])),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://function-profile/{query}",
@@ -2042,6 +2345,7 @@ def _register_resources(
         description="读取指定函数画像。",
         mime_type="application/json",
         handler=template_reader("resource.function_profile_query", lambda core, params: core.get_function_profile(params["query"], include_asm=False)),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://decompile/{query}",
@@ -2049,6 +2353,7 @@ def _register_resources(
         description="读取指定函数的高层表示。",
         mime_type="application/json",
         handler=template_reader("resource.decompile_query", lambda core, params: core.decompile_function(params["query"])),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://basic-blocks/{addr}",
@@ -2056,6 +2361,7 @@ def _register_resources(
         description="读取指定函数的基本块信息。",
         mime_type="application/json",
         handler=template_reader("resource.basic_blocks_addr", lambda core, params: core.get_basic_blocks(params["addr"])),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://stack-frame/{addr}",
@@ -2063,6 +2369,7 @@ def _register_resources(
         description="读取指定函数栈帧。",
         mime_type="application/json",
         handler=template_reader("resource.stack_frame", lambda core, params: core.get_stack_frame(params["addr"])),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://type/{name}",
@@ -2070,6 +2377,7 @@ def _register_resources(
         description="读取指定类型详情。",
         mime_type="application/json",
         handler=template_reader("resource.type_name", lambda core, params: core.inspect_type(params["name"])),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://import/{name}",
@@ -2077,6 +2385,7 @@ def _register_resources(
         description="读取指定导入符号。",
         mime_type="application/json",
         handler=template_reader("resource.import_name", lambda core, params: core.query_imports(filter_text=params["name"], limit=200)),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://export/{name}",
@@ -2084,6 +2393,7 @@ def _register_resources(
         description="读取指定导出符号。",
         mime_type="application/json",
         handler=template_reader("resource.export_name", lambda core, params: [item for item in core.entrypoints() if str(item.get("name", "")).lower() == params["name"].lower()]),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://xrefs/from/{addr}",
@@ -2091,6 +2401,7 @@ def _register_resources(
         description="读取指定地址的向外 xref。",
         mime_type="application/json",
         handler=template_reader("resource.xrefs_from", lambda core, params: core.get_xrefs_from(params["addr"])),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://callgraph/{root}",
@@ -2098,6 +2409,7 @@ def _register_resources(
         description="读取指定根函数的调用图。",
         mime_type="application/json",
         handler=template_reader("resource.callgraph_root", lambda core, params: core.build_callgraph([params["root"]], max_depth=3)),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://data-flow/{addr}",
@@ -2105,6 +2417,7 @@ def _register_resources(
         description="读取指定地址的增强版数据流追踪。",
         mime_type="application/json",
         handler=template_reader("resource.data_flow_addr", lambda core, params: core.trace_data_flow(params["addr"], direction="both", max_depth=3)),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://managed/method/{query}",
@@ -2118,6 +2431,7 @@ def _register_resources(
                 "decompile": core.decompile_function(params["query"]),
             },
         ),
+        requires_context=session_requires_context,
     )
     resources.register_template(
         uri_template="ida://docs/tool/{name}",

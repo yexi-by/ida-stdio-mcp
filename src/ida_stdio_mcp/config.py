@@ -38,6 +38,7 @@ class FeatureGateConfig:
 
     allow_unsafe: bool
     allow_debugger: bool
+    isolated_contexts: bool
 
 
 @dataclass(slots=True, frozen=True)
@@ -144,6 +145,7 @@ def load_config(config_path: Path) -> AppConfig:
         feature_gates=FeatureGateConfig(
             allow_unsafe=_as_bool(gates_raw.get("allow_unsafe", False), default=False),
             allow_debugger=_as_bool(gates_raw.get("allow_debugger", False), default=False),
+            isolated_contexts=_as_bool(gates_raw.get("isolated_contexts", False), default=False),
         ),
         limits=LimitConfig(
             default_page_size=_as_int(limits_raw.get("default_page_size", 100), default=100),

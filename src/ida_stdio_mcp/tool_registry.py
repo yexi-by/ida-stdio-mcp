@@ -28,6 +28,7 @@ class ToolSpec:
     handler: ToolHandler
     validation_schema: JsonObject | None = None
     requires_session: bool = False
+    requires_context: bool = False
     feature_gate: GateName = "public"
     preconditions: tuple[str, ...] = ()
     empty_state_behavior: str = ""
@@ -45,6 +46,7 @@ class ResourceSpec:
     handler: ResourceHandler
     scope: str = "session"
     requires_session: bool = True
+    requires_context: bool = False
 
 
 @dataclass(slots=True, frozen=True)
@@ -60,6 +62,7 @@ class ResourceTemplateSpec:
     handler: ResourceHandler
     scope: str = "session"
     requires_session: bool = True
+    requires_context: bool = False
 
 
 class ToolRegistry:
@@ -91,6 +94,7 @@ class ToolRegistry:
                 "outputSchema": tool.output_schema,
                 "inputExample": tool.input_example if tool.input_example is not None else self._input_example(tool.validation_schema or tool.input_schema),
                 "requiresSession": tool.requires_session,
+                "requiresContext": tool.requires_context,
                 "featureGate": tool.feature_gate,
                 "preconditions": list(tool.preconditions),
                 "emptyStateBehavior": tool.empty_state_behavior,
@@ -203,6 +207,7 @@ class ToolRegistry:
         examples = {
             "path": "D:/samples/sample.exe",
             "session_id": "sess-001",
+            "context_id": "agent-001",
             "addr": "main",
             "query": "main",
             "root": "main",
@@ -243,6 +248,7 @@ class ResourceRegistry:
         handler: ResourceHandler,
         scope: str = "session",
         requires_session: bool = True,
+        requires_context: bool = False,
     ) -> None:
         parameter_names = tuple(re.findall(r"\{([^{}]+)\}", uri_template))
         pattern_text = re.escape(uri_template)
@@ -260,6 +266,7 @@ class ResourceRegistry:
                 handler=handler,
                 scope=scope,
                 requires_session=requires_session,
+                requires_context=requires_context,
             )
         )
 
@@ -272,6 +279,7 @@ class ResourceRegistry:
                 "mimeType": spec.mime_type,
                 "scope": spec.scope,
                 "requiresSession": spec.requires_session,
+                "requiresContext": spec.requires_context,
             }
             for spec in self._static_resources.values()
         ]
@@ -285,21 +293,31 @@ class ResourceRegistry:
                 "mimeType": spec.mime_type,
                 "scope": spec.scope,
                 "requiresSession": spec.requires_session,
+                "requiresContext": spec.requires_context,
             }
             for spec in self._templates
         ]
 
-    def read(self, uri: str) -> tuple[list[ResourceContent], bool]:
+    def read(self, uri: str, request_params: JsonObject | None = None) -> tuple[list[ResourceContent], bool]:
+        merged_params: dict[str, str] = {}
+        if request_params is not None:
+            for key, value in request_params.items():
+                if key == "uri":
+                    continue
+                if isinstance(value, str):
+                    merged_params[key] = value
         static = self._static_resources.get(uri)
         if static is not None:
-            payload = static.handler({})
+            payload = static.handler(merged_params)
             return [self._content(uri, static.mime_type, payload)], self._payload_is_error(payload)
 
         for template in self._templates:
             match = template.pattern.match(uri)
             if match is None:
                 continue
-            payload = template.handler(match.groupdict())
+            template_params = dict(merged_params)
+            template_params.update(match.groupdict())
+            payload = template.handler(template_params)
             return [self._content(uri, template.mime_type, payload)], self._payload_is_error(payload)
 
         raise KeyError(f"未知资源：{uri}")

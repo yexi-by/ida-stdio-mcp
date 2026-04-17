@@ -198,7 +198,7 @@ class StdioMcpServer:
             if not isinstance(uri, str):
                 return self._error_response(request_id, -32602, "resources/read 需要字符串 uri")
             try:
-                contents, is_error = self._resources.read(uri)
+                contents, is_error = self._resources.read(uri, cast(JsonObject, params))
             except Exception as exc:
                 logger.exception("资源读取失败：{}", uri)
                 payload = build_result(

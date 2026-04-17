@@ -13,6 +13,11 @@ from pathlib import Path
 from typing import Callable, Iterable, Protocol, TypeAlias, cast
 
 from .ida_bootstrap import ensure_ida_environment
+from .managed_decompiler import (
+    decompile_managed_method,
+    managed_decompiler_available,
+    managed_decompiler_command,
+)
 
 ensure_ida_environment()
 
@@ -85,6 +90,8 @@ SET_CMT = cast(Callable[[int, str, bool], bool], ida_bytes.set_cmt)
 PATCH_BYTES = cast(Callable[[int, bytes], None], ida_bytes.patch_bytes)
 FIND_BYTES = cast(Callable[..., int], ida_bytes.find_bytes)
 SET_NAME = cast(Callable[[int, str, int], bool], ida_name.set_name)
+SET_FUNC_CMT = cast(Callable[[ida_funcs.func_t, str, bool], bool], ida_funcs.set_func_cmt)
+GET_FUNC_CMT = cast(Callable[[ida_funcs.func_t, bool], str], ida_funcs.get_func_cmt)
 GET_FLOW_CHART = cast(Callable[[ida_funcs.func_t], object], idaapi.FlowChart)
 CREATE_INSN = cast(Callable[[int, ida_ua.insn_t], int], ida_ua.create_insn)
 DECODE_INSN = cast(Callable[[ida_ua.insn_t, int], int], ida_ua.decode_insn)
@@ -98,6 +105,7 @@ GET_FUNC_FRAME = cast(Callable[[ida_typeinf.tinfo_t, ida_funcs.func_t], bool], i
 IS_SPECIAL_FRAME_MEMBER = cast(Callable[[int], bool], ida_frame.is_special_frame_member)
 IS_FUNCARG_OFF = cast(Callable[[ida_funcs.func_t, int], bool], ida_frame.is_funcarg_off)
 DELETE_FRAME_MEMBERS = cast(Callable[[ida_funcs.func_t, int, int], bool], ida_frame.delete_frame_members)
+PLAN_AND_WAIT = cast(Callable[[int, int, bool], int], ida_auto.plan_and_wait)
 ASSEMBLE = cast(Callable[[int, str], tuple[bool, bytes] | object], idautils.Assemble)
 GENERATE_DISASM_LINE = cast(Callable[[int, int], str], ida_lines.generate_disasm_line)
 START_PROCESS = cast(Callable[[str, str, str], bool], ida_dbg.start_process)
@@ -162,6 +170,8 @@ class IdaCore:
         representations: list[JsonValue] = ["asm_fallback"]
         if analysis_domain == "managed":
             representations.insert(0, "il")
+            if self.managed_csharp_available():
+                representations.insert(0, "csharp")
         if self.hexrays_available():
             representations.insert(0, "hexrays")
         catalogs: list[JsonValue] = ["local_types"]
@@ -169,6 +179,12 @@ class IdaCore:
             catalogs.append("managed_types")
         debugger_health = self.debugger_health()
         debugger_available = bool(debugger_health.get("backend_available"))
+        if analysis_domain == "managed":
+            decompiler_state = "external_csharp" if self.managed_csharp_available() else "il_fallback"
+            decompile_mode = "csharp_external" if self.managed_csharp_available() else "il_fallback"
+        else:
+            decompiler_state = "hexrays" if self.hexrays_available() else "asm_fallback"
+            decompile_mode = "hexrays" if self.hexrays_available() else "asm_fallback"
         return self._json_object({
             "binary_kind": self.get_binary_kind(),
             "analysis_domain": analysis_domain,
@@ -176,8 +192,8 @@ class IdaCore:
             "representations": representations,
             "catalogs": catalogs,
             "callgraph_quality": "coderefs",
-            "decompiler_state": "hexrays" if self.hexrays_available() else "asm_fallback",
-            "decompile_mode": "hexrays" if self.hexrays_available() else ("il_fallback" if analysis_domain == "managed" else "asm_fallback"),
+            "decompiler_state": decompiler_state,
+            "decompile_mode": decompile_mode,
             "string_index_quality": self._string_index_quality(),
             "type_writeback_support": self._type_writeback_support(),
             "debugger_support": "available" if debugger_available else "unavailable",
@@ -196,9 +212,14 @@ class IdaCore:
             "capabilities": [
                 {"capability": "list_functions", "native": "full", "managed": "full", "notes": "native 与托管都支持符号级函数枚举"},
                 {"capability": "build_callgraph", "native": "full", "managed": "degraded", "notes": "托管场景目前基于符号与 IL/反汇编文本构图"},
-                {"capability": "decompile_function", "native": "full" if self.hexrays_available() else "degraded", "managed": "degraded", "notes": "managed 目前为 symbolic IL fallback"},
+                {
+                    "capability": "decompile_function",
+                    "native": "full" if self.hexrays_available() else "degraded",
+                    "managed": "full" if self.managed_csharp_available() else "degraded",
+                    "notes": "托管目标优先走外部 C# 反编译，失败时才回退到 IL/反汇编文本",
+                },
                 {"capability": "list_strings", "native": "full", "managed": self._string_index_quality(), "notes": "managed 字符串索引来自 IL/反汇编文本抽取"},
-                {"capability": "set_types", "native": "full", "managed": self._type_writeback_support(), "notes": "托管类型写回目前以 native-only 为主"},
+                {"capability": "set_types", "native": "full", "managed": self._type_writeback_support(), "notes": "类型写回作用于 IDA 数据库，native/managed 都可持久化到 IDB"},
                 {"capability": "patch_bytes", "native": "full", "managed": "full", "notes": "只要地址可写，补丁能力本身不依赖 GUI"},
                 {"capability": "debugger", "native": "available" if debugger_available else "unavailable", "managed": "available" if debugger_available else "unavailable", "notes": "是否真正可用取决于当前调试器后端"},
             ],
@@ -461,9 +482,37 @@ class IdaCore:
         analysis_domain = self.get_analysis_domain()
         managed_identity = self.managed_method_identity(func.start_ea)
         warnings: list[str] = []
+        if analysis_domain == "managed":
+            managed_result = self._managed_csharp_decompile(func.start_ea)
+            if managed_result is not None:
+                managed_warnings = managed_result.get("warnings")
+                if isinstance(managed_warnings, list):
+                    warnings.extend(str(item) for item in managed_warnings)
+                return self._json_object({
+                    "status": "ok",
+                    "addr": hex(func.start_ea),
+                    "name": func_name,
+                    "signature": signature,
+                    "analysis_domain": analysis_domain,
+                    "representation": "csharp",
+                    "backend": managed_result["backend"],
+                    "confidence": "high" if managed_result["exact"] else "medium",
+                    "reconstruction_level": "high_level_csharp" if managed_result["exact"] else "type_level_csharp",
+                    "type_recovery": "high",
+                    "variable_recovery": "partial",
+                    "language": "csharp",
+                    "text": managed_result["text"],
+                    "source": managed_result["source"],
+                    "warnings": warnings,
+                    "error": None,
+                    "managed_identity": managed_identity,
+                })
         if self.hexrays_available():
             try:
                 cfunc = ida_hexrays.decompile(func.start_ea)
+                cfunc_text = str(cfunc).strip()
+                if not cfunc_text or cfunc_text == "None":
+                    raise RuntimeError("Hex-Rays 返回了空文本")
                 return self._json_object({
                     "status": "ok",
                     "addr": hex(func.start_ea),
@@ -477,7 +526,7 @@ class IdaCore:
                     "type_recovery": "full",
                     "variable_recovery": "full",
                     "language": "c",
-                    "text": str(cfunc),
+                    "text": cfunc_text,
                     "source": "ida_hexrays",
                     "warnings": warnings,
                     "error": None,
@@ -698,26 +747,16 @@ class IdaCore:
         """分页列出字符串。"""
         results: list[JsonObject] = []
         seen: set[tuple[str, str]] = set()
-        strings = CREATE_STRINGS()
-        cast(Callable[[], None], getattr(strings, "setup"))()
-        for item in cast(list[_StringItem], self._iter_objects(strings)):
-            text = str(item)
-            if not text:
+        for row in self._native_string_rows(limit=10_000):
+            addr_value = row.get("addr")
+            text_value = row.get("string")
+            if not isinstance(addr_value, str) or not isinstance(text_value, str):
                 continue
-            addr_text = hex(int(item.ea))
-            key = (addr_text, text)
+            key = (addr_value, text_value)
             if key in seen:
                 continue
             seen.add(key)
-            results.append(
-                {
-                    "addr": addr_text,
-                    "string": text,
-                    "length": len(text),
-                    "xref_count": len(list(idautils.XrefsTo(int(item.ea)))),
-                    "source": "ida_strings",
-                }
-            )
+            results.append(row)
         for row in self._managed_string_rows(limit=10_000):
             addr_value = row.get("addr")
             text_value = row.get("string")
@@ -826,19 +865,31 @@ class IdaCore:
         return results
 
     def read_strings(self, addrs: list[str], *, max_length: int = 512) -> list[JsonObject]:
-        """读取字符串。"""
+        """读取字符串值。"""
         results: list[JsonObject] = []
+        string_index = self._string_row_index(limit=10_000)
         for addr in addrs:
             ea = self.parse_address(addr)
-            raw = idc.get_strlit_contents(ea, max_length, idc.STRTYPE_C)
-            text = raw.decode("utf-8", errors="replace") if isinstance(raw, bytes) else ""
-            source = "ida_strlit" if text else "unresolved"
-            if not text:
+            exact = string_index.get(ea)
+            if exact is not None:
+                results.append(exact)
+                continue
+
+            text = ""
+            source = "unresolved"
+            str_type = idc.get_str_type(ea)
+            if isinstance(str_type, int) and str_type >= 0:
+                raw = idc.get_strlit_contents(ea, max_length, str_type)
+                if isinstance(raw, bytes):
+                    text = self._decode_string_bytes(raw, str_type)
+                    if text:
+                        source = "ida_strlit_fallback"
+            if not text and self.get_analysis_domain() == "managed":
                 line_strings = self._line_string_literals(self.line_text(ea))
                 text = line_strings[0] if line_strings else ""
                 if text:
                     source = "managed_il_text"
-            results.append({"addr": hex(ea), "string": text, "source": source})
+            results.append(self._json_object({"addr": hex(ea), "string": text, "source": source}))
         return results
 
     def read_global_values(self, addrs: list[str], *, size: int = 8) -> list[JsonObject]:
@@ -1223,6 +1274,14 @@ class IdaCore:
                 final_comment = f"{existing}\n{comment_text}".strip() if existing else comment_text
             if not SET_CMT(ea, final_comment, repeatable):
                 raise RuntimeError(f"设置注释失败：{addr_text}")
+            func = GET_FUNC(ea)
+            if func is not None and func.start_ea == ea:
+                existing_func_comment = GET_FUNC_CMT(func, repeatable) or ""
+                func_comment = final_comment
+                if append and existing_func_comment:
+                    func_comment = f"{existing_func_comment}\n{comment_text}".strip()
+                if not SET_FUNC_CMT(func, func_comment, repeatable):
+                    raise RuntimeError(f"设置函数注释失败：{addr_text}")
             results.append({"addr": hex(ea)})
         return results
 
@@ -1254,6 +1313,7 @@ class IdaCore:
             written = GET_BYTES(ea, len(blob), 0) or b""
             if written != blob:
                 raise RuntimeError(f"写入字节失败：{addr_text}")
+            self._refresh_analysis_range(ea, len(blob))
             results.append({"addr": hex(ea), "size": len(blob)})
         return results
 
@@ -1279,6 +1339,7 @@ class IdaCore:
             written = GET_BYTES(ea, len(blob), 0) or b""
             if written != blob:
                 raise RuntimeError(f"写入整数失败：{addr_text}")
+            self._refresh_analysis_range(ea, len(blob))
             results.append({"addr": hex(ea), "size": size, "value": value})
         return results
 
@@ -1485,36 +1546,30 @@ class IdaCore:
         return results
 
     def delete_stack_variables(self, items: list[JsonObject]) -> list[JsonObject]:
-        """删除函数栈变量。"""
+        """删除已声明的栈变量。"""
         results: list[JsonObject] = []
         for item in items:
             addr_text = item.get("addr")
             name_text = item.get("name")
-            if not isinstance(addr_text, str) or not isinstance(name_text, str):
-                raise ValueError("delete_stack_variables 的 addr/name 必须为字符串")
+            offset_value = item.get("offset")
+            if not isinstance(addr_text, str):
+                raise ValueError("delete_stack_variables 的 addr 必须为字符串")
+            if name_text is not None and not isinstance(name_text, str):
+                raise ValueError("delete_stack_variables 的 name 必须为字符串")
+            if offset_value is not None and not isinstance(offset_value, (int, str)):
+                raise ValueError("delete_stack_variables 的 offset 必须为整数或字符串")
             func = self.require_function(self.parse_address(addr_text))
-            frame_tif = NEW_TINFO()
-            if not GET_FUNC_FRAME(frame_tif, func):
+            frame_id = int(idc.get_frame_id(func.start_ea))
+            if frame_id in (-1, BADADDR):
                 raise RuntimeError(f"无法获取函数栈帧：{addr_text}")
-            get_udm = cast(Callable[[str], tuple[int, object | None]], frame_tif.get_udm)
-            index, udm = get_udm(name_text)
-            if udm is None:
-                raise RuntimeError(f"找不到栈变量：{name_text}")
-            get_udm_tid = cast(Callable[[int], int], frame_tif.get_udm_tid)
-            tid = int(get_udm_tid(index))
-            if IS_SPECIAL_FRAME_MEMBER(tid):
-                raise RuntimeError(f"禁止删除特殊栈帧成员：{name_text}")
-            udm_info = NEW_UDM()
-            get_udm_by_tid = cast(Callable[[ida_typeinf.udm_t, int], bool], frame_tif.get_udm_by_tid)
-            if not get_udm_by_tid(udm_info, tid):
-                raise RuntimeError(f"无法读取栈变量信息：{name_text}")
-            start_offset = udm_info.offset // 8
-            end_offset = start_offset + (udm_info.size // 8)
-            if IS_FUNCARG_OFF(func, start_offset):
-                raise RuntimeError(f"禁止删除参数成员：{name_text}")
-            if not DELETE_FRAME_MEMBERS(func, start_offset, end_offset):
-                raise RuntimeError(f"删除栈变量失败：{name_text}")
-            results.append({"addr": hex(func.start_ea), "name": name_text})
+
+            member_offset = self._resolve_stack_member_offset(frame_id, name_text, offset_value)
+            if member_offset is None:
+                target = name_text if isinstance(name_text, str) and name_text else offset_value
+                raise RuntimeError(f"找不到栈变量：{target}")
+            if not idc.del_struc_member(frame_id, member_offset):
+                raise RuntimeError(f"删除栈变量失败：{name_text or member_offset}")
+            results.append({"addr": hex(func.start_ea), "name": name_text or "", "offset": member_offset})
         return results
 
     def patch_assembly(self, items: list[JsonObject]) -> list[JsonObject]:
@@ -1543,6 +1598,7 @@ class IdaCore:
                 written = GET_BYTES(current_ea, len(patch_blob), 0) or b""
                 if written != patch_blob:
                     raise RuntimeError(f"补丁写入失败：{hex(current_ea)}")
+                self._refresh_analysis_range(current_ea, len(patch_blob))
                 current_ea += len(blob)
             results.append({"addr": hex(ea), "size": current_ea - ea, "asm": asm_text})
         return results
@@ -1787,6 +1843,30 @@ class IdaCore:
             return self._json_object({"status": "unsupported", "data": {"reason": "写入调试内存失败", "written": written, "expected": len(blob)}, "warnings": ["write_dbg_memory 未完整写入"]})
         return self._json_object({"status": "ok", "data": {"addr": addr, "size": len(blob)}, "warnings": []})
 
+    def _refresh_analysis_range(self, start_ea: int, size: int) -> None:
+        """在写回后主动触发局部重分析。"""
+        end_ea = start_ea + max(1, size)
+        PLAN_AND_WAIT(start_ea, end_ea, True)
+        func = GET_FUNC(start_ea)
+        if func is not None:
+            PLAN_AND_WAIT(func.start_ea, func.end_ea, True)
+
+    def _resolve_stack_member_offset(self, frame_id: int, name_text: str | None, offset_value: int | str | None) -> int | None:
+        """解析栈变量在 frame struct 里的精确偏移。"""
+        if offset_value is not None:
+            target_offset = self._parse_signed_int(offset_value)
+            for member_offset, _, _ in idautils.StructMembers(frame_id):
+                if int(member_offset) == target_offset:
+                    return int(member_offset)
+            return None
+
+        if not name_text:
+            return None
+        for member_offset, member_name, _ in idautils.StructMembers(frame_id):
+            if str(member_name) == name_text:
+                return int(member_offset)
+        return None
+
     def parse_address(self, value: str) -> int:
         """解析地址或名称。"""
         text = value.strip()
@@ -1839,6 +1919,49 @@ class IdaCore:
                         pass
                 results.append(literal)
         return results
+
+    def _decode_string_bytes(self, raw: bytes, str_type: int) -> str:
+        """根据字符串类型解码原始字节。"""
+        if str_type == idc.STRTYPE_C_16:
+            return raw.decode("utf-16-le", errors="replace").rstrip("\x00")
+        return raw.decode("utf-8", errors="replace").rstrip("\x00")
+
+    def _native_string_rows(self, *, limit: int = 2000) -> list[JsonObject]:
+        """提取原生字符串索引。"""
+        results: list[JsonObject] = []
+        strings = CREATE_STRINGS()
+        cast(Callable[[], None], getattr(strings, "setup"))()
+        for item in cast(list[_StringItem], self._iter_objects(strings)):
+            text = str(item)
+            if not text:
+                continue
+            results.append(
+                self._json_object(
+                    {
+                        "addr": hex(int(item.ea)),
+                        "string": text,
+                        "length": len(text),
+                        "xref_count": len(list(idautils.XrefsTo(int(item.ea)))),
+                        "source": "ida_strings",
+                    }
+                )
+            )
+            if len(results) >= limit:
+                break
+        return results
+
+    def _string_row_index(self, *, limit: int = 10_000) -> dict[int, JsonObject]:
+        """构建“地址 -> 字符串行”的精确索引。"""
+        rows: dict[int, JsonObject] = {}
+        for row in self._native_string_rows(limit=limit):
+            addr_value = row.get("addr")
+            if isinstance(addr_value, str):
+                rows.setdefault(self.parse_address(addr_value), row)
+        for row in self._managed_string_rows(limit=limit):
+            addr_value = row.get("addr")
+            if isinstance(addr_value, str):
+                rows.setdefault(self.parse_address(addr_value), row)
+        return rows
 
     def _managed_string_rows(self, *, limit: int = 2000) -> list[JsonObject]:
         """基于反汇编/IL 文本提取托管字符串行。
@@ -1910,23 +2033,77 @@ class IdaCore:
         return constants
 
     def function_comments(self, start_ea: int) -> JsonObject:
-        """提取函数内注释。"""
+        """读取函数内注释。"""
         func = self.require_function(start_ea)
         comments: JsonObject = {}
+        function_regular = GET_FUNC_CMT(func, False)
+        function_repeatable = GET_FUNC_CMT(func, True)
+        if function_regular or function_repeatable:
+            comments[hex(func.start_ea)] = self._json_object(
+                {
+                    "regular": function_regular or "",
+                    "repeatable": function_repeatable or "",
+                    "scope": "function",
+                }
+            )
         for item_ea in idautils.FuncItems(func.start_ea):
             regular = GET_CMT(item_ea, False)
             repeatable = GET_CMT(item_ea, True)
             if regular or repeatable:
-                comments[hex(item_ea)] = self._json_object({"regular": regular or "", "repeatable": repeatable or ""})
+                existing = comments.get(hex(item_ea))
+                payload: JsonObject = {
+                    "regular": regular or "",
+                    "repeatable": repeatable or "",
+                    "scope": "item",
+                }
+                if isinstance(existing, dict):
+                    existing_regular = existing.get("regular")
+                    existing_repeatable = existing.get("repeatable")
+                    if isinstance(existing_regular, str) and not payload["regular"]:
+                        payload["regular"] = existing_regular
+                    if isinstance(existing_repeatable, str) and not payload["repeatable"]:
+                        payload["repeatable"] = existing_repeatable
+                    payload["scope"] = "function+item"
+                comments[hex(item_ea)] = self._json_object(payload)
         return comments
 
-    def managed_summary(self) -> JsonObject:
-        """返回托管/.NET 能力与符号级摘要。
+    def managed_csharp_available(self) -> bool:
+        """判断当前托管样本是否具备 C# 反编译能力。"""
+        return self.get_analysis_domain() == "managed" and managed_decompiler_available()
 
-        headless 下对 managed 的支持目前仍以“符号+IL 文本”路线为主，
-        所以这里明确把能力边界暴露出来，避免客户端把它误当成完整
-        的 .NET 元数据浏览器。
-        """
+    def _managed_csharp_decompile(self, start_ea: int) -> JsonObject | None:
+        """尝试把托管方法反编译成 C#。"""
+        identity = self.managed_method_identity(start_ea)
+        if identity is None:
+            return None
+        full_type_value = identity.get("full_type")
+        method_value = identity.get("method")
+        if not isinstance(full_type_value, str) or not isinstance(method_value, str):
+            return None
+
+        assembly_path = Path(ida_nalt.get_input_file_path() or "")
+        if not assembly_path.exists():
+            return None
+
+        result = decompile_managed_method(assembly_path, full_type_value, method_value)
+        if result is None:
+            return None
+
+        warnings: list[str] = []
+        if not result.extracted_exact:
+            warnings.append("未能精确截取单方法，已返回所属类型的 C# 源码。")
+        return self._json_object(
+            {
+                "text": result.method_source,
+                "backend": result.command,
+                "source": "ilspycmd",
+                "exact": result.extracted_exact,
+                "warnings": warnings,
+            }
+        )
+
+    def managed_summary(self) -> JsonObject:
+        """返回托管/.NET 目标的能力与类型摘要。"""
         analysis_domain = self.get_analysis_domain()
         managed_rows = self.managed_types()
         namespace_histogram: dict[str, int] = defaultdict(int)
@@ -1948,10 +2125,14 @@ class IdaCore:
             self._json_object({"namespace": namespace, "count": count})
             for namespace, count in sorted(namespace_histogram.items(), key=lambda item: item[1], reverse=True)[:20]
         ]
+        support_level = "not_managed"
+        if analysis_domain == "managed":
+            support_level = "csharp_external" if self.managed_csharp_available() else "symbolic_il"
         return self._json_object({
             "analysis_domain": analysis_domain,
             "available": analysis_domain == "managed",
-            "support_level": "symbolic_il" if analysis_domain == "managed" else "not_managed",
+            "support_level": support_level,
+            "external_decompiler": managed_decompiler_command() or "",
             "type_count": len(managed_rows),
             "namespace_count": len(namespace_histogram),
             "top_namespaces": top_namespaces,
@@ -2128,14 +2309,11 @@ class IdaCore:
         except Exception:
             total_strings = 0
         if analysis_domain == "managed":
-            return "partial" if total_strings > 0 else "none"
+            return "full" if total_strings > 0 else "none"
         return "full" if total_strings > 0 else "partial"
 
     def _type_writeback_support(self) -> str:
         """评估类型写回能力。"""
-        analysis_domain = self.get_analysis_domain()
-        if analysis_domain == "managed":
-            return "native_only"
         return "full"
 
     def _export_function_targets(self, *, items: list[str] | None, limit: int) -> list[str]:
@@ -2471,10 +2649,10 @@ class IdaCore:
         return self._json_object({
             "available": True,
             "type_catalog": "symbolic_managed_types",
-            "decompiler": "il_symbolic_fallback",
+            "decompiler": "external_csharp" if self.managed_csharp_available() else "il_symbolic_fallback",
             "notes": [
-                "当前托管支持基于 IDA 已识别符号与 IL/反汇编文本。",
-                "尚未实现完整 CLR 元数据解析与真正的托管高层反编译。",
+                "托管类型目录仍以 IDA 已识别符号和方法签名为主。",
+                "若系统存在 ilspycmd，则 decompile_function 会直接返回高层 C# 结果。",
             ],
         })
 

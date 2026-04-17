@@ -20,6 +20,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--config", type=Path, default=Path("setting.toml"), help="配置文件路径")
     parser.add_argument("--unsafe", action="store_true", help="启用危险写操作与 Python 执行工具")
     parser.add_argument("--debugger", action="store_true", help="启用调试器工具")
+    parser.add_argument("--isolated-contexts", action="store_true", help="按 context_id 隔离不同 agent/工作流的默认上下文")
     parser.add_argument("--profile", type=Path, help="工具白名单 profile 文件")
     return parser.parse_args(argv)
 
@@ -30,7 +31,10 @@ def main(argv: list[str] | None = None) -> int:
     config = load_config(args.config.resolve())
     log_path = configure_logging(config.logging)
 
-    runtime = HeadlessRuntime()
+    allow_unsafe = config.feature_gates.allow_unsafe or args.unsafe
+    allow_debugger = config.feature_gates.allow_debugger or args.debugger
+    isolated_contexts = config.feature_gates.isolated_contexts or args.isolated_contexts
+    runtime = HeadlessRuntime(isolated_contexts=isolated_contexts)
     ida_dir = runtime.require_ida_dir()
 
     # idapro 必须先于其它 ida_* 模块导入。
@@ -40,17 +44,16 @@ def main(argv: list[str] | None = None) -> int:
 
     from .service import build_service
 
-    allow_unsafe = config.feature_gates.allow_unsafe or args.unsafe
-    allow_debugger = config.feature_gates.allow_debugger or args.debugger
     profile_path = args.profile.resolve() if args.profile is not None else None
 
     logger.info(
-        "启动参数：config={} log_path={} idadir={} unsafe={} debugger={} profile={}",
+        "启动参数：config={} log_path={} idadir={} unsafe={} debugger={} isolated_contexts={} profile={}",
         args.config,
         log_path,
         ida_dir,
         allow_unsafe,
         allow_debugger,
+        isolated_contexts,
         profile_path,
     )
 
@@ -66,7 +69,10 @@ def main(argv: list[str] | None = None) -> int:
     if startup_binary is None and config.server.default_input_path.strip():
         startup_binary = Path(config.server.default_input_path.strip())
     if startup_binary is not None:
-        runtime.open_binary(startup_binary.resolve())
+        runtime.open_binary(
+            startup_binary.resolve(),
+            context_id="startup" if isolated_contexts else None,
+        )
         logger.info("已在启动阶段打开样本：{}", startup_binary)
 
     server = StdioMcpServer(
