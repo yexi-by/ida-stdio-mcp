@@ -42,6 +42,14 @@ class FeatureGateConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class RuntimeWorkspaceConfig:
+    """运行时副作用目录配置。"""
+
+    directory: Path
+    symbol_cache_directory: Path
+
+
+@dataclass(slots=True, frozen=True)
 class LimitConfig:
     """工具默认限制。"""
 
@@ -74,6 +82,7 @@ class AppConfig:
     logging: LoggingConfig
     server: ServerConfig
     feature_gates: FeatureGateConfig
+    runtime_workspace: RuntimeWorkspaceConfig
     limits: LimitConfig
     directory_analysis: DirectoryAnalysisConfig
     root: Path
@@ -110,6 +119,15 @@ def _require_table(raw: TomlTable, key: str) -> TomlTable:
     return cast(TomlTable, value)
 
 
+def _resolve_path(root: Path, value: TomlValue, *, default: str) -> Path:
+    """把配置中的路径解析为绝对路径。"""
+    raw_text = _as_str(value, default=default).strip()
+    path = Path(raw_text) if raw_text else Path(default)
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
 def _to_str_tuple(value: TomlValue) -> tuple[str, ...]:
     """把 TOML 数组转换成字符串元组。"""
     if not isinstance(value, list):
@@ -128,13 +146,14 @@ def load_config(config_path: Path) -> AppConfig:
     logging_raw = _require_table(raw, "logging")
     server_raw = _require_table(raw, "server")
     gates_raw = _require_table(raw, "feature_gates")
+    runtime_workspace_raw = _require_table(raw, "runtime_workspace")
     limits_raw = _require_table(raw, "limits")
     directory_raw = _require_table(raw, "directory_analysis")
 
     return AppConfig(
         logging=LoggingConfig(
             level=_as_str(logging_raw.get("level", "INFO"), default="INFO"),
-            directory=(root / _as_str(logging_raw.get("directory", "logs"), default="logs")).resolve(),
+            directory=_resolve_path(root, logging_raw.get("directory", "logs"), default="logs"),
         ),
         server=ServerConfig(
             protocol_version=_as_str(server_raw.get("protocol_version", "2025-06-18"), default="2025-06-18"),
@@ -146,6 +165,14 @@ def load_config(config_path: Path) -> AppConfig:
             allow_unsafe=_as_bool(gates_raw.get("allow_unsafe", False), default=False),
             allow_debugger=_as_bool(gates_raw.get("allow_debugger", False), default=False),
             isolated_contexts=_as_bool(gates_raw.get("isolated_contexts", False), default=False),
+        ),
+        runtime_workspace=RuntimeWorkspaceConfig(
+            directory=_resolve_path(root, runtime_workspace_raw.get("directory", ".runtime"), default=".runtime"),
+            symbol_cache_directory=_resolve_path(
+                root,
+                runtime_workspace_raw.get("symbol_cache_directory", ".runtime/symbol-cache"),
+                default=".runtime/symbol-cache",
+            ),
         ),
         limits=LimitConfig(
             default_page_size=_as_int(limits_raw.get("default_page_size", 100), default=100),

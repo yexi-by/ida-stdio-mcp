@@ -13,6 +13,10 @@ allow_unsafe = false
 allow_debugger = false
 isolated_contexts = false
 
+[runtime_workspace]
+directory = ".runtime"
+symbol_cache_directory = ".runtime/symbol-cache"
+
 [limits]
 default_page_size = 100
 max_page_size = 1000

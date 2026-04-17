@@ -11,6 +11,7 @@ from threading import RLock
 from .errors import SessionNotFoundError, SessionRequiredError
 from .ida_bootstrap import ensure_ida_environment
 from .models import BinarySummary
+from .runtime_workspace import symbol_cache_scope
 
 ensure_ida_environment()
 
@@ -247,8 +248,9 @@ class SessionManager:
         if self._active_session_id is not None:
             idapro.close_database()
             self._active_session_id = None
-        if idapro.open_database(str(input_path), run_auto_analysis=run_auto_analysis):
-            raise RuntimeError(f"打开数据库失败：{input_path}")
+        with symbol_cache_scope():
+            if idapro.open_database(str(input_path), run_auto_analysis=run_auto_analysis):
+                raise RuntimeError(f"打开数据库失败：{input_path}")
 
     def _require_session_locked(self, session_id: str) -> IdaSession:
         session = self._sessions.get(session_id)

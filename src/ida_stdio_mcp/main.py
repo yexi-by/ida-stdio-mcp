@@ -10,6 +10,7 @@ from loguru import logger
 from .config import load_config
 from .logging import configure_logging
 from .runtime import HeadlessRuntime
+from .runtime_workspace import configure_runtime_workspace
 from .stdio_server import ServerIdentity, StdioMcpServer
 
 
@@ -30,6 +31,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     config = load_config(args.config.resolve())
     log_path = configure_logging(config.logging)
+    workspace_paths = configure_runtime_workspace(config.runtime_workspace)
 
     allow_unsafe = config.feature_gates.allow_unsafe or args.unsafe
     allow_debugger = config.feature_gates.allow_debugger or args.debugger
@@ -55,6 +57,11 @@ def main(argv: list[str] | None = None) -> int:
         allow_debugger,
         isolated_contexts,
         profile_path,
+    )
+    logger.info(
+        "运行时目录：workspace={} symbol_cache={}",
+        workspace_paths.directory,
+        workspace_paths.symbol_cache_directory,
     )
 
     service = build_service(
