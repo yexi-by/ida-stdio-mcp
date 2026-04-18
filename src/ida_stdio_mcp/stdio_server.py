@@ -5,10 +5,19 @@ from __future__ import annotations
 import json
 import sys
 from dataclasses import dataclass
+from time import perf_counter
 from typing import BinaryIO, Literal, cast
 
 from loguru import logger
 
+from .logging import (
+    log_resource_read_exception,
+    log_resource_read_finished,
+    log_resource_read_started,
+    log_tool_call_exception,
+    log_tool_call_finished,
+    log_tool_call_started,
+)
 from .models import JsonObject, JsonValue
 from .result import build_error_info, build_result, normalize_json_object
 from .tool_registry import ResourceRegistry, ToolRegistry
@@ -147,10 +156,14 @@ class StdioMcpServer:
             arguments = params.get("arguments", {})
             if not isinstance(tool_name, str) or not isinstance(arguments, dict):
                 return self._error_response(request_id, -32602, "tools/call 参数格式错误")
+            typed_arguments = cast(JsonObject, arguments)
+            log_tool_call_started(tool_name, request_id, typed_arguments)
+            started_at = perf_counter()
             try:
-                result = self._tools.call(tool_name, cast(JsonObject, arguments))
+                result = self._tools.call(tool_name, typed_arguments)
             except Exception as exc:
-                logger.exception("工具调用失败：{}", tool_name)
+                duration_ms = (perf_counter() - started_at) * 1000.0
+                log_tool_call_exception(tool_name, request_id, typed_arguments, exc, duration_ms=duration_ms)
                 return self._ok_response(
                     request_id,
                     cast(
@@ -176,6 +189,8 @@ class StdioMcpServer:
                         },
                     ),
                 )
+            duration_ms = (perf_counter() - started_at) * 1000.0
+            log_tool_call_finished(tool_name, request_id, typed_arguments, result, duration_ms=duration_ms)
             return self._ok_response(request_id, self._tools.format_tool_result(result))
 
         if method == "resources/list":
@@ -197,10 +212,14 @@ class StdioMcpServer:
             uri = params.get("uri")
             if not isinstance(uri, str):
                 return self._error_response(request_id, -32602, "resources/read 需要字符串 uri")
+            typed_params = cast(JsonObject, params)
+            log_resource_read_started(uri, request_id, typed_params)
+            started_at = perf_counter()
             try:
-                contents, is_error = self._resources.read(uri, cast(JsonObject, params))
+                contents, is_error = self._resources.read(uri, typed_params)
             except Exception as exc:
-                logger.exception("资源读取失败：{}", uri)
+                duration_ms = (perf_counter() - started_at) * 1000.0
+                log_resource_read_exception(uri, request_id, typed_params, exc, duration_ms=duration_ms)
                 payload = build_result(
                     status="error",
                     source=f"resource.read:{uri}",
@@ -214,6 +233,14 @@ class StdioMcpServer:
                         next_steps=["检查资源 URI 是否存在", "必要时查看文件日志中的异常上下文"],
                         ),
                     ),
+                )
+                log_resource_read_finished(
+                    uri,
+                    request_id,
+                    typed_params,
+                    duration_ms=duration_ms,
+                    is_error=True,
+                    payload_summary=cast(JsonValue, payload),
                 )
                 return self._ok_response(
                     request_id,
@@ -231,6 +258,22 @@ class StdioMcpServer:
                         },
                     ),
                 )
+            duration_ms = (perf_counter() - started_at) * 1000.0
+            payload_summary: JsonValue = {}
+            if contents:
+                raw_text = contents[0]["text"]
+                try:
+                    payload_summary = cast(JsonValue, json.loads(raw_text))
+                except json.JSONDecodeError:
+                    payload_summary = raw_text
+            log_resource_read_finished(
+                uri,
+                request_id,
+                typed_params,
+                duration_ms=duration_ms,
+                is_error=is_error,
+                payload_summary=payload_summary,
+            )
             return self._ok_response(
                 request_id,
                 {"contents": [cast(JsonValue, item) for item in contents], "isError": is_error},

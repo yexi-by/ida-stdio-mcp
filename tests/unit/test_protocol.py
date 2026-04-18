@@ -8,6 +8,8 @@ from io import BytesIO
 from pathlib import Path
 from typing import cast
 
+from loguru import logger
+
 from ida_stdio_mcp.config import load_config
 from ida_stdio_mcp.models import JsonObject, JsonValue
 from ida_stdio_mcp.service import build_service
@@ -452,6 +454,64 @@ class ProtocolTests(unittest.TestCase):
         details = expect_object(error["details"], name="invalid.details")
         self.assertEqual(details["tool"], "get_function")
         self.assertTrue(str(details["path"]).startswith("arguments"))
+
+    def test_tool_and_resource_calls_are_written_to_debug_log(self) -> None:
+        config = load_config(self._repo_root() / "setting.toml")
+        service = build_service(
+            HeadlessRuntime(),
+            config,
+            allow_unsafe=False,
+            allow_debugger=False,
+            profile_path=None,
+        )
+        server = StdioMcpServer(
+            tools=service.tools,
+            resources=service.resources,
+            identity=ServerIdentity(
+                protocol_version=config.server.protocol_version,
+                server_name=config.server.server_name,
+                server_version=config.server.server_version,
+            ),
+        )
+
+        rendered_logs: list[str] = []
+        sink_id = logger.add(
+            rendered_logs.append,
+            level="DEBUG",
+            format="{level} | {message} | {extra[event]} | {extra[tool_name]} | {extra[resource_uri]} | {extra[status]} | {extra[details]}",
+        )
+        try:
+            tool_response = server.dispatch_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 61,
+                    "method": "tools/call",
+                    "params": {"name": "health", "arguments": {}},
+                }
+            )
+            self.assertIsNotNone(tool_response)
+
+            resource_response = server.dispatch_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 62,
+                    "method": "resources/read",
+                    "params": {"uri": "ida://capability-matrix"},
+                }
+            )
+            self.assertIsNotNone(resource_response)
+        finally:
+            logger.remove(sink_id)
+
+        merged = "\n".join(rendered_logs)
+        self.assertIn("开始调用工具：health", merged)
+        self.assertIn("工具调用完成：health", merged)
+        self.assertIn("tool_call_start", merged)
+        self.assertIn("tool_call_finish", merged)
+        self.assertIn("开始读取资源：ida://capability-matrix", merged)
+        self.assertIn("资源读取完成：ida://capability-matrix", merged)
+        self.assertIn("resource_read_start", merged)
+        self.assertIn("resource_read_finish", merged)
 
     def test_stdio_message_framing_uses_content_length(self) -> None:
         payload: JsonObject = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
