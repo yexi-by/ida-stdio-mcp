@@ -2,7 +2,7 @@
 
 让 AI 助手直接操控 IDA Pro 进行逆向分析的 MCP 服务器。
 
-本项目灵感来自 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，专注于 IDA Pro 9.2+ 的命令行模式（headless），让 Claude、Kilo 等 AI 助手能够：
+本项目灵感来自 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，专注于 IDA Pro 9.2+ 的命令行模式（headless），让支持 MCP 的 AI 客户端能够：
 
 - 打开并分析二进制文件
 - 读取样本摘要、入口点、关键函数与关键字符串
@@ -16,7 +16,7 @@
 ## 特性
 
 - **纯命令行运行** - 无需启动 IDA GUI，适合自动化和 CI/CD
-- **MCP 协议** - 兼容 Claude Desktop、Kilo 等 AI 客户端
+- **MCP 协议** - 兼容支持 MCP 的 AI 客户端
 - **多会话支持** - 可同时打开多个二进制文件
 - **安全可控** - 写操作和调试功能默认关闭，需显式启用
 - **任务化入口** - 提供样本摘要、字符串使用点追踪、完整分析导出等高层工具
@@ -69,11 +69,13 @@ uv run ida-stdio-mcp --debugger
 
 ## 配置 AI 客户端
 
-### Claude Desktop
+当前主流 MCP 客户端通常使用 **JSON 配置** 或 **TOML 配置**。以下示例使用占位符：
 
-编辑配置文件：
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
+- `<repo-root>`：本项目所在的绝对路径
+- `<ida-dir>`：IDA 安装目录
+- `<sample-path>`：可选，启动时自动打开的样本路径
+
+### JSON 配置格式
 
 **基础配置：**
 
@@ -82,9 +84,9 @@ uv run ida-stdio-mcp --debugger
   "mcpServers": {
     "ida-stdio-mcp": {
       "command": "uv",
-      "args": ["run", "--directory", "D:/work/ida-stdio-mcp", "--no-sync", "ida-stdio-mcp"],
+      "args": ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp"],
       "env": {
-        "IDADIR": "C:\\Program Files\\IDA Professional 9.2"
+        "IDADIR": "<ida-dir>"
       }
     }
   }
@@ -98,40 +100,64 @@ uv run ida-stdio-mcp --debugger
   "mcpServers": {
     "ida-stdio-mcp": {
       "command": "uv",
-      "args": ["run", "--directory", "D:/work/ida-stdio-mcp", "--no-sync", "ida-stdio-mcp", "D:/samples/target.exe"],
+      "args": ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp", "<sample-path>"],
       "env": {
-        "IDADIR": "C:\\Program Files\\IDA Professional 9.2"
+        "IDADIR": "<ida-dir>"
       }
     }
   }
 }
 ```
 
-**启用写操作：**
+**启用写操作与调试能力：**
 
 ```json
 {
   "mcpServers": {
     "ida-stdio-mcp": {
       "command": "uv",
-      "args": ["run", "--directory", "D:/work/ida-stdio-mcp", "--no-sync", "ida-stdio-mcp", "--unsafe"],
+      "args": ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp", "--unsafe", "--debugger"],
       "env": {
-        "IDADIR": "C:\\Program Files\\IDA Professional 9.2"
+        "IDADIR": "<ida-dir>"
       }
     }
   }
 }
 ```
 
-### Kilo (TOML)
+### TOML 配置格式
+
+**基础配置：**
 
 ```toml
 [mcpServers.ida-stdio-mcp]
 command = "uv"
-args = ["run", "--directory", "D:/work/ida-stdio-mcp", "--no-sync", "ida-stdio-mcp"]
+args = ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp"]
 
 [mcpServers.ida-stdio-mcp.env]
-IDADIR = "C:\\Program Files\\IDA Professional 9.2"
+IDADIR = "<ida-dir>"
+```
+
+**启动时自动加载样本：**
+
+```toml
+[mcpServers.ida-stdio-mcp]
+command = "uv"
+args = ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp", "<sample-path>"]
+
+[mcpServers.ida-stdio-mcp.env]
+IDADIR = "<ida-dir>"
+```
+
+**启用写操作与调试能力：**
+
+```toml
+[mcpServers.ida-stdio-mcp]
+command = "uv"
+args = ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp", "--unsafe", "--debugger"]
+
+[mcpServers.ida-stdio-mcp.env]
+IDADIR = "<ida-dir>"
 ```
 
 ## 命令行参数
