@@ -1,8 +1,8 @@
 # ida-stdio-mcp
 
-让 AI 助手直接操控 IDA Pro 进行逆向分析的 MCP 服务器。
+让 Agent 直接操控 IDA Pro 进行逆向分析的 MCP Server。
 
-本项目灵感来自 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，专注于 IDA Pro 9.2+ 的命令行模式（headless），让支持 MCP 的 AI 客户端能够：
+本项目灵感来自 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，专注于 IDA Pro 9.2+ 的命令行模式（headless），让支持 MCP 的 Agent 客户端能够：
 
 - 打开并分析二进制文件
 - 读取样本摘要、入口点、关键函数与关键字符串
@@ -16,7 +16,7 @@
 ## 特性
 
 - **纯命令行运行** - 无需启动 IDA GUI，适合自动化和 CI/CD
-- **MCP 协议** - 兼容支持 MCP 的 AI 客户端
+- **MCP 协议** - 兼容支持 MCP 的 Agent 客户端
 - **多会话支持** - 可同时打开多个二进制文件
 - **安全可控** - 写操作和调试功能默认关闭，需显式启用
 - **任务化入口** - 提供样本摘要、字符串使用点追踪、完整分析导出等高层工具
@@ -67,7 +67,7 @@ uv run ida-stdio-mcp --unsafe
 uv run ida-stdio-mcp --debugger
 ```
 
-## 配置 AI 客户端
+## 配置 Agent 客户端
 
 当前主流 MCP 客户端通常使用 **JSON 配置** 或 **TOML 配置**。以下示例使用占位符：
 
