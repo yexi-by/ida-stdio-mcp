@@ -5,9 +5,11 @@
 本项目灵感来自 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，专注于 IDA Pro 9.2+ 的命令行模式（headless），让 Claude、Kilo 等 AI 助手能够：
 
 - 打开并分析二进制文件
+- 读取样本摘要、入口点、关键函数与关键字符串
 - 反编译函数、查看汇编代码
-- 搜索字符串、交叉引用
+- 搜索字符串、追踪字符串使用点、查看交叉引用
 - 重命名符号、添加注释
+- 导出结构化分析结果
 - 执行 Python 脚本
 - 调试程序
 
@@ -17,6 +19,7 @@
 - **MCP 协议** - 兼容 Claude Desktop、Kilo 等 AI 客户端
 - **多会话支持** - 可同时打开多个二进制文件
 - **安全可控** - 写操作和调试功能默认关闭，需显式启用
+- **任务化入口** - 提供样本摘要、字符串使用点追踪、完整分析导出等高层工具
 
 ## 环境要求
 
@@ -144,6 +147,8 @@ IDADIR = "C:\\Program Files\\IDA Professional 9.2"
 
 ## 工具列表
 
+运行时工具集分为公共读工具、`--unsafe` 写工具和 `--debugger` 调试工具三层。常见逆向工作流可以直接从 `describe_capabilities`、`summarize_binary`、`find_string_usage`、`export_full_analysis` 进入。
+
 ### 会话管理
 
 | 工具 | 说明 |
@@ -158,7 +163,9 @@ IDADIR = "C:\\Program Files\\IDA Professional 9.2"
 
 | 工具 | 说明 |
 |------|------|
+| `describe_capabilities` | 返回工具目录、能力矩阵、门控状态与推荐入口 |
 | `survey_binary` | 文件概览：架构、段、入口点 |
+| `summarize_binary` | 样本摘要：入口点、关键函数、关键字符串、导入分类、推荐下一步 |
 | `list_functions` | 列出所有函数 |
 | `get_function` | 获取函数详情 |
 | `decompile_function` | 反编译函数（native 返回伪代码，.NET 返回 C#） |
@@ -174,6 +181,7 @@ IDADIR = "C:\\Program Files\\IDA Professional 9.2"
 | 工具 | 说明 |
 |------|------|
 | `find_strings` | 搜索字符串 |
+| `find_string_usage` | 按字符串或字符串地址追踪使用点，返回字符串、xref/引用点、所属函数 |
 | `find_bytes` | 搜索字节序列 |
 | `search_regex` | 正则搜索 |
 
@@ -197,6 +205,33 @@ IDADIR = "C:\\Program Files\\IDA Professional 9.2"
 | `debug_continue` | 继续执行 |
 | `debug_registers` | 查看寄存器 |
 | `debug_read_memory` | 读取内存 |
+
+### 导出与批处理
+
+| 工具 | 说明 |
+|------|------|
+| `export_functions` | 导出函数级分析结果，支持 JSON、原型列表、近似头文件 |
+| `export_full_analysis` | 导出当前 IDB 的结构化分析总包，包含 metadata、entrypoints、imports、globals、strings、types、structs、functions |
+
+## 推荐工作流
+
+### 单样本开局
+
+```text
+open_binary -> summarize_binary -> list_functions / find_string_usage -> decompile_function / read_struct / query_types
+```
+
+### 字符串驱动的定位流程
+
+```text
+find_string_usage -> get_function_profile -> decompile_function -> get_xrefs_to
+```
+
+### 导出与复盘
+
+```text
+export_full_analysis -> export_functions
+```
 
 ## 配置文件
 

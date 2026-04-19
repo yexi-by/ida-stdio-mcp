@@ -76,6 +76,7 @@ class ProtocolTests(unittest.TestCase):
             for tool in service.tools.list_tools()
             if isinstance(tool.get("name"), str)
         ]
+        self.assertIn("describe_capabilities", tool_names)
         self.assertIn("open_binary", tool_names)
         self.assertIn("survey_binary", tool_names)
         self.assertNotIn("set_comments", tool_names)
@@ -110,6 +111,81 @@ class ProtocolTests(unittest.TestCase):
         feature_gates = expect_object(health_data.get("feature_gates"), name="health.feature_gates")
         self.assertTrue(bool(feature_gates.get("unsafe")))
         self.assertTrue(bool(feature_gates.get("debugger")))
+
+    def test_describe_capabilities_returns_keyword_rich_overview(self) -> None:
+        """能力总览工具应返回可检索、可导航的分类与任务摘要。"""
+        config = load_config(self._repo_root() / "setting.toml")
+        service = build_service(
+            HeadlessRuntime(),
+            config,
+            allow_unsafe=True,
+            allow_debugger=True,
+            profile_path=None,
+        )
+        server = StdioMcpServer(
+            tools=service.tools,
+            resources=service.resources,
+            identity=ServerIdentity(
+                protocol_version=config.server.protocol_version,
+                server_name=config.server.server_name,
+                server_version=config.server.server_version,
+            ),
+        )
+
+        response = server.dispatch_message(
+            {
+                "jsonrpc": "2.0",
+                "id": 12,
+                "method": "tools/call",
+                "params": {
+                    "name": "describe_capabilities",
+                    "arguments": {"focus": "反编译伪代码", "include_examples": True},
+                },
+            }
+        )
+        self.assertIsNotNone(response)
+        assert response is not None
+        response_result = expect_object(response["result"], name="describe.result")
+        structured = expect_object(response_result["structuredContent"], name="describe.structured")
+        self.assertEqual(structured["status"], "ok")
+        data = expect_object(structured["data"], name="describe.data")
+        summary = expect_string(data.get("summary"), name="describe.data.summary")
+        self.assertIn("反编译伪代码", summary)
+        self.assertIn("交叉引用", summary)
+        self.assertIn("导出分析结果", summary)
+
+        categories = expect_list(data.get("categories"), name="describe.data.categories")
+        self.assertGreater(len(categories), 0)
+        category_titles = [
+            str(item.get("title"))
+            for item in categories
+            if isinstance(item, dict) and isinstance(item.get("title"), str)
+        ]
+        self.assertIn("上手入口与能力总览", category_titles)
+        self.assertIn("函数、伪代码与调用关系", category_titles)
+
+        tasks = expect_list(data.get("notable_tasks"), name="describe.data.notable_tasks")
+        self.assertGreater(len(tasks), 0)
+        task_titles = [
+            str(item.get("title"))
+            for item in tasks
+            if isinstance(item, dict) and isinstance(item.get("title"), str)
+        ]
+        self.assertIn("读取反编译伪代码 / 高层表示", task_titles)
+
+        entrypoints = expect_list(data.get("recommended_entrypoints"), name="describe.data.recommended_entrypoints")
+        self.assertGreater(len(entrypoints), 0)
+        by_name = {
+            str(item["name"]): item
+            for item in entrypoints
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        }
+        self.assertIn("describe_capabilities", by_name)
+        self.assertIn("summarize_binary", by_name)
+        self.assertIn("decompile_function", by_name)
+        self.assertIn("export_full_analysis", by_name)
+        decompile_entry = expect_object(by_name["decompile_function"], name="describe.entrypoints.decompile_function")
+        self.assertIn("input_example", decompile_entry)
 
     def test_stdio_dispatch_supports_tools_and_resources(self) -> None:
         config = load_config(self._repo_root() / "setting.toml")
@@ -359,6 +435,16 @@ class ProtocolTests(unittest.TestCase):
             self.assertIn("inputExample", item, msg=f"{raw_name} 缺少最小输入示例")
 
         self.assertEqual(
+            set(schema_properties(by_name["describe_capabilities"], name="describe_capabilities").keys()),
+            {"focus", "include_examples"},
+        )
+        self.assertFalse(bool(by_name["describe_capabilities"]["requiresSession"]))
+        self.assertFalse(bool(by_name["describe_capabilities"]["requiresContext"]))
+        self.assertEqual(
+            by_name["describe_capabilities"]["inputExample"],
+            {"focus": "反编译伪代码", "include_examples": True},
+        )
+        self.assertEqual(
             set(schema_properties(by_name["open_binary"], name="open_binary").keys()),
             {"path", "run_auto_analysis", "session_id"},
         )
@@ -383,6 +469,18 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(
             set(schema_properties(by_name["find_strings"], name="find_strings").keys()),
             {"pattern", "offset", "count", "limit", "session_id"},
+        )
+        self.assertEqual(
+            set(schema_properties(by_name["summarize_binary"], name="summarize_binary").keys()),
+            {"function_limit", "string_limit", "import_limit_per_category", "session_id"},
+        )
+        self.assertEqual(
+            set(schema_properties(by_name["find_string_usage"], name="find_string_usage").keys()),
+            {"pattern", "addr", "max_strings", "max_usages", "session_id"},
+        )
+        self.assertEqual(
+            set(schema_properties(by_name["export_full_analysis"], name="export_full_analysis").keys()),
+            {"function_limit", "string_limit", "global_limit", "import_limit", "type_limit", "struct_limit", "include_decompile", "include_asm", "session_id"},
         )
         self.assertEqual(
             set(schema_properties(by_name["trace_data_flow"], name="trace_data_flow").keys()),
@@ -416,6 +514,26 @@ class ProtocolTests(unittest.TestCase):
             set(expect_object(comment_item_schema["properties"], name="set_comments.items[].properties").keys()),
             {"addr", "comment", "repeatable"},
         )
+        discovery_keywords: dict[str, tuple[str, ...]] = {
+            "describe_capabilities": ("反编译伪代码", "交叉引用", "导出分析结果"),
+            "summarize_binary": ("样本摘要", "binary summary", "关键字符串"),
+            "decompile_function": ("反编译伪代码", "Hex-Rays"),
+            "get_xrefs_to": ("交叉引用", "xref"),
+            "list_strings": ("字符串",),
+            "find_string_usage": ("字符串", "xref", "grep"),
+            "read_struct": ("结构体", "UDT"),
+            "query_types": ("类型", "函数原型"),
+            "export_full_analysis": ("完整分析结果", "full analysis bundle"),
+            "export_functions": ("导出函数分析结果", "AI"),
+            "rename_symbols": ("重命名符号",),
+            "patch_assembly": ("修改汇编", "补丁"),
+            "patch_bytes": ("字节补丁", "十六进制"),
+            "evaluate_python": ("IDAPython", "高级自定义分析"),
+        }
+        for tool_name, keywords in discovery_keywords.items():
+            description = expect_string(by_name[tool_name].get("description"), name=f"{tool_name}.description")
+            for keyword in keywords:
+                self.assertIn(keyword, description, msg=f"{tool_name} 描述缺少关键词：{keyword}")
 
     def test_invalid_arguments_return_machine_fixable_error(self) -> None:
         config = load_config(self._repo_root() / "setting.toml")

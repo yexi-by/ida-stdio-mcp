@@ -370,6 +370,405 @@ class ServiceBundle:
     resources: ResourceRegistry
 
 
+@dataclass(slots=True, frozen=True)
+class CapabilityCategorySpec:
+    """能力总览里的工具分类定义。"""
+
+    key: str
+    title: str
+    summary: str
+    keywords: tuple[str, ...]
+    tool_names: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class CapabilityTaskSpec:
+    """能力总览里的典型任务定义。"""
+
+    title: str
+    summary: str
+    keywords: tuple[str, ...]
+    tool_names: tuple[str, ...]
+    gate_requirements: tuple[str, ...] = ()
+    notes: tuple[str, ...] = ()
+
+
+CAPABILITY_CATEGORY_SPECS: tuple[CapabilityCategorySpec, ...] = (
+    CapabilityCategorySpec(
+        key="entrypoints",
+        title="上手入口与能力总览",
+        summary="先判断这个 MCP 能做什么、当前运行开了哪些门控、适合从哪里开始逆向。",
+        keywords=("能力总览", "工具总目录", "反编译伪代码", "列函数", "交叉引用", "字符串", "结构体", "类型", "补丁", "导出分析结果"),
+        tool_names=("describe_capabilities", "health", "summarize_binary", "survey_binary", "analyze_directory", "warmup"),
+    ),
+    CapabilityCategorySpec(
+        key="sessions",
+        title="样本与会话管理",
+        summary="打开二进制、切换当前会话、保存 IDB、关闭样本，适合分析流程开场。",
+        keywords=("打开二进制", "切换会话", "保存数据库", "关闭样本", "当前会话"),
+        tool_names=("open_binary", "list_binaries", "current_binary", "switch_binary", "save_binary", "close_binary", "deactivate_binary"),
+    ),
+    CapabilityCategorySpec(
+        key="functions",
+        title="函数、伪代码与调用关系",
+        summary="列函数、定位函数、看函数画像、读反编译伪代码或汇编、分析调用关系。",
+        keywords=("列函数", "函数列表", "函数画像", "反编译伪代码", "汇编", "调用图", "入口函数"),
+        tool_names=(
+            "list_functions",
+            "get_function",
+            "get_function_profile",
+            "analyze_functions",
+            "decompile_function",
+            "disassemble_function",
+            "get_callers",
+            "get_callees",
+            "get_basic_blocks",
+            "build_callgraph",
+            "analyze_function",
+            "analyze_component",
+        ),
+    ),
+    CapabilityCategorySpec(
+        key="xrefs_strings_imports",
+        title="交叉引用、字符串、导入与全局",
+        summary="查 xref、列字符串、搜字符串、看导入表、读全局值，适合快速摸清程序外部接口和提示信息。",
+        keywords=("交叉引用", "xref", "字符串", "导入表", "全局变量", "正则搜索"),
+        tool_names=(
+            "get_xrefs_to",
+            "query_xrefs",
+            "get_xrefs_to_field",
+            "list_strings",
+            "find_strings",
+            "find_string_usage",
+            "search_regex",
+            "list_globals",
+            "list_imports",
+            "query_imports",
+            "read_strings",
+            "read_global_values",
+            "query_instructions",
+        ),
+    ),
+    CapabilityCategorySpec(
+        key="types_structs",
+        title="结构体、类型与栈帧",
+        summary="查结构体字段、查本地类型与托管类型、看函数栈帧、批量写回类型。",
+        keywords=("结构体", "类型", "UDT", "栈帧", "字段布局", "函数原型", "类型写回"),
+        tool_names=(
+            "read_struct",
+            "search_structs",
+            "query_types",
+            "inspect_type",
+            "get_stack_frame",
+            "declare_types",
+            "set_types",
+            "apply_types",
+            "infer_types",
+            "declare_stack_variables",
+            "delete_stack_variables",
+            "upsert_enum",
+        ),
+    ),
+    CapabilityCategorySpec(
+        key="patching",
+        title="重命名、注释与补丁写回",
+        summary="重命名符号、追加注释、修改汇编、写字节补丁、改整数、重新定义代码或函数。",
+        keywords=("重命名符号", "注释", "修改汇编", "汇编补丁", "字节补丁", "patch", "define function"),
+        tool_names=(
+            "rename_symbols",
+            "set_comments",
+            "append_comments",
+            "patch_assembly",
+            "patch_bytes",
+            "write_ints",
+            "define_function",
+            "define_code",
+            "undefine_items",
+        ),
+    ),
+    CapabilityCategorySpec(
+        key="export_reports",
+        title="导出、复盘与结果整理",
+        summary="导出函数分析结果、原型、近似头文件，适合批量复盘、报告生成和继续喂给 AI。",
+        keywords=("导出分析结果", "导出函数", "导出伪代码", "头文件", "prototypes", "json"),
+        tool_names=("export_full_analysis", "export_functions", "trace_data_flow", "read_bytes", "read_ints"),
+    ),
+    CapabilityCategorySpec(
+        key="python_escape_hatch",
+        title="IDAPython 与自定义分析",
+        summary="当现成工具不够时，直接在 IDA 上下文执行 Python / IDAPython 代码做高级自定义分析。",
+        keywords=("IDAPython", "evaluate_python", "execute python", "自定义分析", "Python 脚本"),
+        tool_names=("evaluate_python", "execute_python_file"),
+    ),
+    CapabilityCategorySpec(
+        key="debugger",
+        title="调试器与断点控制",
+        summary="启动调试、读寄存器和内存、单步、继续执行、管理断点。",
+        keywords=("调试", "断点", "单步", "寄存器", "内存", "stacktrace"),
+        tool_names=(
+            "debug_start",
+            "debug_exit",
+            "debug_continue",
+            "debug_run_to",
+            "debug_step_into",
+            "debug_step_over",
+            "debug_list_breakpoints",
+            "debug_add_breakpoints",
+            "debug_delete_breakpoints",
+            "debug_toggle_breakpoints",
+            "debug_registers",
+            "debug_registers_all_threads",
+            "debug_registers_thread",
+            "debug_general_registers",
+            "debug_general_registers_thread",
+            "debug_named_registers",
+            "debug_named_registers_thread",
+            "debug_stacktrace",
+            "debug_read_memory",
+            "debug_write_memory",
+        ),
+    ),
+)
+
+
+CAPABILITY_TASK_SPECS: tuple[CapabilityTaskSpec, ...] = (
+    CapabilityTaskSpec(
+        title="开局快速摸清样本 / binary summary",
+        summary="直接看样本摘要、入口点、关键函数、关键字符串、导入分类和推荐下一步，替代先去 shell 里乱扫一圈。",
+        keywords=("样本摘要", "binary summary", "入口点", "关键函数", "关键字符串", "开局"),
+        tool_names=("summarize_binary", "survey_binary", "list_functions"),
+    ),
+    CapabilityTaskSpec(
+        title="读取反编译伪代码 / 高层表示",
+        summary="看函数伪代码、Hex-Rays C 结果或托管 C# 结果；不可用时再退回 IL/汇编。",
+        keywords=("反编译伪代码", "Hex-Rays", "C#", "高层表示"),
+        tool_names=("decompile_function", "disassemble_function", "get_function_profile"),
+        notes=("native 优先 Hex-Rays；managed 优先外部 C#，失败再降级。",),
+    ),
+    CapabilityTaskSpec(
+        title="列函数 / 定位目标函数",
+        summary="先枚举函数、按名称筛选、再读取单函数详情和画像。",
+        keywords=("列函数", "函数列表", "定位函数", "入口函数"),
+        tool_names=("list_functions", "get_function", "get_function_profile", "survey_binary"),
+    ),
+    CapabilityTaskSpec(
+        title="查交叉引用 / xref",
+        summary="查看谁引用了目标地址、函数、结构字段，或按方向过滤调用边。",
+        keywords=("交叉引用", "xref", "who references", "callers", "callees"),
+        tool_names=("get_xrefs_to", "query_xrefs", "get_xrefs_to_field", "get_callers", "get_callees"),
+    ),
+    CapabilityTaskSpec(
+        title="列字符串 / 搜索字符串",
+        summary="批量列字符串、做子串或正则搜索、按地址回读字符串值。",
+        keywords=("字符串", "搜索字符串", "正则", "read strings"),
+        tool_names=("list_strings", "find_strings", "find_string_usage", "search_regex", "read_strings"),
+    ),
+    CapabilityTaskSpec(
+        title="查字符串使用点 / string usage",
+        summary="把字符串、xref/引用点、所属函数直接串成闭环结果，适合顺着错误文案、URL、路径、协议字段快速追逻辑。",
+        keywords=("字符串使用点", "string usage", "xref", "grep", "谁用了这个字符串"),
+        tool_names=("find_string_usage", "get_xrefs_to", "get_function_profile", "decompile_function"),
+    ),
+    CapabilityTaskSpec(
+        title="查结构体 / 类型 / 栈帧",
+        summary="查看结构体字段、类型声明、成员布局与栈变量信息。",
+        keywords=("结构体", "类型", "UDT", "栈帧", "字段"),
+        tool_names=("read_struct", "search_structs", "query_types", "inspect_type", "get_stack_frame"),
+    ),
+    CapabilityTaskSpec(
+        title="重命名符号 / 添加注释",
+        summary="批量重命名函数或变量、追加注释，改善数据库可读性。",
+        keywords=("重命名符号", "rename", "注释", "comments"),
+        tool_names=("rename_symbols", "set_comments", "append_comments"),
+        gate_requirements=("unsafe",),
+        notes=("需要当前运行启用 --unsafe。",),
+    ),
+    CapabilityTaskSpec(
+        title="修改汇编 / 打补丁 / 写字节",
+        summary="按汇编语句 assemble 后写回，或直接打十六进制字节补丁。",
+        keywords=("修改汇编", "汇编补丁", "字节补丁", "patch assembly", "patch bytes"),
+        tool_names=("patch_assembly", "patch_bytes", "write_ints", "define_function", "define_code", "undefine_items"),
+        gate_requirements=("unsafe",),
+        notes=("需要当前运行启用 --unsafe。",),
+    ),
+    CapabilityTaskSpec(
+        title="导出分析结果 / 继续喂给 AI",
+        summary="导出结构化 JSON、函数原型、近似头文件，适合报告、批处理和再分析。",
+        keywords=("导出分析结果", "export analysis", "json", "c_header", "prototypes"),
+        tool_names=("export_full_analysis", "export_functions", "analyze_component", "get_function_profile"),
+    ),
+    CapabilityTaskSpec(
+        title="执行任意 IDAPython / 自定义脚本",
+        summary="当现成工具不够时，直接在 IDA 上下文执行 Python 或加载脚本文件。",
+        keywords=("IDAPython", "evaluate_python", "execute python", "自定义脚本"),
+        tool_names=("evaluate_python", "execute_python_file"),
+        gate_requirements=("unsafe",),
+        notes=("需要当前运行启用 --unsafe。",),
+    ),
+    CapabilityTaskSpec(
+        title="调试、断点、寄存器与内存",
+        summary="做断点管理、单步、继续执行、查看寄存器、读写调试内存。",
+        keywords=("调试", "断点", "单步", "寄存器", "内存"),
+        tool_names=("debug_start", "debug_continue", "debug_step_into", "debug_step_over", "debug_add_breakpoints", "debug_registers", "debug_read_memory"),
+        gate_requirements=("debugger",),
+        notes=("需要当前运行启用 --debugger。",),
+    ),
+)
+
+
+def _focus_matches(focus: str, texts: tuple[str, ...]) -> bool:
+    """判断某条能力描述是否命中指定主题。"""
+    normalized_focus = focus.strip().lower()
+    if not normalized_focus:
+        return True
+    return any(normalized_focus in text.lower() for text in texts if text)
+
+
+def _build_capability_overview_payload(
+    registry: ToolRegistry,
+    *,
+    allow_unsafe: bool,
+    allow_debugger: bool,
+    isolated_contexts: bool,
+    focus: str = "",
+    include_examples: bool = False,
+) -> JsonObject:
+    """构造面向 AI 与人的能力总览结果。"""
+    tool_items = registry.list_tools()
+    tools_by_name: dict[str, JsonObject] = {}
+    for item in tool_items:
+        raw_name = item.get("name")
+        if isinstance(raw_name, str):
+            tools_by_name[raw_name] = item
+
+    def tool_row(name: str) -> JsonObject | None:
+        item = tools_by_name.get(name)
+        if item is None:
+            return None
+        row: JsonObject = {
+            "name": name,
+            "description": str(item.get("description", "")),
+            "requires_session": bool(item.get("requiresSession", False)),
+            "requires_context": bool(item.get("requiresContext", False)),
+        }
+        if include_examples and "inputExample" in item:
+            row["input_example"] = item["inputExample"]
+        return normalize_json_object(row)
+
+    categories: list[JsonValue] = []
+    for spec in CAPABILITY_CATEGORY_SPECS:
+        category_tool_rows: list[JsonValue] = [row for row in (tool_row(name) for name in spec.tool_names) if row is not None]
+        if not category_tool_rows:
+            continue
+        if not _focus_matches(
+            focus,
+            (
+                spec.title,
+                spec.summary,
+                *spec.keywords,
+                *spec.tool_names,
+            ),
+        ):
+            continue
+        categories.append(
+            normalize_json_object(
+                {
+                    "key": spec.key,
+                    "title": spec.title,
+                    "summary": spec.summary,
+                    "keywords": list(spec.keywords),
+                    "tool_count": len(category_tool_rows),
+                    "tools": category_tool_rows,
+                }
+            )
+        )
+
+    notable_tasks: list[JsonValue] = []
+    for spec in CAPABILITY_TASK_SPECS:
+        task_tool_rows: list[JsonValue] = [row for row in (tool_row(name) for name in spec.tool_names) if row is not None]
+        if not task_tool_rows:
+            continue
+        if not _focus_matches(
+            focus,
+            (
+                spec.title,
+                spec.summary,
+                *spec.keywords,
+                *spec.tool_names,
+                *spec.gate_requirements,
+                *spec.notes,
+            ),
+        ):
+            continue
+        notable_tasks.append(
+            normalize_json_object(
+                {
+                    "title": spec.title,
+                    "summary": spec.summary,
+                    "keywords": list(spec.keywords),
+                    "gate_requirements": list(spec.gate_requirements),
+                    "notes": list(spec.notes),
+                    "tools": task_tool_rows,
+                }
+            )
+        )
+
+    recommended_entrypoints: list[JsonValue] = [
+        row
+        for row in (
+            tool_row("describe_capabilities"),
+            tool_row("open_binary"),
+            tool_row("summarize_binary"),
+            tool_row("survey_binary"),
+            tool_row("list_functions"),
+            tool_row("decompile_function"),
+            tool_row("find_string_usage"),
+            tool_row("get_xrefs_to"),
+            tool_row("list_strings"),
+            tool_row("read_struct"),
+            tool_row("query_types"),
+            tool_row("export_full_analysis"),
+            tool_row("export_functions"),
+        )
+        if row is not None
+    ]
+
+    gate_notes: list[JsonValue] = [
+        "当前运行已启用 --unsafe，可使用重命名、类型写回、补丁、IDAPython 等写操作。"
+        if allow_unsafe
+        else "当前运行未启用 --unsafe，重命名、类型写回、补丁、IDAPython 等写操作会缺席或不可用。",
+        "当前运行已启用 --debugger，可使用断点、单步、寄存器、调试内存等调试工具。"
+        if allow_debugger
+        else "当前运行未启用 --debugger，调试器相关工具不会暴露。",
+        "当前运行启用了 --isolated-contexts，后续多数 session-scoped 工具都必须显式传入 context_id。"
+        if isolated_contexts
+        else "当前运行未启用 --isolated-contexts，可使用共享默认上下文。",
+    ]
+    discovery_advice: list[JsonValue] = [
+        "不知道该用哪个工具时，先调用 describe_capabilities。",
+        "单样本常见工作流：open_binary -> summarize_binary -> list_functions / find_string_usage -> decompile_function / read_struct / query_types。",
+        "需要批量整理结果时，优先考虑 export_full_analysis、export_functions、get_function_profile、analyze_component。",
+    ]
+
+    return normalize_json_object(
+        {
+            "summary": "这是 ida-stdio-mcp 的能力总览工具。它会回答当前到底能不能做反编译伪代码、列函数、查交叉引用 xref、列字符串、查结构体/类型、重命名符号、修改汇编或字节补丁、导出分析结果、执行 IDAPython、调试等任务。",
+            "feature_gates": {
+                "unsafe": allow_unsafe,
+                "debugger": allow_debugger,
+                "isolated_contexts": isolated_contexts,
+            },
+            "gate_notes": gate_notes,
+            "focus": focus,
+            "tool_count": len(tools_by_name),
+            "recommended_entrypoints": recommended_entrypoints,
+            "notable_tasks": notable_tasks,
+            "categories": categories,
+            "discovery_advice": discovery_advice,
+        }
+    )
+
+
 def _ensure_session(arguments: JsonObject, runtime: HeadlessRuntime) -> None:
     raw_session = arguments.get("session_id")
     session_id = raw_session if isinstance(raw_session, str) and raw_session else None
@@ -562,6 +961,7 @@ def _management_tools(
     allow_debugger: bool,
 ) -> set[str]:
     protected = {
+        "describe_capabilities",
         "health",
         "warmup",
         "open_binary",
@@ -896,8 +1296,34 @@ def _management_tools(
             return management_error_result("analyze_directory", "directory_analysis", exc, session_required=False, requires_context=context_required)
 
     register_management_tool(
+        name="describe_capabilities",
+        description="能力总览 / 工具总目录：回答 ida-stdio-mcp 当前能否做反编译伪代码、列函数、查交叉引用 xref、列字符串、查结构体/类型、重命名符号、修改汇编或字节补丁、导出分析结果、执行 IDAPython、调试等任务，并返回推荐工具与调用示例。",
+        schema=_tool_input_schema(
+            properties={
+                "focus": _string_schema("可选。按主题筛选能力总览，例如 反编译伪代码 / 列函数 / 交叉引用 / 字符串 / 结构体 / 类型 / 重命名符号 / 汇编补丁 / 导出分析结果 / IDAPython / 调试。"),
+                "include_examples": _boolean_schema("是否在结果里附带推荐工具的最小调用示例。"),
+            }
+        ),
+        handler=lambda arguments: build_result(
+            status="ok",
+            source="runtime.describe_capabilities",
+            data=_build_capability_overview_payload(
+                registry,
+                allow_unsafe=allow_unsafe,
+                allow_debugger=allow_debugger,
+                isolated_contexts=runtime.isolated_contexts,
+                focus=_string_or_default(arguments, "focus", ""),
+                include_examples=_bool_or_default(arguments, "include_examples", False),
+            ),
+        ),
+        requires_session=False,
+        requires_context=False,
+        empty_state_behavior="这是全局能力总览，不依赖当前会话，也不会修改数据库。",
+        input_example={"focus": "反编译伪代码", "include_examples": True},
+    )
+    register_management_tool(
         name="health",
-        description="返回运行时健康状态。",
+        description="返回运行时健康状态、当前门控、IDA 环境与活动会话概览；适合先确认这个 MCP 当前是否准备好可做逆向分析。",
         schema=_tool_input_schema(),
         handler=health_handler,
         requires_session=False,
@@ -907,7 +1333,7 @@ def _management_tools(
     )
     register_management_tool(
         name="warmup",
-        description="预热当前会话。",
+        description="预热当前会话并等待自动分析完成；适合在刚打开样本后先稳定数据库状态。",
         schema=_tool_input_schema(include_session=True),
         handler=warmup_handler,
         requires_session=True,
@@ -917,7 +1343,7 @@ def _management_tools(
     )
     register_management_tool(
         name="open_binary",
-        description="打开二进制并绑定当前会话。",
+        description="打开二进制样本并绑定当前会话；这是做函数枚举、反编译伪代码、查 xref、查字符串、查结构体/类型前的起点工具。",
         schema=_tool_input_schema(
             properties={
                 "path": _string_schema("二进制文件路径。"),
@@ -994,7 +1420,7 @@ def _management_tools(
     )
     register_management_tool(
         name="analyze_directory",
-        description="扫描目录、挑选候选二进制并做批量深度分析。",
+        description="扫描目录、挑选候选二进制并做批量深度分析；适合目录级样本筛选、自动定位入口二进制、批量逆向前总览。",
         schema=_tool_input_schema(
             properties={
                 "path": _string_schema("要扫描的目录路径。"),
@@ -1023,7 +1449,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="survey_binary",
-        description="返回当前会话的二进制概览。",
+        description="返回当前会话的二进制概览、架构、段、入口点与能力摘要；适合作为样本逆向前的总览入口。",
         source="core.survey_binary",
         runtime=runtime,
         input_schema=_tool_input_schema(include_session=True),
@@ -1034,8 +1460,31 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     )
     _tool(
         registry,
+        name="summarize_binary",
+        description="样本摘要 / binary summary / 开局总览：直接给出入口点、关键函数、关键字符串、导入分类、能力边界和推荐下一步，适合替代先用 shell 随便扫一圈。",
+        source="core.summarize_binary",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "function_limit": _integer_schema("返回多少个关键函数摘要。", minimum=1),
+                "string_limit": _integer_schema("返回多少个关键字符串摘要。", minimum=1),
+                "import_limit_per_category": _integer_schema("每个导入分类最多展示多少个示例。", minimum=1),
+            },
+            include_session=True,
+        ),
+        handler=lambda core, arguments: core.summarize_binary(
+            function_limit=_int_or_default(arguments, "function_limit", 12),
+            string_limit=_int_or_default(arguments, "string_limit", 12),
+            import_limit_per_category=_int_or_default(arguments, "import_limit_per_category", 6),
+        ),
+        preconditions=("必须已存在活动会话，或显式提供 session_id。",),
+        empty_state_behavior="无活动会话时返回 session_required。",
+        input_example={"session_id": "sess-001", "function_limit": 10, "string_limit": 10},
+    )
+    _tool(
+        registry,
         name="list_functions",
-        description="分页列出函数。",
+        description="分页列函数、做函数名筛选并枚举目标函数；适合先看函数列表、入口函数和批量逆向目标。",
         source="core.list_functions",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1057,7 +1506,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="get_function",
-        description="返回单个函数详情以及 callers/callees。",
+        description="返回单个函数详情以及 callers/callees；适合按函数名或地址定位目标函数并看调用关系。",
         source="core.get_function",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
@@ -1066,7 +1515,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="get_function_profile",
-        description="读取函数画像。",
+        description="读取函数画像，聚合字符串、常量、calls/xrefs、基本块、注释等摘要；适合单函数分析。",
         source="core.get_function_profile",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1079,7 +1528,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="analyze_functions",
-        description="批量分析多个函数。",
+        description="批量分析多个函数，适合一次性拉取多个目标函数的画像摘要。",
         source="core.analyze_functions",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1092,7 +1541,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="decompile_function",
-        description="返回函数的统一高层表示。",
+        description="读取反编译伪代码 / 高层表示：native 优先 Hex-Rays C 伪代码，托管/.NET 优先 C#；失败时降级为 IL 或汇编文本。",
         source="core.decompile_function",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
@@ -1101,7 +1550,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="disassemble_function",
-        description="返回函数反汇编。",
+        description="读取函数汇编 / 反汇编文本，适合在没有伪代码时直接看指令级逻辑。",
         source="core.disassemble_function",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
@@ -1156,7 +1605,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="get_xrefs_to",
-        description="读取目标地址的交叉引用。",
+        description="读取目标地址的交叉引用（xref），查看谁引用了目标函数、符号、地址或字段。",
         source="core.get_xrefs_to",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
@@ -1165,7 +1614,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="query_xrefs",
-        description="按条件查询交叉引用。",
+        description="按条件查询交叉引用 / xref，支持 from/to 方向和类型过滤。",
         source="core.query_xrefs",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1199,7 +1648,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="get_callers",
-        description="读取函数调用者。",
+        description="读取函数调用者，查看哪些函数会调用当前目标函数。",
         source="core.get_callers",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
@@ -1208,7 +1657,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="get_callees",
-        description="读取函数调用目标。",
+        description="读取函数调用目标，查看当前函数调用了哪些内部或外部目标。",
         source="core.get_callees",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
@@ -1217,7 +1666,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="get_basic_blocks",
-        description="读取函数基本块。",
+        description="读取函数基本块与控制流边，适合做 CFG、复杂度和路径分析。",
         source="core.get_basic_blocks",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
@@ -1226,7 +1675,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="list_strings",
-        description="分页列出字符串。",
+        description="分页列字符串，适合做字符串总览、字面量审计、提示词/路径/URL 快速摸排。",
         source="core.list_strings",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=PAGINATION_PROPERTIES, include_session=True),
@@ -1235,7 +1684,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="find_strings",
-        description="按子串搜索字符串。",
+        description="按子串搜索字符串，快速查提示词、错误文案、URL、路径、协议字段。",
         source="core.find_strings",
         runtime=runtime,
         input_schema=_tool_input_schema(properties={**SEARCH_TEXT_PROPERTIES, **PAGINATION_PROPERTIES}, include_session=True, required=("pattern",)),
@@ -1243,8 +1692,32 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     )
     _tool(
         registry,
+        name="find_string_usage",
+        description="按字符串或字符串地址直接查使用点，返回 字符串 -> xref/引用点 -> 所属函数 的闭环结果，适合替代 grep / strings / 手工拼接。",
+        source="core.find_string_usage",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "pattern": _string_schema("要查的字符串内容、错误文案、URL、路径或协议字段。"),
+                "addr": _string_schema("字符串地址；与 pattern 二选一，也可同时传入做交叉收窄。"),
+                "max_strings": _integer_schema("最多展开多少条匹配字符串。", minimum=1),
+                "max_usages": _integer_schema("最多返回多少条使用点。", minimum=1),
+            },
+            include_session=True,
+            any_of=(("pattern",), ("addr",)),
+        ),
+        handler=lambda core, arguments: core.find_string_usage(
+            pattern=_string_or_default(arguments, "pattern", ""),
+            addr=_string_or_default(arguments, "addr", ""),
+            max_strings=_int_or_default(arguments, "max_strings", 20),
+            max_usages=_int_or_default(arguments, "max_usages", 100),
+        ),
+        input_example={"session_id": "sess-001", "pattern": "error", "max_strings": 10, "max_usages": 30},
+    )
+    _tool(
+        registry,
         name="search_regex",
-        description="对字符串做正则搜索。",
+        description="对字符串做正则搜索，适合批量查模式化字面量、路径、域名、格式串。",
         source="core.search_regex",
         runtime=runtime,
         input_schema=_tool_input_schema(properties={**SEARCH_TEXT_PROPERTIES, **PAGINATION_PROPERTIES}, include_session=True, required=("pattern",)),
@@ -1356,7 +1829,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="get_stack_frame",
-        description="读取函数栈帧。",
+        description="读取函数栈帧、局部变量槽位和成员布局。",
         source="core.get_stack_frame",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
@@ -1365,7 +1838,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="read_struct",
-        description="读取结构体字段定义。",
+        description="读取结构体字段定义，查看成员、偏移、大小；支持本地 UDT 与托管类型。",
         source="core.read_struct",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1378,7 +1851,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="search_structs",
-        description="搜索结构体。",
+        description="搜索结构体，按结构体名筛选并查看成员数量。",
         source="core.search_structs",
         runtime=runtime,
         input_schema=_tool_input_schema(properties={"filter": _string_schema("结构体名筛选文本。")}, include_session=True),
@@ -1387,7 +1860,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="query_types",
-        description="查询类型目录。",
+        description="查询类型目录，列出本地类型/托管类型；适合查类型名、函数原型、UDT 和声明。",
         source="core.query_types",
         runtime=runtime,
         input_schema=_tool_input_schema(properties={"filter": _string_schema("类型名筛选文本。")}, include_session=True),
@@ -1396,7 +1869,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="inspect_type",
-        description="读取具体类型详情。",
+        description="读取具体类型详情，查看类型声明、成员布局、字段定义与来源。",
         source="core.inspect_type",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1409,7 +1882,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="export_functions",
-        description="导出函数。",
+        description="导出函数分析结果；支持结构化 JSON、函数原型、近似头文件，适合批量复盘、报告和继续喂给 AI。",
         source="core.export_functions",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1428,6 +1901,37 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
             format_name=_string_or_default(arguments, "format", _string_or_default(arguments, "format_name", "json")),
             limit=_int_or_default(arguments, "limit", 1000),
         ),
+    )
+    _tool(
+        registry,
+        name="export_full_analysis",
+        description="导出当前 IDB 的完整分析结果 / full analysis bundle，包含 metadata、入口点、imports、globals、strings、types、structs、functions 等，适合报告、批处理和继续喂给 AI。",
+        source="core.export_full_analysis",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "function_limit": _integer_schema("最多导出多少个函数。", minimum=1),
+                "string_limit": _integer_schema("最多导出多少条字符串。", minimum=1),
+                "global_limit": _integer_schema("最多导出多少个全局符号。", minimum=1),
+                "import_limit": _integer_schema("最多导出多少条导入。", minimum=1),
+                "type_limit": _integer_schema("最多导出多少条类型目录记录。", minimum=1),
+                "struct_limit": _integer_schema("最多导出多少条结构体记录。", minimum=1),
+                "include_decompile": _boolean_schema("函数导出中是否包含反编译伪代码。"),
+                "include_asm": _boolean_schema("函数导出中是否包含汇编文本。"),
+            },
+            include_session=True,
+        ),
+        handler=lambda core, arguments: core.export_full_analysis(
+            function_limit=_int_or_default(arguments, "function_limit", 200),
+            string_limit=_int_or_default(arguments, "string_limit", 500),
+            global_limit=_int_or_default(arguments, "global_limit", 200),
+            import_limit=_int_or_default(arguments, "import_limit", 500),
+            type_limit=_int_or_default(arguments, "type_limit", 200),
+            struct_limit=_int_or_default(arguments, "struct_limit", 100),
+            include_decompile=_bool_or_default(arguments, "include_decompile", True),
+            include_asm=_bool_or_default(arguments, "include_asm", False),
+        ),
+        input_example={"session_id": "sess-001", "function_limit": 100, "string_limit": 200, "include_asm": False},
     )
     _tool(
         registry,
@@ -1524,7 +2028,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="set_comments",
-        description="设置注释。",
+        description="设置注释，给地址、指令或函数补充中文/业务语义说明。",
         source="core.set_comments",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1538,7 +2042,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="append_comments",
-        description="追加注释。",
+        description="追加注释，在保留原注释的前提下补充更多分析说明。",
         source="core.append_comments",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1552,7 +2056,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="patch_assembly",
-        description="按汇编语句打补丁。",
+        description="修改汇编并打补丁：按汇编语句 assemble 后写回数据库，适合改指令逻辑或快速验证补丁。",
         source="core.patch_assembly",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1566,7 +2070,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="rename_symbols",
-        description="批量重命名符号。",
+        description="批量重命名符号、函数、变量，提升数据库可读性并方便后续逆向分析。",
         source="core.rename_symbols",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1622,7 +2126,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="declare_types",
-        description="声明 C 类型。",
+        description="声明 C 类型，把结构体、枚举、函数原型等声明写入本地类型库。",
         source="core.declare_types",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1650,7 +2154,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="set_types",
-        description="设置类型。",
+        description="设置类型 / 函数原型 / 变量类型，适合批量修正签名和恢复类型信息。",
         source="core.set_types",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1664,7 +2168,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="apply_types",
-        description="批量应用类型。",
+        description="批量应用类型声明，和 set_types 等价；适合批量恢复函数原型和变量类型。",
         source="core.apply_types",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1678,7 +2182,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="infer_types",
-        description="推断并写入类型。",
+        description="推断并尽量写回类型，适合恢复函数原型、字符串指针、指针链和基础整数类型。",
         source="core.infer_types",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1720,7 +2224,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="patch_bytes",
-        description="直接写入字节补丁。",
+        description="直接写入字节补丁 / 十六进制补丁，适合做 opcode 级 patch 和快速回滚。",
         source="core.patch_bytes",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1748,7 +2252,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="evaluate_python",
-        description="在 IDA 上下文执行 Python 代码。",
+        description="在 IDA 上下文执行 Python / IDAPython 代码；当现成工具不够时可做高级自定义分析。",
         source="core.evaluate_python",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1761,7 +2265,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="execute_python_file",
-        description="执行磁盘上的 Python 脚本。",
+        description="执行磁盘上的 Python / IDAPython 脚本文件，适合复用现有分析脚本。",
         source="core.execute_python_file",
         runtime=runtime,
         input_schema=_tool_input_schema(

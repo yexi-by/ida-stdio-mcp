@@ -371,6 +371,71 @@ class IdaCore:
             },
         })
 
+    def summarize_binary(
+        self,
+        *,
+        function_limit: int = 12,
+        string_limit: int = 12,
+        import_limit_per_category: int = 6,
+    ) -> JsonObject:
+        """返回更适合快速开局的样本摘要。"""
+        survey = self.survey_binary()
+        metadata = self.idb_metadata()
+        capabilities = self.capabilities()
+        statistics_value = survey.get("statistics")
+        statistics = statistics_value if isinstance(statistics_value, dict) else {}
+        quality_value = survey.get("quality")
+        quality = quality_value if isinstance(quality_value, dict) else {}
+        managed_summary_value = survey.get("managed_summary")
+        managed_summary = managed_summary_value if isinstance(managed_summary_value, dict) else {}
+
+        analysis_domain = str(metadata.get("analysis_domain", "unknown"))
+        binary_kind = str(metadata.get("binary_kind", "unknown"))
+        decompile_mode = str(capabilities.get("decompile_mode", "unknown"))
+        total_functions = self._json_int_or_default(statistics.get("total_functions"), 0)
+        total_strings = self._json_int_or_default(statistics.get("total_strings"), 0)
+
+        entrypoints = self.entrypoints()
+        interesting_functions = self._interesting_function_rows(limit=function_limit)
+        interesting_strings = self._interesting_string_rows(limit=string_limit)
+        import_summary = self._import_category_summary(limit_per_category=import_limit_per_category)
+        recommended_queries = self._recommended_binary_queries(entrypoints, interesting_functions)
+        recommended_next_tools = self._recommended_binary_tools(
+            analysis_domain=analysis_domain,
+            has_strings=bool(interesting_strings),
+        )
+
+        summary_text = (
+            f"当前样本属于 {analysis_domain} 分析域，文件类型为 {binary_kind}；"
+            f"已识别 {total_functions} 个函数、{total_strings} 个字符串，"
+            f"当前反编译模式为 {decompile_mode}。"
+        )
+        opening_moves: list[JsonValue] = [
+            "优先查看 entrypoints 与 interesting_functions，先锁定入口函数、初始化逻辑或明显的业务函数。",
+            "如果 interesting_strings 里已经出现 URL、路径、错误文案、协议字段，下一步直接用 find_string_usage 追到所属函数。",
+            "如果需要函数级深挖，继续调用 decompile_function、get_function_profile、read_struct、query_types。",
+        ]
+        if analysis_domain == "managed":
+            opening_moves.insert(0, "这是托管/.NET 样本，优先使用 decompile_function 读取 C#；若外部反编译器不可用，再看 IL/反汇编。")
+        else:
+            opening_moves.insert(0, "这是 native 样本，优先从入口点、导入分类和关键字符串切入，再决定是否继续看 Hex-Rays 伪代码或汇编。")
+
+        return self._json_object({
+            "summary": summary_text,
+            "metadata": metadata,
+            "statistics": statistics,
+            "capabilities": capabilities,
+            "quality": quality,
+            "entrypoints": entrypoints,
+            "interesting_functions": interesting_functions,
+            "interesting_strings": interesting_strings,
+            "imports": import_summary,
+            "managed_summary": managed_summary,
+            "recommended_queries": recommended_queries,
+            "recommended_next_tools": recommended_next_tools,
+            "opening_moves": opening_moves,
+        })
+
     def list_functions(self, *, filter_text: str = "", offset: int = 0, limit: int = 100) -> list[JsonObject]:
         """分页列出函数。"""
         lowered = filter_text.lower()
@@ -783,6 +848,120 @@ class IdaCore:
         next_offset = offset + limit if offset + limit < len(matched) else None
         return self._json_object({"data": matched[offset : offset + limit], "next_offset": next_offset})
 
+    def find_string_usage(
+        self,
+        *,
+        pattern: str = "",
+        addr: str = "",
+        max_strings: int = 20,
+        max_usages: int = 100,
+    ) -> JsonObject:
+        """返回字符串到函数的闭环使用点结果。"""
+        if not pattern and not addr:
+            raise ValueError("必须提供 pattern 或 addr")
+
+        matched_rows = self.list_strings(offset=0, limit=10_000)
+        if pattern:
+            lowered = pattern.lower()
+            matched_rows = [
+                row
+                for row in matched_rows
+                if lowered in str(row.get("string", "")).lower()
+            ]
+        if addr:
+            target_ea = self.parse_address(addr)
+            matched_rows = [
+                row
+                for row in matched_rows
+                if isinstance(row.get("addr"), str) and self.parse_address(str(row.get("addr"))) == target_ea
+            ]
+
+        selected_matches = matched_rows[:max_strings]
+        usages: list[JsonObject] = []
+        function_map: dict[str, JsonObject] = {}
+        usage_seen: set[tuple[str, str, str]] = set()
+
+        for row in selected_matches:
+            string_addr = str(row.get("addr", ""))
+            string_text = str(row.get("string", ""))
+            if not string_addr or not string_text:
+                continue
+
+            usage_rows = self._string_usage_rows(row)
+            for usage in usage_rows:
+                function_addr_value = usage.get("function_addr")
+                function_addr = function_addr_value if isinstance(function_addr_value, str) else ""
+                usage_addr_value = usage.get("usage_addr")
+                usage_addr = usage_addr_value if isinstance(usage_addr_value, str) else ""
+                dedupe_key = (string_addr, usage_addr, function_addr)
+                if dedupe_key in usage_seen:
+                    continue
+                usage_seen.add(dedupe_key)
+                usages.append(usage)
+                if len(usages) >= max_usages:
+                    break
+
+                if function_addr:
+                    summary = function_map.get(function_addr)
+                    if summary is None:
+                        function_name = str(usage.get("function_name", function_addr))
+                        summary = self._json_object({
+                            "addr": function_addr,
+                            "name": function_name,
+                            "prototype": self.function_signature(self.parse_address(function_addr)),
+                            "type": self._classify_function(function_addr),
+                            "use_count": 0,
+                            "strings": [],
+                        })
+                        function_map[function_addr] = summary
+                    strings_value = summary.get("strings")
+                    if isinstance(strings_value, list) and string_text not in strings_value:
+                        strings_value.append(string_text)
+                    use_count = self._json_int_or_default(summary.get("use_count"), 0)
+                    summary["use_count"] = use_count + 1
+            if len(usages) >= max_usages:
+                break
+
+        functions = sorted(
+            function_map.values(),
+            key=lambda item: (
+                self._json_int_or_default(item.get("use_count"), 0),
+                len(cast(list[JsonValue], item.get("strings", []))) if isinstance(item.get("strings"), list) else 0,
+            ),
+            reverse=True,
+        )
+
+        match_rows: list[JsonObject] = []
+        usage_count_by_string: dict[str, int] = {}
+        for usage in usages:
+            string_addr_value = usage.get("string_addr")
+            if isinstance(string_addr_value, str):
+                usage_count_by_string[string_addr_value] = usage_count_by_string.get(string_addr_value, 0) + 1
+        for row in selected_matches:
+            match_addr = str(row.get("addr", ""))
+            enriched = dict(row)
+            enriched["usage_count"] = usage_count_by_string.get(match_addr, 0)
+            match_rows.append(self._json_object(enriched))
+
+        return self._json_object({
+            "query": {
+                "pattern": pattern or None,
+                "addr": addr or None,
+            },
+            "statistics": {
+                "matched_strings": len(matched_rows),
+                "returned_strings": len(match_rows),
+                "returned_usages": len(usages),
+                "distinct_functions": len(functions),
+                "truncated_matches": len(matched_rows) > len(selected_matches),
+                "truncated_usages": len(usages) >= max_usages,
+            },
+            "matches": match_rows,
+            "usages": usages,
+            "functions": functions,
+            "recommended_next_tools": ["decompile_function", "get_function_profile", "get_xrefs_to", "export_full_analysis"],
+        })
+
     def find_bytes(self, pattern: str, *, max_hits: int = 100) -> list[JsonObject]:
         """按字节模式搜索。"""
         current = GET_MIN_EA()
@@ -1079,6 +1258,108 @@ class IdaCore:
             return [self._json_object({"format": "prototypes", "functions": functions})]
 
         return [self._json_object({"format": "json", "functions": exported})]
+
+    def export_full_analysis(
+        self,
+        *,
+        function_limit: int = 200,
+        string_limit: int = 500,
+        global_limit: int = 200,
+        import_limit: int = 500,
+        type_limit: int = 200,
+        struct_limit: int = 100,
+        include_decompile: bool = True,
+        include_asm: bool = False,
+    ) -> JsonObject:
+        """导出当前 IDB 的结构化分析总包。"""
+        summary = self.summarize_binary(
+            function_limit=min(function_limit, 12),
+            string_limit=min(string_limit, 12),
+            import_limit_per_category=6,
+        )
+        survey = self.survey_binary()
+        functions_block = self.export_functions(format_name="json", limit=function_limit)[0]
+        raw_functions = functions_block.get("functions")
+        functions = cast(list[JsonObject], raw_functions) if isinstance(raw_functions, list) else []
+
+        function_items: list[JsonObject] = []
+        for row in functions:
+            exported = dict(row)
+            if not include_decompile:
+                exported.pop("code", None)
+                exported.pop("decompile_status", None)
+                exported.pop("decompile_representation", None)
+                exported.pop("warnings", None)
+            if not include_asm:
+                exported.pop("asm", None)
+            function_items.append(self._json_object(exported))
+
+        imports = self.list_imports(offset=0, limit=import_limit)
+        globals_list = self.list_globals(offset=0, limit=global_limit)
+        strings = self.list_strings(offset=0, limit=string_limit)
+        all_types = self.query_types()
+        all_structs = self.search_structs()
+        statistics_value = survey.get("statistics")
+        statistics = statistics_value if isinstance(statistics_value, dict) else {}
+        total_functions = self._json_int_or_default(statistics.get("total_functions"), len(function_items))
+        total_strings = self._json_int_or_default(statistics.get("total_strings"), len(strings))
+
+        return self._json_object({
+            "bundle_format": "full_analysis_v1",
+            "metadata": self.idb_metadata(),
+            "capabilities": self.capabilities(),
+            "summary": summary,
+            "survey": survey,
+            "entrypoints": self.entrypoints(),
+            "imports": {
+                "total": len(imports),
+                "limit": import_limit,
+                "truncated": len(imports) >= import_limit,
+                "items": imports,
+                "categories": self._categorize_imports(),
+            },
+            "globals": {
+                "total": len(globals_list),
+                "limit": global_limit,
+                "truncated": len(globals_list) >= global_limit,
+                "items": globals_list,
+            },
+            "strings": {
+                "total_estimate": total_strings,
+                "limit": string_limit,
+                "truncated": total_strings > len(strings),
+                "items": strings,
+            },
+            "types": {
+                "total": len(all_types),
+                "limit": type_limit,
+                "truncated": len(all_types) > type_limit,
+                "items": all_types[:type_limit],
+            },
+            "structs": {
+                "total": len(all_structs),
+                "limit": struct_limit,
+                "truncated": len(all_structs) > struct_limit,
+                "items": all_structs[:struct_limit],
+            },
+            "functions": {
+                "format": "json",
+                "total_estimate": total_functions,
+                "limit": function_limit,
+                "truncated": total_functions > len(function_items),
+                "include_decompile": include_decompile,
+                "include_asm": include_asm,
+                "items": function_items,
+            },
+            "recommended_next_tools": [
+                "decompile_function",
+                "get_function_profile",
+                "find_string_usage",
+                "read_struct",
+                "query_types",
+                "patch_assembly",
+            ],
+        })
 
     def build_callgraph(self, items: list[str], *, max_depth: int = 3) -> JsonObject:
         """构建调用图。"""
@@ -2444,6 +2725,14 @@ class IdaCore:
         """读取对象整数属性。"""
         return int(getattr(value, name))
 
+    def _json_int_or_default(self, value: JsonValue | None, default: int = 0) -> int:
+        """把 JSON 数值安全收窄为整数。"""
+        if isinstance(value, bool):
+            return default
+        if isinstance(value, int):
+            return value
+        return default
+
     def _match_ea(self, match: JsonObject) -> int:
         value = match.get("ea")
         if not isinstance(value, int):
@@ -2515,6 +2804,286 @@ class IdaCore:
         for key in ("crypto", "network", "file_io", "process", "registry", "other"):
             buckets.setdefault(key, [])
         return self._json_object(dict(buckets))
+
+    def _interesting_function_rows(self, *, limit: int = 12, seed_limit: int = 160) -> list[JsonObject]:
+        """选出更值得优先逆向的函数摘要。"""
+        entrypoints = self.entrypoints()
+        entry_names = {
+            str(item.get("name", "")).lower()
+            for item in entrypoints
+            if isinstance(item.get("name"), str)
+        }
+        entry_addrs = {
+            str(item.get("addr", ""))
+            for item in entrypoints
+            if isinstance(item.get("addr"), str)
+        }
+
+        seeds: list[tuple[int, JsonObject]] = []
+        for row in self.list_functions(limit=seed_limit):
+            if bool(row.get("is_library", False)):
+                continue
+            score = self._function_interest_seed_score(row, entry_names=entry_names, entry_addrs=entry_addrs)
+            if score <= 0:
+                continue
+            seeds.append((score, row))
+
+        seeds.sort(
+            key=lambda item: (
+                item[0],
+                self._json_int_or_default(item[1].get("size"), 0),
+                0 if str(item[1].get("name", "")).startswith("sub_") else 1,
+            ),
+            reverse=True,
+        )
+
+        detailed_rows: list[JsonObject] = []
+        seen_addrs: set[str] = set()
+        for seed_score, row in seeds[: max(limit * 3, 24)]:
+            addr_value = row.get("addr")
+            if not isinstance(addr_value, str) or addr_value in seen_addrs:
+                continue
+            seen_addrs.add(addr_value)
+            try:
+                xrefs = self.get_xrefs_to(addr_value)
+                callees = self.get_callees(addr_value)
+                func_type = self._classify_function(addr_value)
+            except Exception:
+                xrefs = []
+                callees = []
+                func_type = "unknown"
+
+            score = seed_score + min(len(xrefs), 6) * 2 + min(len(callees), 6)
+            if func_type == "complex":
+                score += 4
+            elif func_type == "wrapper":
+                score += 2
+            elif func_type == "thunk":
+                score -= 3
+
+            detailed_rows.append(
+                self._json_object({
+                    "addr": addr_value,
+                    "name": row.get("name", addr_value),
+                    "size": row.get("size", 0),
+                    "signature": row.get("signature", ""),
+                    "is_entrypoint": addr_value in entry_addrs or str(row.get("name", "")).lower() in entry_names,
+                    "xref_count": len(xrefs),
+                    "callee_count": len(callees),
+                    "type": func_type,
+                    "score": score,
+                })
+            )
+
+        detailed_rows.sort(
+            key=lambda item: (
+                self._json_int_or_default(item.get("score"), 0),
+                self._json_int_or_default(item.get("xref_count"), 0),
+                self._json_int_or_default(item.get("callee_count"), 0),
+                self._json_int_or_default(item.get("size"), 0),
+            ),
+            reverse=True,
+        )
+        return detailed_rows[:limit]
+
+    def _function_interest_seed_score(
+        self,
+        row: JsonObject,
+        *,
+        entry_names: set[str],
+        entry_addrs: set[str],
+    ) -> int:
+        """估算某个函数作为开局目标的优先级。"""
+        name = str(row.get("name", ""))
+        addr = str(row.get("addr", ""))
+        lowered = name.lower()
+        score = 0
+
+        if addr in entry_addrs or lowered in entry_names:
+            score += 20
+        if not name.startswith("sub_"):
+            score += 6
+        if any(keyword in lowered for keyword in ("main", "start", "entry", "init", "auth", "login", "check", "verify", "decrypt", "encrypt", "dispatch", "handle", "process", "flag")):
+            score += 8
+
+        size = self._json_int_or_default(row.get("size"), 0)
+        score += min(size // 64, 6)
+
+        signature = row.get("signature")
+        if isinstance(signature, str) and signature:
+            score += 2
+        if "managed_identity" in row:
+            score += 2
+        return score
+
+    def _interesting_string_rows(self, *, limit: int = 12, pool_limit: int = 2000) -> list[JsonObject]:
+        """选出更值得优先追踪的字符串。"""
+        scored_rows: list[JsonObject] = []
+        for row in self.list_strings(limit=pool_limit):
+            text_value = row.get("string")
+            if not isinstance(text_value, str) or not text_value.strip():
+                continue
+            scored = dict(row)
+            scored["score"] = self._string_interest_score(row)
+            scored_rows.append(self._json_object(scored))
+
+        scored_rows.sort(
+            key=lambda item: (
+                self._json_int_or_default(item.get("score"), 0),
+                self._json_int_or_default(item.get("xref_count"), 0),
+                self._json_int_or_default(item.get("length"), 0),
+            ),
+            reverse=True,
+        )
+        return scored_rows[:limit]
+
+    def _string_interest_score(self, row: JsonObject) -> int:
+        """估算某条字符串对逆向开局的价值。"""
+        text = str(row.get("string", ""))
+        lowered = text.lower()
+        xref_count = self._json_int_or_default(row.get("xref_count"), 0)
+        score = min(xref_count * 3, 18)
+
+        if 4 <= len(text) <= 120:
+            score += 4
+        elif len(text) > 200:
+            score -= 2
+
+        if any(
+            keyword in lowered
+            for keyword in (
+                "http",
+                "https",
+                "socket",
+                "token",
+                "password",
+                "login",
+                "error",
+                "fail",
+                "flag",
+                ".dll",
+                ".exe",
+                ".sys",
+                ".so",
+                ".json",
+                ".xml",
+                "\\",
+                "/",
+                "%s",
+                "%d",
+            )
+        ):
+            score += 8
+
+        if text.count(" ") >= 2:
+            score += 2
+        if sum(1 for ch in text if ch.isalnum()) < 3:
+            score -= 6
+        if len(set(text)) <= 2:
+            score -= 6
+        return score
+
+    def _import_category_summary(self, *, limit_per_category: int = 6) -> JsonObject:
+        """把导入分类收敛为更适合摘要阅读的结构。"""
+        categorized = self._categorize_imports()
+        summary: JsonObject = {}
+        for category, value in categorized.items():
+            items = cast(list[JsonObject], value) if isinstance(value, list) else []
+            summary[category] = self._json_object({
+                "count": len(items),
+                "examples": items[:limit_per_category],
+            })
+        return self._json_object(summary)
+
+    def _recommended_binary_queries(
+        self,
+        entrypoints: list[JsonObject],
+        interesting_functions: list[JsonObject],
+    ) -> list[JsonValue]:
+        """给出下一步最值得查看的函数查询词。"""
+        results: list[JsonValue] = []
+        seen: set[str] = set()
+        for row in [*entrypoints, *interesting_functions]:
+            name_value = row.get("name")
+            addr_value = row.get("addr")
+            query = ""
+            if isinstance(name_value, str) and name_value and not name_value.startswith("sub_"):
+                query = name_value
+            elif isinstance(addr_value, str):
+                query = addr_value
+            if query and query not in seen:
+                seen.add(query)
+                results.append(query)
+            if len(results) >= 8:
+                break
+        return results
+
+    def _recommended_binary_tools(self, *, analysis_domain: str, has_strings: bool) -> list[JsonValue]:
+        """返回摘要场景下推荐的下一跳工具。"""
+        tools: list[str] = ["list_functions", "decompile_function", "get_function_profile"]
+        if has_strings:
+            tools.append("find_string_usage")
+        if analysis_domain == "managed":
+            tools.extend(["query_types", "inspect_type", "export_full_analysis"])
+        else:
+            tools.extend(["read_struct", "query_types", "export_full_analysis"])
+
+        deduped: list[JsonValue] = []
+        seen: set[str] = set()
+        for name in tools:
+            if name in seen:
+                continue
+            seen.add(name)
+            deduped.append(name)
+        return deduped
+
+    def _string_usage_rows(self, row: JsonObject) -> list[JsonObject]:
+        """把单条字符串记录展开为使用点列表。"""
+        addr_value = row.get("addr")
+        string_text = str(row.get("string", ""))
+        source = str(row.get("source", ""))
+        if not isinstance(addr_value, str):
+            return []
+
+        if source == "managed_il_text":
+            function_name = row.get("function")
+            func = GET_FUNC(self.parse_address(addr_value))
+            function_addr = hex(func.start_ea) if func is not None else None
+            return [
+                self._json_object({
+                    "string_addr": addr_value,
+                    "string": string_text,
+                    "string_source": source,
+                    "usage_addr": addr_value,
+                    "usage_kind": "inline_literal",
+                    "xref_type": "inline_literal",
+                    "instruction": self.line_text(self.parse_address(addr_value)),
+                    "function_addr": function_addr,
+                    "function_name": function_name if isinstance(function_name, str) else (self.best_name(func.start_ea) if func is not None else None),
+                })
+            ]
+
+        string_ea = self.parse_address(addr_value)
+        results: list[JsonObject] = []
+        for ref in idautils.XrefsTo(string_ea):
+            usage_addr = hex(ref.frm)
+            func = GET_FUNC(ref.frm)
+            function_addr = hex(func.start_ea) if func is not None else None
+            function_name = self.best_name(func.start_ea) if func is not None else None
+            results.append(
+                self._json_object({
+                    "string_addr": addr_value,
+                    "string": string_text,
+                    "string_source": source,
+                    "usage_addr": usage_addr,
+                    "usage_kind": "xref",
+                    "xref_type": self.xref_type_name(ref.type),
+                    "instruction": self.line_text(ref.frm),
+                    "function_addr": function_addr,
+                    "function_name": function_name,
+                })
+            )
+        return results
 
     def _type_row(self, name: str, tif: ida_typeinf.tinfo_t) -> JsonObject:
         return self._json_object({

@@ -156,6 +156,15 @@ class HeadlessToolTests(unittest.TestCase):
         survey = self._call_tool("survey_binary", {"session_id": "elf-main"})
         self.assertIn(survey["status"], ("ok", "degraded"))
 
+        summary = self._call_tool("summarize_binary", {"session_id": "elf-main", "function_limit": 8, "string_limit": 8})
+        self.assertEqual(summary["status"], "ok")
+        summary_data = summary["data"]
+        self.assertIsInstance(summary_data, dict)
+        assert isinstance(summary_data, dict)
+        self.assertIn("interesting_functions", summary_data)
+        self.assertIn("interesting_strings", summary_data)
+        self.assertIn("recommended_next_tools", summary_data)
+
         functions = self._call_tool("list_functions", {"filter": "main", "count": 20, "session_id": "elf-main"})
         self.assertEqual(functions["status"], "ok")
 
@@ -170,6 +179,25 @@ class HeadlessToolTests(unittest.TestCase):
 
         strings_page = self._call_tool("list_strings", {"limit": 20, "session_id": "elf-main"})
         self.assertEqual(strings_page["status"], "ok")
+        strings_data = strings_page["data"]
+        self.assertIsInstance(strings_data, list)
+        assert isinstance(strings_data, list)
+        self.assertGreater(len(strings_data), 0)
+        first_string = strings_data[0]
+        self.assertIsInstance(first_string, dict)
+        assert isinstance(first_string, dict)
+        first_string_addr = first_string.get("addr")
+        self.assertIsInstance(first_string_addr, str)
+        assert isinstance(first_string_addr, str)
+
+        string_usage = self._call_tool("find_string_usage", {"addr": first_string_addr, "max_usages": 20, "session_id": "elf-main"})
+        self.assertEqual(string_usage["status"], "ok")
+        string_usage_data = string_usage["data"]
+        self.assertIsInstance(string_usage_data, dict)
+        assert isinstance(string_usage_data, dict)
+        self.assertIn("matches", string_usage_data)
+        self.assertIn("usages", string_usage_data)
+        self.assertIn("functions", string_usage_data)
 
         comment = self._call_tool(
             "set_comments",
@@ -307,6 +335,19 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertEqual(proto_first.get("format"), "prototypes")
         proto_functions = proto_first.get("functions")
         self.assertIsInstance(proto_functions, list)
+
+        full_export = self._call_tool(
+            "export_full_analysis",
+            {"session_id": "elf-main", "function_limit": 5, "string_limit": 20, "include_asm": False},
+        )
+        self.assertEqual(full_export["status"], "ok")
+        full_export_data = full_export["data"]
+        self.assertIsInstance(full_export_data, dict)
+        assert isinstance(full_export_data, dict)
+        self.assertEqual(full_export_data.get("bundle_format"), "full_analysis_v1")
+        self.assertIn("summary", full_export_data)
+        self.assertIn("functions", full_export_data)
+        self.assertIn("types", full_export_data)
 
     def test_extended_type_stack_patch_and_trace_tools(self) -> None:
         self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "elf-extended"})
