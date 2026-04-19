@@ -287,12 +287,6 @@ default_page_size = 100
 max_page_size = 1000
 ```
 
-运行时副作用（例如 PDB/符号缓存、占位文件）会统一写入项目内的：
-
-- `.runtime/symbol-cache/`
-
-不会再直接散落到仓库根目录；`.runtime/` 已默认加入 `.gitignore`。
-
 ## 开发
 
 ```powershell
