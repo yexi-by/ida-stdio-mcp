@@ -143,6 +143,8 @@ Hex-Rays 可用时，`decompile_function` 与 `explain_function` 返回 C 伪代
 
 大型 native 样本默认采用轻量打开：IDA loader、导入表、PDB/调试符号与 working IDB 会正常加载和保存，但 `open_target` 不等待全库自动分析队列清空。需要等待全库自动分析时可显式传入 `run_auto_analysis=true`；对 UE、Chrome、游戏客户端等大型目标，推荐保持默认值，并由 `triage_binary`、`explain_function`、`investigate_string` 对具体目标触发定点分析。
 
+`open_target` 的 `metadata` 字段会返回打开结果报告，包括 `database_loaded`、`working_idb_ready`、`auto_analysis_waited`、`analysis_completeness`、PDB 路径、同目录 PDB 列表、打开耗时、working IDB 大小、入口数量和 segment 预览。AI Agent 应根据这些字段判断当前结果可信边界。
+
 ## Unity/.NET 分析
 
 1. 使用 `open_target` 打开 `Assembly-CSharp.dll` 或其他托管程序集。

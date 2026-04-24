@@ -11,13 +11,15 @@ from time import perf_counter
 
 from .errors import SessionNotFoundError, SessionRequiredError
 from .ida_bootstrap import ensure_ida_environment
-from .models import BinarySummary
+from .models import BinarySummary, JsonObject, JsonValue
 from .runtime_workspace import get_runtime_workspace_paths, symbol_cache_scope
 
 ensure_ida_environment()
 
 import ida_auto  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_entry  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
 import ida_loader  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
+import ida_segment  # pyright: ignore[reportMissingModuleSource]  # IDA 仅提供存根与运行时模块，这里按边界导入。
 import idapro
 from loguru import logger
 
@@ -40,6 +42,7 @@ class IdaSession:
     last_active_tool: str = ""
     recent_targets: list[str] = field(default_factory=list)
     recommended_next_tools: list[str] = field(default_factory=lambda: ["triage_binary"])
+    metadata: JsonObject = field(default_factory=dict)
 
     def to_summary(
         self,
@@ -50,8 +53,8 @@ class IdaSession:
     ) -> BinarySummary:
         """把会话转换成统一摘要。
 
-        会话管理器只负责数据库生命周期，不直接维护样本 survey 元数据。
-        因此这里的 `metadata` 固定为空对象，由上层真正读取当前数据库后再补充。
+        `metadata` 记录打开阶段已经真实完成的事项，以及未等待全库
+        自动分析时的可信边界，避免 AI 把轻量打开误解成完整分析完成。
         """
         return {
             "session_id": self.session_id,
@@ -61,7 +64,7 @@ class IdaSession:
             "created_at": self.created_at.isoformat(),
             "last_accessed": self.last_accessed.isoformat(),
             "is_analyzing": self.is_analyzing,
-            "metadata": {},
+            "metadata": dict(self.metadata),
             "is_active": is_active,
             "is_current_context": is_current_context,
             "bound_contexts": bound_contexts,
@@ -133,18 +136,27 @@ class SessionManager:
                 resolved,
                 "full-auto-analysis" if run_auto_analysis else "light-open",
             )
-            self._open_database_locked(resolved, run_auto_analysis=run_auto_analysis)
+            source_open_duration_ms = self._open_database_locked(resolved, run_auto_analysis=run_auto_analysis)
             working_idb_path = self._working_idb_path(created_id)
             working_idb_path.parent.mkdir(parents=True, exist_ok=True)
-            self._save_database_locked(working_idb_path)
+            save_duration_ms = self._save_database_locked(working_idb_path)
             idapro.close_database(False)
-            self._open_database_locked(working_idb_path, run_auto_analysis=False)
+            working_open_duration_ms = self._open_database_locked(working_idb_path, run_auto_analysis=False)
+            metadata = self._build_open_metadata_locked(
+                source_path=resolved,
+                working_idb_path=working_idb_path,
+                run_auto_analysis=run_auto_analysis,
+                source_open_duration_ms=source_open_duration_ms,
+                save_duration_ms=save_duration_ms,
+                working_open_duration_ms=working_open_duration_ms,
+            )
             session = IdaSession(
                 session_id=created_id,
                 source_path=resolved,
                 working_idb_path=working_idb_path,
                 is_analyzing=run_auto_analysis,
                 saved_path=str(working_idb_path),
+                metadata=metadata,
             )
             self._sessions[created_id] = session
             if isolated_contexts and context_id is not None:
@@ -155,6 +167,8 @@ class SessionManager:
                 logger.info("开始等待 IDA 自动分析：session_id={} path={}", created_id, resolved)
                 ida_auto.auto_wait()
                 session.is_analyzing = False
+                session.metadata["analysis_wait_duration_ms"] = round((perf_counter() - analysis_started_at) * 1000.0, 3)
+                session.metadata["analysis_completeness"] = "full_auto_analysis_waited"
                 logger.info(
                     "IDA 自动分析完成：session_id={} duration_ms={:.1f} path={}",
                     created_id,
@@ -300,7 +314,7 @@ class SessionManager:
         self._open_database_locked(session.working_idb_path, run_auto_analysis=False)
         self._active_session_id = session_id
 
-    def _open_database_locked(self, input_path: Path, *, run_auto_analysis: bool) -> None:
+    def _open_database_locked(self, input_path: Path, *, run_auto_analysis: bool) -> float:
         if self._active_session_id is not None:
             idapro.close_database(True)
             self._active_session_id = None
@@ -316,17 +330,95 @@ class SessionManager:
                     f"打开数据库失败：{input_path}{sidecar_hint}；"
                     "如果上一次打开被中断，建议先备份或清理这些伴生文件后重试"
                 )
+        duration_ms = (perf_counter() - started_at) * 1000.0
         logger.info(
             "IDA 数据库打开完成：duration_ms={:.1f} path={}",
-            (perf_counter() - started_at) * 1000.0,
+            duration_ms,
             input_path,
         )
+        return duration_ms
 
     @staticmethod
-    def _save_database_locked(path: Path) -> None:
+    def _save_database_locked(path: Path) -> float:
         """保存当前 IDB 到会话工作库，避免隐式污染原始样本旁的数据库。"""
+        started_at = perf_counter()
         if not ida_loader.save_database(str(path), 0):
             raise RuntimeError(f"保存工作 IDB 失败：{path}")
+        duration_ms = (perf_counter() - started_at) * 1000.0
+        logger.info("工作 IDB 保存完成：duration_ms={:.1f} path={}", duration_ms, path)
+        return duration_ms
+
+    def _build_open_metadata_locked(
+        self,
+        *,
+        source_path: Path,
+        working_idb_path: Path,
+        run_auto_analysis: bool,
+        source_open_duration_ms: float,
+        save_duration_ms: float,
+        working_open_duration_ms: float,
+    ) -> JsonObject:
+        """生成给 AI 使用的真实打开结果报告。"""
+        exact_pdb = source_path.with_suffix(".pdb")
+        analysis_limitations: list[JsonValue] = []
+        if not run_auto_analysis:
+            analysis_limitations.append("未等待全库自动分析队列清空；函数级和字符串级工具会按目标继续触发定点分析。")
+        sibling_pdb_files: list[JsonValue] = [name for name in self._sibling_pdb_names(source_path)]
+        return {
+            "open_mode": "full_auto_analysis" if run_auto_analysis else "light_open",
+            "database_loaded": True,
+            "working_idb_ready": working_idb_path.exists(),
+            "auto_analysis_waited": run_auto_analysis,
+            "analysis_completeness": "full_auto_analysis_waited" if run_auto_analysis else "loader_symbols_and_working_idb_ready",
+            "analysis_limitations": analysis_limitations,
+            "source_size_bytes": source_path.stat().st_size,
+            "working_idb_size_bytes": working_idb_path.stat().st_size if working_idb_path.exists() else 0,
+            "source_open_duration_ms": round(source_open_duration_ms, 3),
+            "working_idb_save_duration_ms": round(save_duration_ms, 3),
+            "working_idb_open_duration_ms": round(working_open_duration_ms, 3),
+            "exact_pdb_path": str(exact_pdb) if exact_pdb.exists() else "",
+            "sibling_pdb_files": sibling_pdb_files,
+            "database_snapshot": self._database_snapshot_locked(),
+            "trust_contract": "样本、调试符号和 working IDB 已真实加载；未等待全库自动分析时，后续结论应来自 triage/explain/investigate 的定点结果。",
+        }
+
+    @staticmethod
+    def _database_snapshot_locked() -> JsonObject:
+        """读取无需全库自动分析即可稳定获得的 IDB 快照。"""
+        segment_count = int(ida_segment.get_segm_qty())
+        segments: list[JsonValue] = []
+        for index in range(min(segment_count, 16)):
+            segment = ida_segment.getnseg(index)
+            if segment is None:
+                continue
+            name = ida_segment.get_segm_name(segment)
+            start = int(segment.start_ea)
+            end = int(segment.end_ea)
+            segments.append(
+                {
+                    "name": name,
+                    "start": hex(start),
+                    "end": hex(end),
+                    "size": end - start,
+                }
+            )
+        return {
+            "entry_count": int(ida_entry.get_entry_qty()),
+            "segment_count": segment_count,
+            "segments_preview": segments,
+        }
+
+    @staticmethod
+    def _sibling_pdb_names(source_path: Path) -> list[str]:
+        """列出同目录 PDB，帮助 AI 判断调试符号上下文。"""
+        if not source_path.parent.exists():
+            return []
+        names: list[str] = []
+        for candidate in source_path.parent.glob("*.pdb"):
+            names.append(candidate.name)
+            if len(names) >= 12:
+                break
+        return names
 
     @staticmethod
     def _working_idb_path(session_id: str) -> Path:
