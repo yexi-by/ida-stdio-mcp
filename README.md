@@ -13,6 +13,7 @@ ida-stdio-mcp 是面向 AI Agent 的 IDA Pro 9.3+ MCP 服务。服务通过 IDA 
 - Native 与 Unity/.NET 双场景：native 优先 Hex-Rays，托管程序集优先 `ilspycmd` C# 反编译。
 - MCP prompts：内置 native triage、managed triage、字符串牵引、microcode 调查模板。
 - 结构化报告：`export_report` 输出便于 AI 复盘的 JSON 分析包。
+- 轻量打开策略：`open_target` 默认完整加载样本和调试符号并创建 working IDB，不等待全库自动分析完成。
 
 ## 环境要求
 
@@ -120,7 +121,7 @@ get_workspace_state -> open_target -> triage_binary -> investigate_string / expl
 | 工具 | 用途 |
 | --- | --- |
 | `get_workspace_state` | 查看 runtime、当前 session、working IDB、最近目标与推荐下一步 |
-| `open_target` | 打开样本并创建隔离 working IDB |
+| `open_target` | 完整加载样本和调试符号，创建隔离 working IDB；默认不等待全库自动分析 |
 | `triage_binary` | 生成入口点、关键函数、导入分类、字符串索引状态与托管质量摘要 |
 | `investigate_string` | 从错误文案、URL、路径、协议字段或字符串地址追到使用点和所属函数 |
 | `explain_function` | 聚合函数画像、伪代码或 C#、调用关系、字符串、常量与可选 microcode 线索 |
@@ -139,6 +140,8 @@ get_workspace_state -> open_target -> triage_binary -> investigate_string / expl
 5. 需要交付结果时调用 `export_report`。
 
 Hex-Rays 可用时，`decompile_function` 与 `explain_function` 返回 C 伪代码。缺少 Hex-Rays 时，服务返回汇编降级结果。
+
+大型 native 样本默认采用轻量打开：IDA loader、导入表、PDB/调试符号与 working IDB 会正常加载和保存，但 `open_target` 不等待全库自动分析队列清空。需要等待全库自动分析时可显式传入 `run_auto_analysis=true`；对 UE、Chrome、游戏客户端等大型目标，推荐保持默认值，并由 `triage_binary`、`explain_function`、`investigate_string` 对具体目标触发定点分析。
 
 ## Unity/.NET 分析
 

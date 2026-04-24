@@ -63,9 +63,12 @@ def _integer_schema(description: str, *, minimum: int | None = None) -> JsonObje
     return schema
 
 
-def _boolean_schema(description: str) -> JsonObject:
+def _boolean_schema(description: str, *, default: bool | None = None) -> JsonObject:
     """构造布尔参数定义。"""
-    return {"type": "boolean", "description": description}
+    schema: JsonObject = {"type": "boolean", "description": description}
+    if default is not None:
+        schema["default"] = default
+    return schema
 
 
 def _array_schema(description: str, items: JsonObject, *, min_items: int | None = None) -> JsonObject:
@@ -679,7 +682,7 @@ def _management_tools(
             raw_path = _require_string(arguments, "path")
             summary = runtime.open_target(
                 Path(raw_path),
-                run_auto_analysis=_bool_or_default(arguments, "run_auto_analysis", True),
+                run_auto_analysis=_bool_or_default(arguments, "run_auto_analysis", False),
                 session_id=_string_or_default(arguments, "session_id", "") or None,
                 context_id=_context_id(arguments),
             )
@@ -862,7 +865,10 @@ def _management_tools(
         schema=_tool_input_schema(
             properties={
                 "path": _string_schema("二进制文件路径。"),
-                "run_auto_analysis": _boolean_schema("是否在打开后等待自动分析。默认 true；大型样本可传 false。"),
+                "run_auto_analysis": _boolean_schema(
+                    "是否在打开后等待全库自动分析完成。默认 false；大型样本保持 false，后续工具按需做定点分析。",
+                    default=False,
+                ),
             },
             required=("path",),
             include_session=True,
@@ -870,7 +876,7 @@ def _management_tools(
         handler=open_target_handler,
         requires_session=False,
         empty_state_behavior="无需现有会话；成功后返回绑定会话和工作 IDB 路径。",
-        input_example={"path": "D:/samples/sample.exe", "run_auto_analysis": True, "session_id": "sess-001"},
+        input_example={"path": "D:/samples/sample.exe", "run_auto_analysis": False, "session_id": "sess-001"},
     )
     register_management_tool(
         name="triage_binary",

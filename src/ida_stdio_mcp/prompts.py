@@ -92,7 +92,7 @@ def build_prompt_registry() -> PromptRegistry:
 
 固定顺序：
 1. 调用 get_workspace_state，确认当前状态。
-2. 如果未打开样本，调用 open_target 打开：$target_path。
+2. 如果未打开样本，调用 open_target 打开：$target_path；大型 native/UE 样本保持 run_auto_analysis=false。
 3. 调用 triage_binary 获取入口点、关键函数、导入分类和字符串索引状态。
 4. 选择最可疑的字符串或函数，调用 investigate_string 或 explain_function 深挖。
 5. 最后调用 export_report 输出可复盘摘要。
@@ -108,7 +108,7 @@ def build_prompt_registry() -> PromptRegistry:
 
 固定顺序：
 1. get_workspace_state。
-2. 如果未打开样本，open_target 打开：$target_path。
+2. 如果未打开样本，open_target 打开：$target_path；默认不等待全库自动分析。
 3. triage_binary，重点查看 managed 质量等级、命名空间、托管字符串和入口方法。
 4. 对可疑字符串调用 investigate_string，对关键方法调用 explain_function。
 5. export_report，明确标注 managed 结果质量等级和 C# 反编译来源。

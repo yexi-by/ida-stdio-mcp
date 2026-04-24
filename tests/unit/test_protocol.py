@@ -209,6 +209,11 @@ class ProtocolTests(unittest.TestCase):
             self.assertIn("inputExample", item, msg=f"{name} 缺少最小输入示例")
 
         self.assertEqual(set(schema_properties(by_name["open_target"], name="open_target")), {"path", "run_auto_analysis", "session_id"})
+        open_target_properties = schema_properties(by_name["open_target"], name="open_target")
+        run_auto_analysis_schema = expect_object(open_target_properties["run_auto_analysis"], name="open_target.run_auto_analysis")
+        self.assertIs(run_auto_analysis_schema["default"], False)
+        input_example = expect_object(by_name["open_target"]["inputExample"], name="open_target.inputExample")
+        self.assertIs(input_example["run_auto_analysis"], False)
         self.assertEqual(
             set(schema_properties(by_name["triage_binary"], name="triage_binary")),
             {"function_limit", "string_limit", "import_limit_per_category", "include_strings", "session_id"},

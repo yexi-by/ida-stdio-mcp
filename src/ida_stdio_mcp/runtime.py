@@ -109,11 +109,16 @@ class HeadlessRuntime:
         self,
         source_path: Path,
         *,
-        run_auto_analysis: bool = True,
+        run_auto_analysis: bool = False,
         session_id: str | None = None,
         context_id: str | None = None,
     ) -> BinarySummary:
-        """打开样本并绑定到当前工作流上下文。"""
+        """打开样本并绑定到当前工作流上下文。
+
+        默认采用与 GUI 交互体验一致的轻量打开：完整加载输入文件、
+        导入表、调试符号与工作 IDB，但不等待全库自动分析队列清空。
+        大型 UE/Chrome/游戏样本的全库分析应由后续定点工具按需触发。
+        """
         resolved_context_id = self._resolve_context_id(context_id)
         opened_session_id = self._manager.open_target(
             source_path=source_path,

@@ -95,7 +95,12 @@ class SessionManager:
         context_id: str | None = None,
         isolated_contexts: bool = False,
     ) -> str:
-        """打开样本并创建会话。"""
+        """打开样本并创建会话。
+
+        `run_auto_analysis=False` 仍然会完整执行 IDA loader 与调试符号加载，
+        并保存隔离 working IDB；它只是不等待全库自动分析完成。这样能够
+        保持 UE 等大型样本的打开体验接近 GUI，后续按函数或字符串定点分析。
+        """
         resolved = source_path.resolve()
         if not resolved.exists():
             raise FileNotFoundError(f"样本不存在：{resolved}")
@@ -122,6 +127,12 @@ class SessionManager:
             if created_id in self._sessions:
                 raise ValueError(f"会话已存在：{created_id}")
 
+            logger.info(
+                "准备创建会话：session_id={} source={} open_mode={}",
+                created_id,
+                resolved,
+                "full-auto-analysis" if run_auto_analysis else "light-open",
+            )
             self._open_database_locked(resolved, run_auto_analysis=run_auto_analysis)
             working_idb_path = self._working_idb_path(created_id)
             working_idb_path.parent.mkdir(parents=True, exist_ok=True)
