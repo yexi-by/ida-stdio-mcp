@@ -1,310 +1,193 @@
 # ida-stdio-mcp
 
-让 Agent 直接操控 IDA Pro 进行逆向分析的 MCP Server。
+ida-stdio-mcp 是面向 AI Agent 的 IDA Pro 9.3+ MCP 服务。服务通过 IDA headless runtime 提供二进制分析、函数解释、字符串牵引、托管程序集反编译、数据流追踪、报告导出、调试与受控写回能力。
 
-本项目灵感来自 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，推荐使用 IDA Pro 9.3 或 9.3sp1 的命令行模式（headless），让支持 MCP 的 Agent 客户端能够：
-
-- 打开并分析二进制文件
-- 读取样本摘要、入口点、关键函数，并按需分析字符串
-- 反编译函数、查看汇编代码
-- 搜索字符串、追踪字符串使用点、查看交叉引用
-- 重命名符号、添加注释
-- 导出结构化分析结果
-- 执行 Python 脚本
-- 调试程序
+当前 V2 特性分支：[codex/ida93-ai-state-refactor](https://github.com/yexi-by/ida-stdio-mcp/tree/codex/ida93-ai-state-refactor)
 
 ## 特性
 
-- **纯命令行运行** - 无需启动 IDA GUI，适合自动化和 CI/CD
-- **MCP 协议** - 兼容支持 MCP 的 Agent 客户端
-- **多会话支持** - 可同时打开多个二进制文件
-- **安全可控** - 写操作和调试功能默认关闭，需显式启用
-- **任务化入口** - 提供样本摘要、字符串使用点追踪、完整分析导出等高层工具
+- IDA 9.3+ runtime 校验：启动时使用 `idapro.get_library_version()` 检查版本，低于 9.3 直接失败。
+- AI 工作流工具面：默认 `slim` 只暴露高层逆向入口，降低工具选择成本。
+- 完整专家工具面：`expert` 可暴露 IDAPython、补丁、调试、microcode 实验能力。
+- 会话级工作 IDB：每个样本使用 `.runtime/sessions/<session_id>/working.i64`，原始样本保持只读输入角色。
+- Native 与 Unity/.NET 双场景：native 优先 Hex-Rays，托管程序集优先 `ilspycmd` C# 反编译。
+- MCP prompts：内置 native triage、managed triage、字符串牵引、microcode 调查模板。
+- 结构化报告：`export_report` 输出便于 AI 复盘的 JSON 分析包。
 
 ## 环境要求
 
+- Windows 或 IDA Pro 9.3+ 支持的系统
 - Python 3.11+
-- IDA Pro 9.3 或 9.3sp1（需包含 idalib）
-- [uv](https://docs.astral.sh/uv/) 包管理器
+- IDA Pro 9.3 / 9.3sp1+
+- `uv`
+- 可选：Hex-Rays Decompiler
+- 可选：`.NET` 与 `ilspycmd`，用于 Unity/.NET C# 反编译
 
-> IDA 9.2 理论上可运行，但在大型 UE Shipping 样本、相邻 PDB 和全量字符串索引场景下容易出现明显卡顿。实测 IDA 9.3 对大型 PDB 的加载更稳定，推荐作为默认环境。
+IDA 运行时可通过以下任一方式提供：
+
+- 已激活的 IDA 9.3 Python package / wheel
+- `IDADIR` 指向 IDA 9.3+ 安装目录
+- 客户端环境中可导入 `idapro`
 
 ## 安装
 
-### 1. 设置 IDA 环境变量
-
 ```powershell
-# Windows
-$env:IDADIR = "C:\Program Files\IDA Professional 9.3"
-
-# Linux/macOS
-export IDADIR="/opt/ida-9.3"
-```
-
-### 2. 安装依赖
-
-```powershell
+git clone https://github.com/yexi-by/ida-stdio-mcp.git
+cd ida-stdio-mcp
+git checkout codex/ida93-ai-state-refactor
 uv sync
-```
-
-### 3. 验证安装
-
-```powershell
 uv run ida-stdio-mcp --help
 ```
 
-## 快速开始
+如需托管程序集 C# 反编译，可安装 `ilspycmd`：
 
 ```powershell
-# 启动服务
-uv run ida-stdio-mcp
-
-# 启动时打开样本
-uv run ida-stdio-mcp path/to/sample.exe
-
-# 启用写操作和脚本执行
-uv run ida-stdio-mcp --unsafe
-
-# 启用调试器
-uv run ida-stdio-mcp --debugger
+dotnet tool install --global ilspycmd
 ```
 
-## 配置 Agent 客户端
+## Codex MCP 配置
 
-当前主流 MCP 客户端通常使用 **JSON 配置** 或 **TOML 配置**。以下示例使用占位符：
-
-- `<repo-root>`：本项目所在的绝对路径
-- `<ida-dir>`：IDA 安装目录
-- `<sample-path>`：可选，启动时自动打开的样本路径
-
-### JSON 配置格式
-
-**基础配置：**
-
-```json
-{
-  "mcpServers": {
-    "ida-stdio-mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp"],
-      "env": {
-        "IDADIR": "<ida-dir>"
-      }
-    }
-  }
-}
-```
-
-**启动时自动加载样本：**
-
-```json
-{
-  "mcpServers": {
-    "ida-stdio-mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp", "<sample-path>"],
-      "env": {
-        "IDADIR": "<ida-dir>"
-      }
-    }
-  }
-}
-```
-
-**启用写操作与调试能力：**
-
-```json
-{
-  "mcpServers": {
-    "ida-stdio-mcp": {
-      "command": "uv",
-      "args": ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp", "--unsafe", "--debugger"],
-      "env": {
-        "IDADIR": "<ida-dir>"
-      }
-    }
-  }
-}
-```
-
-### TOML 配置格式
-
-**基础配置：**
+以下配置开启最大能力，适合本地可信环境中的 Codex 或高级 Agent。请将 `<UV_PATH>`、`<REPO_PATH>` 和 `<IDA_INSTALL_DIR>` 替换为本机实际路径。
 
 ```toml
-[mcpServers.ida-stdio-mcp]
-command = "uv"
-args = ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp"]
+[mcp_servers.ida-stdio-mcp]
+command = '<UV_PATH>'
+args = [
+    "--directory",
+    '<REPO_PATH>',
+    "run",
+    "--no-sync",
+    "python",
+    "-m",
+    "ida_stdio_mcp",
+    "--unsafe",
+    "--debugger",
+    "--isolated-contexts",
+    "--tool-surface",
+    "expert",
+]
+startup_timeout_sec = 240
+tool_timeout_sec = 1800
 
-[mcpServers.ida-stdio-mcp.env]
-IDADIR = "<ida-dir>"
+[mcp_servers.ida-stdio-mcp.env]
+IDADIR = '<IDA_INSTALL_DIR>'
 ```
 
-**启动时自动加载样本：**
+面向普通 MCP 客户端时建议使用默认 `slim` 工具面：
 
 ```toml
-[mcpServers.ida-stdio-mcp]
-command = "uv"
-args = ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp", "<sample-path>"]
-
-[mcpServers.ida-stdio-mcp.env]
-IDADIR = "<ida-dir>"
+args = [
+    "--directory",
+    '<REPO_PATH>',
+    "run",
+    "--no-sync",
+    "python",
+    "-m",
+    "ida_stdio_mcp",
+    "--tool-surface",
+    "slim",
+]
 ```
 
-**启用写操作与调试能力：**
+## 工具面
 
-```toml
-[mcpServers.ida-stdio-mcp]
-command = "uv"
-args = ["run", "--directory", "<repo-root>", "--no-sync", "ida-stdio-mcp", "--unsafe", "--debugger"]
+| 工具面 | 适用场景 | 能力范围 |
+| --- | --- | --- |
+| `slim` | 默认自主逆向工作流 | 高层工作区、打开样本、triage、字符串牵引、函数解释、数据流、报告、保存、关闭 |
+| `full` | 精细分析与结构化查询 | 暴露函数、字符串、导入、xref、类型、结构体、字节、调用图等底层工具 |
+| `expert` | 高级本地 Agent 与实验分析 | 在 full 基础上暴露 IDAPython、调试、补丁与 microcode 实验能力 |
 
-[mcpServers.ida-stdio-mcp.env]
-IDADIR = "<ida-dir>"
-```
+危险能力由硬门控控制：
 
-## 命令行参数
+| 参数 | 启用能力 |
+| --- | --- |
+| `--unsafe` | 写回、补丁、IDAPython、执行脚本、microcode mutation |
+| `--debugger` | 断点、单步、继续、寄存器、调试内存读写 |
+| `--tool-surface expert` | 实验性 expert 工具 |
 
-| 参数 | 说明 |
-|------|------|
-| `<binary_path>` | 启动时自动打开的二进制文件 |
-| `--config <path>` | 配置文件路径，默认 `setting.toml` |
-| `--unsafe` | 启用写操作、符号重命名、Python 执行等 |
-| `--debugger` | 启用调试器功能 |
-| `--profile <path>` | 工具白名单配置 |
-| `--isolated-contexts` | 多 agent 隔离模式 |
-
-## 工具列表
-
-运行时工具集分为公共读工具、`--unsafe` 写工具和 `--debugger` 调试工具三层。常见逆向工作流可以直接从 `describe_capabilities`、`summarize_binary`、`find_string_usage`、`export_full_analysis` 进入。
-
-### 会话管理
-
-| 工具 | 说明 |
-|------|------|
-| `open_binary` | 打开二进制文件 |
-| `close_binary` | 关闭文件 |
-| `list_binaries` | 列出已打开的文件 |
-| `switch_binary` | 切换当前活动文件 |
-| `save_binary` | 保存 IDB 数据库 |
-
-### 信息查询
-
-| 工具 | 说明 |
-|------|------|
-| `describe_capabilities` | 返回工具目录、能力矩阵、门控状态与推荐入口 |
-| `survey_binary` | 文件概览：架构、段、入口点 |
-| `summarize_binary` | 样本摘要：入口点、关键函数、导入分类、推荐下一步；默认不构建全量字符串索引 |
-| `list_functions` | 列出所有函数 |
-| `get_function` | 获取函数详情 |
-| `decompile_function` | 反编译函数（native 返回伪代码，.NET 返回 C#） |
-| `disassemble_function` | 反汇编函数 |
-| `list_imports` | 导入表 |
-| `list_globals` | 全局变量 |
-| `list_strings` | 字符串列表 |
-| `get_xrefs_to` | 交叉引用 |
-| `read_struct` | 结构体定义 |
-
-### 搜索功能
-
-| 工具 | 说明 |
-|------|------|
-| `find_strings` | 搜索字符串 |
-| `find_string_usage` | 按字符串或字符串地址追踪使用点，返回字符串、xref/引用点、所属函数 |
-| `find_bytes` | 搜索字节序列 |
-| `search_regex` | 正则搜索 |
-
-### 写操作（需 `--unsafe`）
-
-| 工具 | 说明 |
-|------|------|
-| `rename_symbols` | 重命名函数/变量 |
-| `set_comments` | 添加注释 |
-| `patch_bytes` | 修改字节 |
-| `declare_types` | 定义数据类型 |
-| `evaluate_python` | 执行 Python 代码 |
-
-### 调试器（需 `--debugger`）
-
-| 工具 | 说明 |
-|------|------|
-| `debug_start` | 启动调试 |
-| `debug_step_into` | 单步进入 |
-| `debug_step_over` | 单步跳过 |
-| `debug_continue` | 继续执行 |
-| `debug_registers` | 查看寄存器 |
-| `debug_read_memory` | 读取内存 |
-
-### 导出与批处理
-
-| 工具 | 说明 |
-|------|------|
-| `export_functions` | 导出函数级分析结果，支持 JSON、原型列表、近似头文件 |
-| `export_full_analysis` | 导出当前 IDB 的结构化分析总包，包含 metadata、entrypoints、imports、globals、strings、types、structs、functions |
+microcode mutation 需要同时启用 `--unsafe --tool-surface expert`。
 
 ## 推荐工作流
 
-### 单样本开局
+AI Agent 使用 V2 时建议遵循固定顺序：
 
 ```text
-open_binary -> summarize_binary -> list_functions / find_string_usage -> decompile_function / read_struct / query_types
+get_workspace_state -> open_target -> triage_binary -> investigate_string / explain_function -> export_report
 ```
 
-`summarize_binary` 默认走轻量路径，不会主动触发 IDA 的全量字符串索引。需要字符串时，优先用 `find_string_usage` 定点查；确实要扫字符串列表时，再显式调用 `list_strings` 或为摘要传入 `include_strings=true`。
+常用高层工具：
 
-### 字符串驱动的定位流程
+| 工具 | 用途 |
+| --- | --- |
+| `get_workspace_state` | 查看 runtime、当前 session、working IDB、最近目标与推荐下一步 |
+| `open_target` | 打开样本并创建隔离 working IDB |
+| `triage_binary` | 生成入口点、关键函数、导入分类、字符串索引状态与托管质量摘要 |
+| `investigate_string` | 从错误文案、URL、路径、协议字段或字符串地址追到使用点和所属函数 |
+| `explain_function` | 聚合函数画像、伪代码或 C#、调用关系、字符串、常量与可选 microcode 线索 |
+| `trace_input_to_check` | 围绕输入、鉴权、路径或协议字段做轻量数据流追踪 |
+| `decompile_function` | 直接读取单个函数的高层表示 |
+| `export_report` | 导出结构化分析报告 |
+| `save_workspace` | 保存当前 working IDB，或显式导出到指定路径 |
+| `close_target` | 关闭当前或指定 session |
+
+## Native 分析
+
+1. 使用 `open_target` 打开 ELF、PE、Mach-O 等 native 样本。
+2. 使用 `triage_binary` 查看入口点、导入分类、关键函数和字符串索引状态。
+3. 对入口函数、校验函数或高 xref 函数调用 `explain_function`。
+4. 对错误文案、路径、URL、协议字段调用 `investigate_string`。
+5. 需要交付结果时调用 `export_report`。
+
+Hex-Rays 可用时，`decompile_function` 与 `explain_function` 返回 C 伪代码。缺少 Hex-Rays 时，服务返回汇编降级结果。
+
+## Unity/.NET 分析
+
+1. 使用 `open_target` 打开 `Assembly-CSharp.dll` 或其他托管程序集。
+2. 使用 `triage_binary` 查看 managed summary、类型目录、关键方法和 C# 反编译状态。
+3. 使用 `investigate_string` 定位 UI 文案、保存路径、网络端点、配置键或脚本关键字。
+4. 对托管方法调用 `decompile_function` 或 `explain_function`，优先返回 `ilspycmd` C# 结果。
+5. 在报告中查看 `managed_summary` 与质量等级。
+
+## 工作 IDB 与保存
+
+`open_target` 会为每个 session 创建独立工作库：
 
 ```text
-find_string_usage -> get_function_profile -> decompile_function -> get_xrefs_to
+.runtime/sessions/<session_id>/working.i64
 ```
 
-### 导出与复盘
+后续分析、注释、类型、补丁和脚本操作作用于 working IDB。默认 `save_workspace` 保存当前工作库。传入 `path` 时，服务会导出到用户指定位置。
 
-```text
-export_full_analysis -> export_functions
-```
+## MCP Prompts
 
-## 配置文件
+服务实现 `prompts/list` 与 `prompts/get`，内置模板：
 
-项目根目录的 `setting.toml`：
+- `triage-native`
+- `triage-managed`
+- `string-led-investigation`
+- `microcode-investigation`
 
-```toml
-[logging]
-level = "INFO"
-directory = "logs"
+这些模板用于让 MCP 客户端了解推荐调用顺序和分析策略。
 
-[server]
-protocol_version = "2025-06-18"
-server_name = "ida-stdio-mcp"
-server_version = "0.2.0"
+## MCP Resources
 
-[feature_gates]
-allow_unsafe = false
-allow_debugger = false
-isolated_contexts = false
-
-[runtime_workspace]
-directory = ".runtime"
-symbol_cache_directory = ".runtime/symbol-cache"
-
-[limits]
-default_page_size = 100
-max_page_size = 1000
-```
+服务提供工作区、能力矩阵、函数、字符串、导入、调用图、托管摘要、工具文档等资源。资源读取使用统一 JSON envelope，便于客户端处理成功、降级、错误和下一步建议。
 
 ## 开发
 
 ```powershell
-# 类型检查
+uv sync
 uv run basedpyright
-
-# 运行测试
 uv run python -m unittest discover -s tests/unit
 ```
 
-## 致谢
+有 IDA 9.3+ 环境时运行集成测试：
 
-本项目受到 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp) 的启发，感谢作者的开拓性工作。
+```powershell
+$env:IDADIR = '<IDA_INSTALL_DIR>'
+uv run python -m unittest discover -s tests/integration
+```
 
-## License
+## 许可证
 
-MIT
+本项目使用 MIT License。详见 [LICENSE](LICENSE)。

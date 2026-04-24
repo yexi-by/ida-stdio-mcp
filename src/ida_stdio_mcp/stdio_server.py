@@ -19,6 +19,7 @@ from .logging import (
     log_tool_call_started,
 )
 from .models import JsonObject, JsonValue
+from .prompts import PromptRegistry
 from .result import build_error_info, build_result, normalize_json_object
 from .tool_registry import ResourceRegistry, ToolRegistry
 
@@ -42,10 +43,12 @@ class StdioMcpServer:
         tools: ToolRegistry,
         resources: ResourceRegistry,
         identity: ServerIdentity,
+        prompts: PromptRegistry | None = None,
     ) -> None:
         self._tools = tools
         self._resources = resources
         self._identity = identity
+        self._prompts = prompts
         self._transport_flavor: TransportFlavor | None = None
 
     def serve(self) -> int:
@@ -120,15 +123,17 @@ class StdioMcpServer:
             return self._error_response(request_id, -32600, "请求缺少 method")
 
         if method == "initialize":
+            capabilities: JsonObject = {
+                "tools": {},
+                "resources": {"subscribe": False, "listChanged": False},
+            }
+            if self._prompts is not None and self._prompts.has_prompts():
+                capabilities["prompts"] = {}
             return self._ok_response(
                 request_id,
                 {
                     "protocolVersion": self._identity.protocol_version,
-                    "capabilities": {
-                        "tools": {},
-                        "resources": {"subscribe": False, "listChanged": False},
-                        "prompts": {},
-                    },
+                    "capabilities": capabilities,
                     "serverInfo": {
                         "name": self._identity.server_name,
                         "version": self._identity.server_version,
@@ -278,6 +283,32 @@ class StdioMcpServer:
                 request_id,
                 {"contents": [cast(JsonValue, item) for item in contents], "isError": is_error},
             )
+
+        if method == "prompts/list":
+            if self._prompts is None:
+                return self._error_response(request_id, -32601, "当前服务未启用 prompts")
+            return self._ok_response(
+                request_id,
+                {"prompts": [cast(JsonValue, item) for item in self._prompts.list_prompts()]},
+            )
+
+        if method == "prompts/get":
+            if self._prompts is None:
+                return self._error_response(request_id, -32601, "当前服务未启用 prompts")
+            params = request_obj.get("params")
+            if not isinstance(params, dict):
+                return self._error_response(request_id, -32602, "prompts/get 缺少 params")
+            name = params.get("name")
+            arguments = params.get("arguments", {})
+            if not isinstance(name, str):
+                return self._error_response(request_id, -32602, "prompts/get 需要字符串 name")
+            if not isinstance(arguments, dict):
+                return self._error_response(request_id, -32602, "prompts/get arguments 必须是对象")
+            try:
+                prompt_payload = self._prompts.get_prompt(name, cast(JsonObject, arguments))
+            except KeyError as exc:
+                return self._error_response(request_id, -32602, str(exc))
+            return self._ok_response(request_id, prompt_payload)
 
         return self._error_response(request_id, -32601, f"未知方法：{method}")
 

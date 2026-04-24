@@ -5,17 +5,18 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, cast
+from typing import TYPE_CHECKING, Callable, cast
 
-from .config import AppConfig
-from .directory_analysis import DirectoryAnalysisPolicy, detect_project_profile, iter_candidate_files
 from .errors import RuntimeNotReadyError, SessionNotFoundError, SessionRequiredError
-from .ida_core import IdaCore
-from .models import BinarySummary, GateName, JsonObject, JsonValue, ToolResult, ToolStatus
+from .models import BinarySummary, GateName, JsonObject, JsonValue, ToolResult, ToolStatus, ToolSurface
 from .profile_loader import load_profile
+from .prompts import PromptRegistry, build_prompt_registry
 from .result import build_error_info, build_result, normalize_json_object
 from .runtime import HeadlessRuntime
 from .tool_registry import ResourceRegistry, ResourceSpec, ToolRegistry, ToolSpec
+
+if TYPE_CHECKING:
+    from .ida_core import IdaCore
 
 COMMON_OUTPUT_SCHEMA: JsonObject = {
     "type": "object",
@@ -98,6 +99,21 @@ def _object_param_schema(
 
 SESSION_ID_SCHEMA = _string_schema("可选。指定会话 ID；不传时默认作用于当前激活会话。")
 CONTEXT_ID_SCHEMA = _string_schema("上下文 ID；启用 --isolated-contexts 时必须显式提供，用于隔离不同 agent 的默认会话。")
+SLIM_TOOL_NAMES = {
+    "get_workspace_state",
+    "open_target",
+    "triage_binary",
+    "investigate_string",
+    "explain_function",
+    "trace_input_to_check",
+    "decompile_function",
+    "export_report",
+    "save_workspace",
+    "close_target",
+}
+EXPERT_ONLY_TOOL_NAMES = {
+    "microcode_experiment",
+}
 ADDR_OR_QUERY_PROPERTIES: dict[str, JsonObject] = {
     "addr": _string_schema("地址字符串，可写 0x 地址、十进制地址，或能解析到地址的符号名。"),
     "query": _string_schema("函数/符号查询文本；与 addr 二选一。"),
@@ -188,7 +204,7 @@ def _mapped_error_info(
                 "requires_session": session_required,
                 "requires_context": context_required,
             },
-            next_steps=["先调用 open_binary 打开样本", "或调用 switch_binary 切换到已有会话", "若启用了隔离模式，请补充 context_id"],
+            next_steps=["先调用 open_target 打开样本", "或调用 get_workspace_state 查看当前会话", "若启用了隔离模式，请补充 context_id"],
         )))
     if isinstance(exc, SessionNotFoundError):
         return normalize_json_object(cast(JsonObject, build_error_info(
@@ -200,7 +216,7 @@ def _mapped_error_info(
                 "requires_session": session_required,
                 "requires_context": context_required,
             },
-            next_steps=["先调用 list_binaries 查看当前有效会话", "再使用正确的 session_id 重新调用", "若启用了隔离模式，请确认 session_id 属于当前 context_id"],
+            next_steps=["先调用 get_workspace_state 查看当前有效会话", "再使用正确的 session_id 重新调用", "若启用了隔离模式，请确认 session_id 属于当前 context_id"],
         )))
     if isinstance(exc, FileNotFoundError):
         return normalize_json_object(cast(JsonObject, build_error_info(
@@ -214,7 +230,7 @@ def _mapped_error_info(
             code="path_not_directory",
             message=str(exc),
             details={"tool": name, "source": source, "requires_session": session_required, "requires_context": context_required},
-            next_steps=["改传目录路径", "或改用 open_binary 打开单个文件"],
+            next_steps=["改传目录路径", "或改用 open_target 打开单个文件"],
         )))
     if isinstance(exc, IsADirectoryError):
         return normalize_json_object(cast(JsonObject, build_error_info(
@@ -368,405 +384,7 @@ class ServiceBundle:
 
     tools: ToolRegistry
     resources: ResourceRegistry
-
-
-@dataclass(slots=True, frozen=True)
-class CapabilityCategorySpec:
-    """能力总览里的工具分类定义。"""
-
-    key: str
-    title: str
-    summary: str
-    keywords: tuple[str, ...]
-    tool_names: tuple[str, ...]
-
-
-@dataclass(slots=True, frozen=True)
-class CapabilityTaskSpec:
-    """能力总览里的典型任务定义。"""
-
-    title: str
-    summary: str
-    keywords: tuple[str, ...]
-    tool_names: tuple[str, ...]
-    gate_requirements: tuple[str, ...] = ()
-    notes: tuple[str, ...] = ()
-
-
-CAPABILITY_CATEGORY_SPECS: tuple[CapabilityCategorySpec, ...] = (
-    CapabilityCategorySpec(
-        key="entrypoints",
-        title="上手入口与能力总览",
-        summary="先判断这个 MCP 能做什么、当前运行开了哪些门控、适合从哪里开始逆向。",
-        keywords=("能力总览", "工具总目录", "反编译伪代码", "列函数", "交叉引用", "字符串", "结构体", "类型", "补丁", "导出分析结果"),
-        tool_names=("describe_capabilities", "health", "summarize_binary", "survey_binary", "analyze_directory", "warmup"),
-    ),
-    CapabilityCategorySpec(
-        key="sessions",
-        title="样本与会话管理",
-        summary="打开二进制、切换当前会话、保存 IDB、关闭样本，适合分析流程开场。",
-        keywords=("打开二进制", "切换会话", "保存数据库", "关闭样本", "当前会话"),
-        tool_names=("open_binary", "list_binaries", "current_binary", "switch_binary", "save_binary", "close_binary", "deactivate_binary"),
-    ),
-    CapabilityCategorySpec(
-        key="functions",
-        title="函数、伪代码与调用关系",
-        summary="列函数、定位函数、看函数画像、读反编译伪代码或汇编、分析调用关系。",
-        keywords=("列函数", "函数列表", "函数画像", "反编译伪代码", "汇编", "调用图", "入口函数"),
-        tool_names=(
-            "list_functions",
-            "get_function",
-            "get_function_profile",
-            "analyze_functions",
-            "decompile_function",
-            "disassemble_function",
-            "get_callers",
-            "get_callees",
-            "get_basic_blocks",
-            "build_callgraph",
-            "analyze_function",
-            "analyze_component",
-        ),
-    ),
-    CapabilityCategorySpec(
-        key="xrefs_strings_imports",
-        title="交叉引用、字符串、导入与全局",
-        summary="查 xref、列字符串、搜字符串、看导入表、读全局值，适合快速摸清程序外部接口和提示信息。",
-        keywords=("交叉引用", "xref", "字符串", "导入表", "全局变量", "正则搜索"),
-        tool_names=(
-            "get_xrefs_to",
-            "query_xrefs",
-            "get_xrefs_to_field",
-            "list_strings",
-            "find_strings",
-            "find_string_usage",
-            "search_regex",
-            "list_globals",
-            "list_imports",
-            "query_imports",
-            "read_strings",
-            "read_global_values",
-            "query_instructions",
-        ),
-    ),
-    CapabilityCategorySpec(
-        key="types_structs",
-        title="结构体、类型与栈帧",
-        summary="查结构体字段、查本地类型与托管类型、看函数栈帧、批量写回类型。",
-        keywords=("结构体", "类型", "UDT", "栈帧", "字段布局", "函数原型", "类型写回"),
-        tool_names=(
-            "read_struct",
-            "search_structs",
-            "query_types",
-            "inspect_type",
-            "get_stack_frame",
-            "declare_types",
-            "set_types",
-            "apply_types",
-            "infer_types",
-            "declare_stack_variables",
-            "delete_stack_variables",
-            "upsert_enum",
-        ),
-    ),
-    CapabilityCategorySpec(
-        key="patching",
-        title="重命名、注释与补丁写回",
-        summary="重命名符号、追加注释、修改汇编、写字节补丁、改整数、重新定义代码或函数。",
-        keywords=("重命名符号", "注释", "修改汇编", "汇编补丁", "字节补丁", "patch", "define function"),
-        tool_names=(
-            "rename_symbols",
-            "set_comments",
-            "append_comments",
-            "patch_assembly",
-            "patch_bytes",
-            "write_ints",
-            "define_function",
-            "define_code",
-            "undefine_items",
-        ),
-    ),
-    CapabilityCategorySpec(
-        key="export_reports",
-        title="导出、复盘与结果整理",
-        summary="导出函数分析结果、原型、近似头文件，适合批量复盘、报告生成和继续喂给 AI。",
-        keywords=("导出分析结果", "导出函数", "导出伪代码", "头文件", "prototypes", "json"),
-        tool_names=("export_full_analysis", "export_functions", "trace_data_flow", "read_bytes", "read_ints"),
-    ),
-    CapabilityCategorySpec(
-        key="python_escape_hatch",
-        title="IDAPython 与自定义分析",
-        summary="当现成工具不够时，直接在 IDA 上下文执行 Python / IDAPython 代码做高级自定义分析。",
-        keywords=("IDAPython", "evaluate_python", "execute python", "自定义分析", "Python 脚本"),
-        tool_names=("evaluate_python", "execute_python_file"),
-    ),
-    CapabilityCategorySpec(
-        key="debugger",
-        title="调试器与断点控制",
-        summary="启动调试、读寄存器和内存、单步、继续执行、管理断点。",
-        keywords=("调试", "断点", "单步", "寄存器", "内存", "stacktrace"),
-        tool_names=(
-            "debug_start",
-            "debug_exit",
-            "debug_continue",
-            "debug_run_to",
-            "debug_step_into",
-            "debug_step_over",
-            "debug_list_breakpoints",
-            "debug_add_breakpoints",
-            "debug_delete_breakpoints",
-            "debug_toggle_breakpoints",
-            "debug_registers",
-            "debug_registers_all_threads",
-            "debug_registers_thread",
-            "debug_general_registers",
-            "debug_general_registers_thread",
-            "debug_named_registers",
-            "debug_named_registers_thread",
-            "debug_stacktrace",
-            "debug_read_memory",
-            "debug_write_memory",
-        ),
-    ),
-)
-
-
-CAPABILITY_TASK_SPECS: tuple[CapabilityTaskSpec, ...] = (
-    CapabilityTaskSpec(
-        title="开局快速摸清样本 / binary summary",
-        summary="直接看样本摘要、入口点、关键函数、关键字符串、导入分类和推荐下一步，替代先去 shell 里乱扫一圈。",
-        keywords=("样本摘要", "binary summary", "入口点", "关键函数", "关键字符串", "开局"),
-        tool_names=("summarize_binary", "survey_binary", "list_functions"),
-    ),
-    CapabilityTaskSpec(
-        title="读取反编译伪代码 / 高层表示",
-        summary="看函数伪代码、Hex-Rays C 结果或托管 C# 结果；不可用时再退回 IL/汇编。",
-        keywords=("反编译伪代码", "Hex-Rays", "C#", "高层表示"),
-        tool_names=("decompile_function", "disassemble_function", "get_function_profile"),
-        notes=("native 优先 Hex-Rays；managed 优先外部 C#，失败再降级。",),
-    ),
-    CapabilityTaskSpec(
-        title="列函数 / 定位目标函数",
-        summary="先枚举函数、按名称筛选、再读取单函数详情和画像。",
-        keywords=("列函数", "函数列表", "定位函数", "入口函数"),
-        tool_names=("list_functions", "get_function", "get_function_profile", "survey_binary"),
-    ),
-    CapabilityTaskSpec(
-        title="查交叉引用 / xref",
-        summary="查看谁引用了目标地址、函数、结构字段，或按方向过滤调用边。",
-        keywords=("交叉引用", "xref", "who references", "callers", "callees"),
-        tool_names=("get_xrefs_to", "query_xrefs", "get_xrefs_to_field", "get_callers", "get_callees"),
-    ),
-    CapabilityTaskSpec(
-        title="列字符串 / 搜索字符串",
-        summary="批量列字符串、做子串或正则搜索、按地址回读字符串值。",
-        keywords=("字符串", "搜索字符串", "正则", "read strings"),
-        tool_names=("list_strings", "find_strings", "find_string_usage", "search_regex", "read_strings"),
-    ),
-    CapabilityTaskSpec(
-        title="查字符串使用点 / string usage",
-        summary="把字符串、xref/引用点、所属函数直接串成闭环结果，适合顺着错误文案、URL、路径、协议字段快速追逻辑。",
-        keywords=("字符串使用点", "string usage", "xref", "grep", "谁用了这个字符串"),
-        tool_names=("find_string_usage", "get_xrefs_to", "get_function_profile", "decompile_function"),
-    ),
-    CapabilityTaskSpec(
-        title="查结构体 / 类型 / 栈帧",
-        summary="查看结构体字段、类型声明、成员布局与栈变量信息。",
-        keywords=("结构体", "类型", "UDT", "栈帧", "字段"),
-        tool_names=("read_struct", "search_structs", "query_types", "inspect_type", "get_stack_frame"),
-    ),
-    CapabilityTaskSpec(
-        title="重命名符号 / 添加注释",
-        summary="批量重命名函数或变量、追加注释，改善数据库可读性。",
-        keywords=("重命名符号", "rename", "注释", "comments"),
-        tool_names=("rename_symbols", "set_comments", "append_comments"),
-        gate_requirements=("unsafe",),
-        notes=("需要当前运行启用 --unsafe。",),
-    ),
-    CapabilityTaskSpec(
-        title="修改汇编 / 打补丁 / 写字节",
-        summary="按汇编语句 assemble 后写回，或直接打十六进制字节补丁。",
-        keywords=("修改汇编", "汇编补丁", "字节补丁", "patch assembly", "patch bytes"),
-        tool_names=("patch_assembly", "patch_bytes", "write_ints", "define_function", "define_code", "undefine_items"),
-        gate_requirements=("unsafe",),
-        notes=("需要当前运行启用 --unsafe。",),
-    ),
-    CapabilityTaskSpec(
-        title="导出分析结果 / 继续喂给 AI",
-        summary="导出结构化 JSON、函数原型、近似头文件，适合报告、批处理和再分析。",
-        keywords=("导出分析结果", "export analysis", "json", "c_header", "prototypes"),
-        tool_names=("export_full_analysis", "export_functions", "analyze_component", "get_function_profile"),
-    ),
-    CapabilityTaskSpec(
-        title="执行任意 IDAPython / 自定义脚本",
-        summary="当现成工具不够时，直接在 IDA 上下文执行 Python 或加载脚本文件。",
-        keywords=("IDAPython", "evaluate_python", "execute python", "自定义脚本"),
-        tool_names=("evaluate_python", "execute_python_file"),
-        gate_requirements=("unsafe",),
-        notes=("需要当前运行启用 --unsafe。",),
-    ),
-    CapabilityTaskSpec(
-        title="调试、断点、寄存器与内存",
-        summary="做断点管理、单步、继续执行、查看寄存器、读写调试内存。",
-        keywords=("调试", "断点", "单步", "寄存器", "内存"),
-        tool_names=("debug_start", "debug_continue", "debug_step_into", "debug_step_over", "debug_add_breakpoints", "debug_registers", "debug_read_memory"),
-        gate_requirements=("debugger",),
-        notes=("需要当前运行启用 --debugger。",),
-    ),
-)
-
-
-def _focus_matches(focus: str, texts: tuple[str, ...]) -> bool:
-    """判断某条能力描述是否命中指定主题。"""
-    normalized_focus = focus.strip().lower()
-    if not normalized_focus:
-        return True
-    return any(normalized_focus in text.lower() for text in texts if text)
-
-
-def _build_capability_overview_payload(
-    registry: ToolRegistry,
-    *,
-    allow_unsafe: bool,
-    allow_debugger: bool,
-    isolated_contexts: bool,
-    focus: str = "",
-    include_examples: bool = False,
-) -> JsonObject:
-    """构造面向 AI 与人的能力总览结果。"""
-    tool_items = registry.list_tools()
-    tools_by_name: dict[str, JsonObject] = {}
-    for item in tool_items:
-        raw_name = item.get("name")
-        if isinstance(raw_name, str):
-            tools_by_name[raw_name] = item
-
-    def tool_row(name: str) -> JsonObject | None:
-        item = tools_by_name.get(name)
-        if item is None:
-            return None
-        row: JsonObject = {
-            "name": name,
-            "description": str(item.get("description", "")),
-            "requires_session": bool(item.get("requiresSession", False)),
-            "requires_context": bool(item.get("requiresContext", False)),
-        }
-        if include_examples and "inputExample" in item:
-            row["input_example"] = item["inputExample"]
-        return normalize_json_object(row)
-
-    categories: list[JsonValue] = []
-    for spec in CAPABILITY_CATEGORY_SPECS:
-        category_tool_rows: list[JsonValue] = [row for row in (tool_row(name) for name in spec.tool_names) if row is not None]
-        if not category_tool_rows:
-            continue
-        if not _focus_matches(
-            focus,
-            (
-                spec.title,
-                spec.summary,
-                *spec.keywords,
-                *spec.tool_names,
-            ),
-        ):
-            continue
-        categories.append(
-            normalize_json_object(
-                {
-                    "key": spec.key,
-                    "title": spec.title,
-                    "summary": spec.summary,
-                    "keywords": list(spec.keywords),
-                    "tool_count": len(category_tool_rows),
-                    "tools": category_tool_rows,
-                }
-            )
-        )
-
-    notable_tasks: list[JsonValue] = []
-    for spec in CAPABILITY_TASK_SPECS:
-        task_tool_rows: list[JsonValue] = [row for row in (tool_row(name) for name in spec.tool_names) if row is not None]
-        if not task_tool_rows:
-            continue
-        if not _focus_matches(
-            focus,
-            (
-                spec.title,
-                spec.summary,
-                *spec.keywords,
-                *spec.tool_names,
-                *spec.gate_requirements,
-                *spec.notes,
-            ),
-        ):
-            continue
-        notable_tasks.append(
-            normalize_json_object(
-                {
-                    "title": spec.title,
-                    "summary": spec.summary,
-                    "keywords": list(spec.keywords),
-                    "gate_requirements": list(spec.gate_requirements),
-                    "notes": list(spec.notes),
-                    "tools": task_tool_rows,
-                }
-            )
-        )
-
-    recommended_entrypoints: list[JsonValue] = [
-        row
-        for row in (
-            tool_row("describe_capabilities"),
-            tool_row("open_binary"),
-            tool_row("summarize_binary"),
-            tool_row("survey_binary"),
-            tool_row("list_functions"),
-            tool_row("decompile_function"),
-            tool_row("find_string_usage"),
-            tool_row("get_xrefs_to"),
-            tool_row("list_strings"),
-            tool_row("read_struct"),
-            tool_row("query_types"),
-            tool_row("export_full_analysis"),
-            tool_row("export_functions"),
-        )
-        if row is not None
-    ]
-
-    gate_notes: list[JsonValue] = [
-        "当前运行已启用 --unsafe，可使用重命名、类型写回、补丁、IDAPython 等写操作。"
-        if allow_unsafe
-        else "当前运行未启用 --unsafe，重命名、类型写回、补丁、IDAPython 等写操作会缺席或不可用。",
-        "当前运行已启用 --debugger，可使用断点、单步、寄存器、调试内存等调试工具。"
-        if allow_debugger
-        else "当前运行未启用 --debugger，调试器相关工具不会暴露。",
-        "当前运行启用了 --isolated-contexts，后续多数 session-scoped 工具都必须显式传入 context_id。"
-        if isolated_contexts
-        else "当前运行未启用 --isolated-contexts，可使用共享默认上下文。",
-    ]
-    discovery_advice: list[JsonValue] = [
-        "不知道该用哪个工具时，先调用 describe_capabilities。",
-        "单样本常见工作流：open_binary -> summarize_binary -> list_functions / find_string_usage -> decompile_function / read_struct / query_types。",
-        "需要批量整理结果时，优先考虑 export_full_analysis、export_functions、get_function_profile、analyze_component。",
-    ]
-
-    return normalize_json_object(
-        {
-            "summary": "这是 ida-stdio-mcp 的能力总览工具。它会回答当前到底能不能做反编译伪代码、列函数、查交叉引用 xref、列字符串、查结构体/类型、重命名符号、修改汇编或字节补丁、导出分析结果、执行 IDAPython、调试等任务。",
-            "feature_gates": {
-                "unsafe": allow_unsafe,
-                "debugger": allow_debugger,
-                "isolated_contexts": isolated_contexts,
-            },
-            "gate_notes": gate_notes,
-            "focus": focus,
-            "tool_count": len(tools_by_name),
-            "recommended_entrypoints": recommended_entrypoints,
-            "notable_tasks": notable_tasks,
-            "categories": categories,
-            "discovery_advice": discovery_advice,
-        }
-    )
+    prompts: PromptRegistry
 
 
 def _ensure_session(arguments: JsonObject, runtime: HeadlessRuntime) -> None:
@@ -783,6 +401,25 @@ def _context_id(arguments: JsonObject) -> str | None:
     if not isinstance(raw_context, str):
         raise ValueError("context_id 必须是字符串")
     return raw_context or None
+
+
+def _new_core() -> "IdaCore":
+    """惰性创建 IDA 能力层对象，避免服务注册阶段强制加载 IDA。"""
+    from .ida_core import IdaCore
+
+    return IdaCore()
+
+
+def _activity_target(arguments: JsonObject) -> str:
+    """从工具参数中提取适合写入工作流状态的目标标识。"""
+    for key in ("addr", "query", "pattern", "name", "path"):
+        value = arguments.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    items = arguments.get("items")
+    if isinstance(items, list) and items:
+        return f"items:{len(items)}"
+    return ""
 
 
 def _context_enabled_schema(runtime: HeadlessRuntime, schema: JsonObject, *, required: bool) -> JsonObject:
@@ -841,10 +478,21 @@ def _normalize_tool_data(value: object) -> JsonValue:
     """在协议边界把任意运行时值收窄为 JSON 值。
 
     这里只保留一个 `object` 边界入口，用来承接 IDA 运行时与资源层回传的
-    各类对象；后续立即通过 `IdaCore.jsonify` 收窄，禁止把宽泛类型继续下传。
+    各类对象；本函数立即递归收窄，避免协议层在无 IDA 环境下为了错误包装
+    而强制创建 `IdaCore`。
     """
-    core = IdaCore()
-    return core.jsonify(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        list_value = cast(list[object], value)
+        return [_normalize_tool_data(item) for item in list_value]
+    if isinstance(value, tuple):
+        tuple_value = cast(tuple[object, ...], value)
+        return [_normalize_tool_data(item) for item in tuple_value]
+    if isinstance(value, dict):
+        dict_value = cast(dict[object, object], value)
+        return {str(key): _normalize_tool_data(item) for key, item in dict_value.items()}
+    return str(value)
 
 
 def _unwrap_statusful(value: object) -> tuple[ToolStatus, JsonValue, list[str]]:
@@ -914,7 +562,7 @@ def _tool(
         try:
             if session_required:
                 _ensure_session(arguments, runtime)
-            core = IdaCore()
+            core = _new_core()
             raw = handler(core, arguments)
             status, data, warnings = _unwrap_statusful(raw)
             if writeback_kind is not None and status in {"ok", "degraded"}:
@@ -924,6 +572,13 @@ def _tool(
                     context_id=_context_id(arguments),
                 )
                 data = _with_writeback_state(data, session)
+            if session_required and status in {"ok", "degraded"}:
+                runtime.record_activity(
+                    name,
+                    target=_activity_target(arguments),
+                    session_id=_string_or_default(arguments, "session_id", "") or None,
+                    context_id=_context_id(arguments),
+                )
             return build_result(status=status, source=source, data=data, warnings=warnings)
         except Exception as exc:
             return _error_result_from_exception(
@@ -955,24 +610,7 @@ def _tool(
 def _management_tools(
     registry: ToolRegistry,
     runtime: HeadlessRuntime,
-    config: AppConfig,
-    *,
-    allow_unsafe: bool,
-    allow_debugger: bool,
-) -> set[str]:
-    protected = {
-        "describe_capabilities",
-        "health",
-        "warmup",
-        "open_binary",
-        "close_binary",
-        "switch_binary",
-        "list_binaries",
-        "current_binary",
-        "save_binary",
-        "deactivate_binary",
-        "analyze_directory",
-    }
+) -> None:
     context_required = runtime.isolated_contexts
 
     def register_management_tool(
@@ -1026,472 +664,328 @@ def _management_tools(
             context_required=requires_context,
         )
 
-    def health_handler(arguments: JsonObject) -> ToolResult:
-        active: JsonValue = None
-        health_data: JsonObject = normalize_json_object(
-            {
-                "runtime_ready": True,
-                "idadir": str(runtime.require_ida_dir()),
-                "binary_open": False,
-                "active": None,
-                "feature_gates": {
-                    "unsafe": allow_unsafe,
-                    "debugger": allow_debugger,
-                    "isolated_contexts": runtime.isolated_contexts,
-                },
-            }
-        )
+    def get_workspace_state_handler(arguments: JsonObject) -> ToolResult:
         try:
-            active = _normalize_tool_data(runtime.current_binary(context_id=_context_id(arguments)))
-            runtime.activate_for_request(None, context_id=_context_id(arguments))
-            core = IdaCore()
-            payload = normalize_json_object(core.health())
-            payload["active_session"] = active
-            payload["feature_gates"] = normalize_json_object(
-                {
-                "unsafe": allow_unsafe,
-                "debugger": allow_debugger,
-                "isolated_contexts": runtime.isolated_contexts,
-                }
+            return build_result(
+                status="ok",
+                source="workflow.get_workspace_state",
+                data=_normalize_tool_data(runtime.workspace_state(context_id=_context_id(arguments))),
             )
-            health_data = payload
-        except Exception:
-            pass
-        if active is not None:
-            health_data["binary_open"] = True
-            health_data["active"] = active
-        return build_result(status="ok", source="runtime.health", data=_normalize_tool_data(health_data))
-
-    def warmup_handler(arguments: JsonObject) -> ToolResult:
-        try:
-            _ensure_session(arguments, runtime)
-            core = IdaCore()
-            data = core.wait_auto_analysis()
-            return build_result(status="ok", source="runtime.warmup", data=data)
         except Exception as exc:
-            return management_error_result(
-                "warmup",
-                "runtime.warmup",
-                exc,
-                session_required=True,
-                requires_context=context_required,
-            )
+            return management_error_result("get_workspace_state", "workflow.get_workspace_state", exc, session_required=False, requires_context=context_required)
 
-    def open_binary_handler(arguments: JsonObject) -> ToolResult:
+    def open_target_handler(arguments: JsonObject) -> ToolResult:
         try:
             raw_path = _require_string(arguments, "path")
-            summary = runtime.open_binary(
+            summary = runtime.open_target(
                 Path(raw_path),
                 run_auto_analysis=_bool_or_default(arguments, "run_auto_analysis", True),
                 session_id=_string_or_default(arguments, "session_id", "") or None,
                 context_id=_context_id(arguments),
             )
-            return build_result(status="ok", source="runtime.open_binary", data=_normalize_tool_data(summary))
+            return build_result(status="ok", source="workflow.open_target", data=_normalize_tool_data(summary))
         except Exception as exc:
-            return management_error_result("open_binary", "runtime.open_binary", exc, session_required=False, requires_context=context_required)
+            return management_error_result("open_target", "workflow.open_target", exc, session_required=False, requires_context=context_required)
 
-    def close_binary_handler(arguments: JsonObject) -> ToolResult:
+    def triage_binary_handler(arguments: JsonObject) -> ToolResult:
         try:
-            raw_session = arguments.get("session_id")
-            session_id = raw_session if isinstance(raw_session, str) else None
-            runtime.close_binary(session_id, context_id=_context_id(arguments))
+            _ensure_session(arguments, runtime)
+            core = _new_core()
+            summary = core.triage_binary_snapshot(
+                function_limit=_int_or_default(arguments, "function_limit", 12),
+                string_limit=_int_or_default(arguments, "string_limit", 12),
+                import_limit_per_category=_int_or_default(arguments, "import_limit_per_category", 6),
+                include_strings=_bool_or_default(arguments, "include_strings", False),
+            )
+            runtime.record_activity(
+                "triage_binary",
+                target="triage",
+                session_id=_string_or_default(arguments, "session_id", "") or None,
+                context_id=_context_id(arguments),
+            )
             return build_result(
                 status="ok",
-                source="runtime.close_binary",
-                data=_normalize_tool_data({"closed": True, "session_id": session_id}),
+                source="workflow.triage_binary",
+                data=_normalize_tool_data(
+                    {
+                        "session": runtime.current_target(context_id=_context_id(arguments)),
+                        "summary": summary,
+                    }
+                ),
             )
         except Exception as exc:
-            return management_error_result("close_binary", "runtime.close_binary", exc, session_required=True, requires_context=context_required)
+            return management_error_result("triage_binary", "workflow.triage_binary", exc, session_required=True, requires_context=context_required)
 
-    def switch_binary_handler(arguments: JsonObject) -> ToolResult:
+    def investigate_string_handler(arguments: JsonObject) -> ToolResult:
         try:
-            raw_session = _require_string(arguments, "session_id")
+            _ensure_session(arguments, runtime)
+            pattern = _string_or_default(arguments, "pattern", "")
+            addr = _string_or_default(arguments, "addr", "")
+            core = _new_core()
+            usage = core.investigate_string(
+                pattern=pattern,
+                addr=addr,
+                max_strings=_int_or_default(arguments, "max_strings", 20),
+                max_usages=_int_or_default(arguments, "max_usages", 100),
+            )
+            runtime.record_activity(
+                "investigate_string",
+                target=pattern or addr,
+                session_id=_string_or_default(arguments, "session_id", "") or None,
+                context_id=_context_id(arguments),
+            )
+            return build_result(status="ok", source="workflow.investigate_string", data=_normalize_tool_data(usage))
+        except Exception as exc:
+            return management_error_result("investigate_string", "workflow.investigate_string", exc, session_required=True, requires_context=context_required)
+
+    def explain_function_handler(arguments: JsonObject) -> ToolResult:
+        try:
+            _ensure_session(arguments, runtime)
+            query = _addr_or_query(arguments)
+            core = _new_core()
+            profile = core.get_function_profile(query, include_asm=_bool_or_default(arguments, "include_asm", False))
+            representation = core.decompile_function(query)
+            microcode: JsonValue = None
+            if _bool_or_default(arguments, "include_microcode", False):
+                microcode = core.microcode_summary(query, max_instructions=_int_or_default(arguments, "max_micro_instructions", 80))
+            runtime.record_activity(
+                "explain_function",
+                target=query,
+                session_id=_string_or_default(arguments, "session_id", "") or None,
+                context_id=_context_id(arguments),
+            )
             return build_result(
                 status="ok",
-                source="runtime.switch_binary",
-                data=_normalize_tool_data(runtime.switch_binary(raw_session, context_id=_context_id(arguments))),
+                source="workflow.explain_function",
+                data=_normalize_tool_data(
+                    {
+                        "profile": profile,
+                        "representation": representation,
+                        "microcode": microcode,
+                        "recommended_next_tools": ["trace_input_to_check", "investigate_string", "export_report"],
+                    }
+                ),
             )
         except Exception as exc:
-            return management_error_result("switch_binary", "runtime.switch_binary", exc, session_required=False, requires_context=context_required)
+            return management_error_result("explain_function", "workflow.explain_function", exc, session_required=True, requires_context=context_required)
 
-    def list_binaries_handler(arguments: JsonObject) -> ToolResult:
+    def trace_input_to_check_handler(arguments: JsonObject) -> ToolResult:
         try:
+            _ensure_session(arguments, runtime)
+            query = _require_string(arguments, "addr")
+            core = _new_core()
+            data_flow = core.trace_data_flow(
+                query,
+                direction=_string_or_default(arguments, "direction", "both"),
+                max_depth=_int_or_default(arguments, "max_depth", 5),
+            )
+            runtime.record_activity(
+                "trace_input_to_check",
+                target=query,
+                session_id=_string_or_default(arguments, "session_id", "") or None,
+                context_id=_context_id(arguments),
+            )
+            return build_result(status="ok", source="workflow.trace_input_to_check", data=_normalize_tool_data(data_flow))
+        except Exception as exc:
+            return management_error_result("trace_input_to_check", "workflow.trace_input_to_check", exc, session_required=True, requires_context=context_required)
+
+    def export_report_handler(arguments: JsonObject) -> ToolResult:
+        try:
+            _ensure_session(arguments, runtime)
+            core = _new_core()
+            report = core.export_full_analysis(
+                function_limit=_int_or_default(arguments, "function_limit", 120),
+                string_limit=_int_or_default(arguments, "string_limit", 200),
+                global_limit=_int_or_default(arguments, "global_limit", 120),
+                import_limit=_int_or_default(arguments, "import_limit", 240),
+                type_limit=_int_or_default(arguments, "type_limit", 120),
+                struct_limit=_int_or_default(arguments, "struct_limit", 80),
+                include_decompile=_bool_or_default(arguments, "include_decompile", False),
+                include_asm=_bool_or_default(arguments, "include_asm", False),
+            )
+            runtime.record_activity(
+                "export_report",
+                target="report",
+                session_id=_string_or_default(arguments, "session_id", "") or None,
+                context_id=_context_id(arguments),
+            )
             return build_result(
                 status="ok",
-                source="runtime.list_binaries",
-                data=_normalize_tool_data(runtime.list_binaries(context_id=_context_id(arguments))),
+                source="workflow.export_report",
+                data=_normalize_tool_data(
+                    {
+                        "session": runtime.current_target(context_id=_context_id(arguments)),
+                        "report": report,
+                    }
+                ),
             )
         except Exception as exc:
-            return management_error_result("list_binaries", "runtime.list_binaries", exc, session_required=False, requires_context=context_required)
+            return management_error_result("export_report", "workflow.export_report", exc, session_required=True, requires_context=context_required)
 
-    def current_binary_handler(arguments: JsonObject) -> ToolResult:
-        try:
-            return build_result(
-                status="ok",
-                source="runtime.current_binary",
-                data=_normalize_tool_data({"session": runtime.current_binary(context_id=_context_id(arguments))}),
-            )
-        except SessionRequiredError:
-            if runtime.isolated_contexts and _context_id(arguments) is None:
-                return management_error_result(
-                    "current_binary",
-                    "runtime.current_binary",
-                    SessionRequiredError("当前启用了 --isolated-contexts，必须显式提供 context_id"),
-                    session_required=False,
-                    requires_context=True,
-                )
-            return build_result(status="ok", source="runtime.current_binary", data=_normalize_tool_data({"session": None}))
-        except Exception as exc:
-            return management_error_result("current_binary", "runtime.current_binary", exc, session_required=False, requires_context=context_required)
-
-    def save_binary_handler(arguments: JsonObject) -> ToolResult:
+    def save_workspace_handler(arguments: JsonObject) -> ToolResult:
         try:
             session_id = _string_or_default(arguments, "session_id", "") or None
             path = _string_or_default(arguments, "path", "")
             return build_result(
                 status="ok",
-                source="runtime.save_binary",
-                data=_normalize_tool_data(runtime.save_binary(path=path, session_id=session_id, context_id=_context_id(arguments))),
+                source="workflow.save_workspace",
+                data=_normalize_tool_data(runtime.save_workspace(path=path, session_id=session_id, context_id=_context_id(arguments))),
             )
         except Exception as exc:
-            return management_error_result("save_binary", "runtime.save_binary", exc, session_required=True, requires_context=context_required)
+            return management_error_result("save_workspace", "workflow.save_workspace", exc, session_required=True, requires_context=context_required)
 
-    def deactivate_binary_handler(arguments: JsonObject) -> ToolResult:
+    def close_target_handler(arguments: JsonObject) -> ToolResult:
         try:
+            raw_session = arguments.get("session_id")
+            session_id = raw_session if isinstance(raw_session, str) else None
+            runtime.close_target(session_id, context_id=_context_id(arguments))
             return build_result(
                 status="ok",
-                source="runtime.deactivate_binary",
-                data=_normalize_tool_data({"deactivated": runtime.deactivate_binary(context_id=_context_id(arguments))}),
+                source="workflow.close_target",
+                data=_normalize_tool_data({"closed": True, "session_id": session_id}),
             )
         except Exception as exc:
-            return management_error_result("deactivate_binary", "runtime.deactivate_binary", exc, session_required=True, requires_context=context_required)
-
-    def analyze_directory_handler(arguments: JsonObject) -> ToolResult:
-        try:
-            raw_path = _require_string(arguments, "path")
-            root = Path(raw_path)
-            if not root.exists():
-                raise FileNotFoundError(f"目录不存在：{root}")
-            if not root.is_dir():
-                raise NotADirectoryError(f"不是目录：{root}")
-            project_profile = detect_project_profile(root)
-
-            raw_include = arguments.get("include_extensions", config.directory_analysis.include_extensions)
-            raw_exclude = arguments.get("exclude_patterns", config.directory_analysis.exclude_patterns)
-            include_extensions = tuple(str(item).lower() for item in raw_include) if isinstance(raw_include, (list, tuple)) else config.directory_analysis.include_extensions
-            exclude_patterns = tuple(str(item) for item in raw_exclude) if isinstance(raw_exclude, (list, tuple)) else config.directory_analysis.exclude_patterns
-            recursive = _bool_or_default(arguments, "recursive", config.directory_analysis.recursive)
-            max_candidates = _int_or_default(arguments, "max_candidates", config.directory_analysis.max_candidates)
-            max_deep_analysis = _int_or_default(arguments, "max_deep_analysis", config.directory_analysis.max_deep_analysis)
-            policy = DirectoryAnalysisPolicy(
-                prefer_managed=_bool_or_default(arguments, "prefer_managed", config.directory_analysis.prefer_managed),
-                prefer_native=_bool_or_default(arguments, "prefer_native", config.directory_analysis.prefer_native),
-                prefer_entry_binary=_bool_or_default(arguments, "prefer_entry_binary", config.directory_analysis.prefer_entry_binary),
-                prefer_user_code=_bool_or_default(arguments, "prefer_user_code", config.directory_analysis.prefer_user_code),
-                scoring_profile=_string_or_default(arguments, "scoring_profile", config.directory_analysis.scoring_profile),
-            )
-
-            previous_session_id: str | None = None
-            try:
-                current = runtime.current_binary(context_id=_context_id(arguments))
-                previous_session_id = current["session_id"]
-            except Exception:
-                previous_session_id = None
-
-            candidates = iter_candidate_files(
-                root,
-                recursive=recursive,
-                include_extensions=include_extensions,
-                exclude_patterns=exclude_patterns,
-                policy=policy,
-            )
-            selected = candidates[:max_candidates]
-            analyzed: list[JsonValue] = []
-            skipped: list[JsonValue] = []
-            errors: list[JsonValue] = []
-
-            for index, candidate in enumerate(selected):
-                if index >= max_deep_analysis:
-                    skipped.append({"path": str(candidate.path), "reason": "超出 max_deep_analysis 限制", "score": candidate.score})
-                    continue
-                temp_session_id = f"batch-{index:03d}"
-                try:
-                    runtime.open_binary(candidate.path, session_id=temp_session_id, context_id=_context_id(arguments))
-                    core = IdaCore()
-                    survey = core.survey_binary()
-                    try:
-                        focus = core.analyze_function("main", include_asm=False)
-                    except Exception as exc:
-                        focus = {"addr": "main", "error": str(exc)}
-                    analyzed.append(
-                        {
-                            "path": str(candidate.path),
-                            "binary_kind": candidate.binary_kind,
-                            "score": candidate.score,
-                            "reasons": list(candidate.reasons),
-                            "survey": _normalize_tool_data(survey),
-                            "focus": _normalize_tool_data(focus),
-                        }
-                    )
-                except Exception as exc:
-                    errors.append({"path": str(candidate.path), "error": str(exc)})
-                finally:
-                    try:
-                        runtime.close_binary(temp_session_id, context_id=_context_id(arguments))
-                    except Exception:
-                        pass
-
-            if previous_session_id is not None:
-                try:
-                    runtime.switch_binary(previous_session_id, context_id=_context_id(arguments))
-                except Exception as exc:
-                    errors.append({"path": "<restore>", "error": f"恢复原会话失败：{exc}"})
-            else:
-                try:
-                    runtime.deactivate_binary(context_id=_context_id(arguments))
-                except Exception:
-                    pass
-
-            status: ToolStatus = "ok" if not errors else "degraded"
-            warnings = ["部分样本分析失败，已降级返回"] if errors else []
-            return build_result(
-                status=status,
-                source="directory_analysis",
-                data={
-                    "summary": {
-                        "root": str(root),
-                        "project_profile": project_profile,
-                        "policy": {
-                            "prefer_managed": policy.prefer_managed,
-                            "prefer_native": policy.prefer_native,
-                            "prefer_entry_binary": policy.prefer_entry_binary,
-                            "prefer_user_code": policy.prefer_user_code,
-                            "scoring_profile": policy.scoring_profile,
-                        },
-                        "candidate_count": len(candidates),
-                        "selected_count": len(selected),
-                        "analyzed_count": len(analyzed),
-                        "skipped_count": len(skipped),
-                        "error_count": len(errors),
-                    },
-                    "candidates": [
-                        {
-                            "path": str(item.path),
-                            "binary_kind": item.binary_kind,
-                            "score": item.score,
-                            "size": item.size,
-                            "sha256": item.sha256,
-                            "reasons": list(item.reasons),
-                        }
-                        for item in candidates
-                    ],
-                    "selected": [str(item.path) for item in selected],
-                    "analyzed": analyzed,
-                    "skipped": skipped,
-                    "errors": errors,
-                },
-                warnings=warnings,
-            )
-        except Exception as exc:
-            return management_error_result("analyze_directory", "directory_analysis", exc, session_required=False, requires_context=context_required)
+            return management_error_result("close_target", "workflow.close_target", exc, session_required=True, requires_context=context_required)
 
     register_management_tool(
-        name="describe_capabilities",
-        description="能力总览 / 工具总目录：回答 ida-stdio-mcp 当前能否做反编译伪代码、列函数、查交叉引用 xref、列字符串、查结构体/类型、重命名符号、修改汇编或字节补丁、导出分析结果、执行 IDAPython、调试等任务，并返回推荐工具与调用示例。",
-        schema=_tool_input_schema(
-            properties={
-                "focus": _string_schema("可选。按主题筛选能力总览，例如 反编译伪代码 / 列函数 / 交叉引用 / 字符串 / 结构体 / 类型 / 重命名符号 / 汇编补丁 / 导出分析结果 / IDAPython / 调试。"),
-                "include_examples": _boolean_schema("是否在结果里附带推荐工具的最小调用示例。"),
-            }
-        ),
-        handler=lambda arguments: build_result(
-            status="ok",
-            source="runtime.describe_capabilities",
-            data=_build_capability_overview_payload(
-                registry,
-                allow_unsafe=allow_unsafe,
-                allow_debugger=allow_debugger,
-                isolated_contexts=runtime.isolated_contexts,
-                focus=_string_or_default(arguments, "focus", ""),
-                include_examples=_bool_or_default(arguments, "include_examples", False),
-            ),
-        ),
-        requires_session=False,
-        requires_context=False,
-        empty_state_behavior="这是全局能力总览，不依赖当前会话，也不会修改数据库。",
-        input_example={"focus": "反编译伪代码", "include_examples": True},
-    )
-    register_management_tool(
-        name="health",
-        description="返回运行时健康状态、当前门控、IDA 环境与活动会话概览；适合先确认这个 MCP 当前是否准备好可做逆向分析。",
+        name="get_workspace_state",
+        description="V2 工作区状态：返回 IDA 9.3+ 运行时、当前会话、工作 IDB、最近目标和推荐下一步；AI 默认先调用它。旧 session_id/context_id 心智负担由服务端下沉处理。",
         schema=_tool_input_schema(),
-        handler=health_handler,
+        handler=get_workspace_state_handler,
         requires_session=False,
-        requires_context=False,
-        empty_state_behavior="全局健康检查；未提供 context_id 时不强制绑定会话。",
+        empty_state_behavior="无会话时返回 sessions=[] 与推荐 open_target，不视为错误。",
         input_example={},
     )
     register_management_tool(
-        name="warmup",
-        description="预热当前会话并等待自动分析完成；适合在刚打开样本后先稳定数据库状态。",
-        schema=_tool_input_schema(include_session=True),
-        handler=warmup_handler,
-        requires_session=True,
-        preconditions=("必须已存在活动会话，或显式提供 session_id。",),
-        empty_state_behavior="无活动会话时返回 session_required。",
-        input_example={"session_id": "sess-001"},
-    )
-    register_management_tool(
-        name="open_binary",
-        description="打开二进制样本并绑定当前会话；这是做函数枚举、反编译伪代码、查 xref、查字符串、查结构体/类型前的起点工具。大型 UE/Shipping 样本建议先传 run_auto_analysis=false，避免工具调用长时间阻塞，再按需调用 warmup。",
+        name="open_target",
+        description="V2 打开样本入口：打开原始样本并创建 .runtime/sessions/<session_id>/working.i64 工作库；后续切换只操作工作 IDB，不隐式污染原样本。",
         schema=_tool_input_schema(
             properties={
                 "path": _string_schema("二进制文件路径。"),
-                "run_auto_analysis": _boolean_schema("是否在打开后等待自动分析。默认 true；大型 UE/Shipping 样本建议传 false。"),
+                "run_auto_analysis": _boolean_schema("是否在打开后等待自动分析。默认 true；大型样本可传 false。"),
             },
             required=("path",),
             include_session=True,
         ),
-        handler=open_binary_handler,
+        handler=open_target_handler,
         requires_session=False,
-        empty_state_behavior="无需现有会话；成功后返回新绑定会话。",
+        empty_state_behavior="无需现有会话；成功后返回绑定会话和工作 IDB 路径。",
         input_example={"path": "D:/samples/sample.exe", "run_auto_analysis": True, "session_id": "sess-001"},
     )
     register_management_tool(
-        name="close_binary",
-        description="关闭指定或当前会话。",
-        schema=_tool_input_schema(include_session=True),
-        handler=close_binary_handler,
-        requires_session=False,
-        preconditions=("若不传 session_id，则必须存在活动会话。",),
-        empty_state_behavior="无活动会话且未传 session_id 时返回 session_required。",
-        input_example={"session_id": "sess-001"},
-    )
-    register_management_tool(
-        name="switch_binary",
-        description="切换当前默认会话。",
-        schema=_tool_input_schema(required=("session_id",), include_session=True),
-        handler=switch_binary_handler,
-        requires_session=False,
-        preconditions=("session_id 必须指向已存在会话。",),
-        empty_state_behavior="session_id 不存在时返回 session_not_found。",
-        input_example={"session_id": "sess-001"},
-    )
-    register_management_tool(
-        name="list_binaries",
-        description="列出所有打开的会话。",
-        schema=_tool_input_schema(),
-        handler=list_binaries_handler,
-        requires_session=False,
-        empty_state_behavior="无会话时返回空列表。",
-        input_example={},
-    )
-    register_management_tool(
-        name="current_binary",
-        description="返回当前默认会话。",
-        schema=_tool_input_schema(),
-        handler=current_binary_handler,
-        requires_session=False,
-        empty_state_behavior="无会话时返回 {session: null}，不视为错误。",
-        input_example={},
-    )
-    register_management_tool(
-        name="save_binary",
-        description="保存当前或指定会话对应的 IDB。",
+        name="triage_binary",
+        description="V2 开局 triage：返回样本摘要、入口点、关键函数、导入分类、字符串索引状态、托管质量等级和推荐下一步；默认不构建全量字符串索引。",
         schema=_tool_input_schema(
-            properties={"path": _string_schema("可选。保存目标路径；为空时覆盖/使用 IDA 默认路径。")},
-            include_session=True,
-        ),
-        handler=save_binary_handler,
-        requires_session=False,
-        preconditions=("若不传 session_id，则必须存在活动会话。",),
-        empty_state_behavior="无活动会话且未传 session_id 时返回 session_required。",
-        input_example={"session_id": "sess-001"},
-    )
-    register_management_tool(
-        name="deactivate_binary",
-        description="解除默认会话绑定。",
-        schema=_tool_input_schema(),
-        handler=deactivate_binary_handler,
-        requires_session=False,
-        preconditions=("必须存在活动会话。",),
-        empty_state_behavior="无活动会话时返回 session_required。",
-        input_example={},
-    )
-    register_management_tool(
-        name="analyze_directory",
-        description="扫描目录、挑选候选二进制并做批量深度分析；适合目录级样本筛选、自动定位入口二进制、批量逆向前总览。",
-        schema=_tool_input_schema(
-            properties={
-                "path": _string_schema("要扫描的目录路径。"),
-                "recursive": _boolean_schema("是否递归扫描子目录。"),
-                "max_candidates": _integer_schema("最多保留多少个候选文件进入筛选结果。", minimum=1),
-                "max_deep_analysis": _integer_schema("最多对多少个候选样本做深度分析。", minimum=1),
-                "include_extensions": _array_schema("允许的扩展名白名单，例如 ['.exe', '.dll', '.elf']。", _string_schema("扩展名。")),
-                "exclude_patterns": _array_schema("排除文件/目录名模式。", _string_schema("排除模式。")),
-                "prefer_managed": _boolean_schema("是否优先托管/.NET 候选。"),
-                "prefer_native": _boolean_schema("是否优先原生候选。"),
-                "prefer_entry_binary": _boolean_schema("是否优先入口二进制。"),
-                "prefer_user_code": _boolean_schema("是否优先用户代码而非插件/运行库。"),
-                "scoring_profile": _string_schema("评分档位，例如 default / managed_first / entry_only。"),
-            },
-            required=("path",),
-        ),
-        handler=analyze_directory_handler,
-        requires_session=False,
-        empty_state_behavior="无需现有会话；内部会临时创建分析会话并在结束后恢复原上下文。",
-        input_example={"path": "D:/samples", "recursive": True, "max_candidates": 20, "max_deep_analysis": 5},
-    )
-    return protected
-
-
-def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
-    _tool(
-        registry,
-        name="survey_binary",
-        description="返回当前会话的快速二进制概览、架构、段、入口点与能力摘要；默认不构建全库字符串索引，避免大型样本卡住。",
-        source="core.survey_binary",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
-            properties={
-                "include_strings": _boolean_schema("是否显式构建并返回字符串样本。默认 false；大型 UE/PDB 样本可能很慢。"),
-                "string_limit": _integer_schema("include_strings=true 时最多返回多少条字符串。", minimum=0),
-            },
-            include_session=True,
-        ),
-        handler=lambda core, arguments: core.survey_binary(
-            include_strings=_bool_or_default(arguments, "include_strings", False),
-            string_limit=_int_or_default(arguments, "string_limit", 0),
-        ),
-        preconditions=("必须已存在活动会话，或显式提供 session_id。",),
-        empty_state_behavior="无活动会话时返回 session_required。",
-        input_example={"session_id": "sess-001"},
-    )
-    _tool(
-        registry,
-        name="summarize_binary",
-        description="样本摘要 / binary summary / 开局总览：直接给出入口点、关键函数、字符串索引状态、导入分类、能力边界和推荐下一步；默认不构建全库字符串索引，需要关键字符串时显式传 include_strings=true。",
-        source="core.summarize_binary",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
             properties={
                 "function_limit": _integer_schema("返回多少个关键函数摘要。", minimum=1),
-                "string_limit": _integer_schema("include_strings=true 时返回多少个关键字符串摘要。", minimum=1),
-                "import_limit_per_category": _integer_schema("每个导入分类最多展示多少个示例。", minimum=1),
-                "include_strings": _boolean_schema("是否显式构建字符串索引并返回关键字符串。默认 false；大型 UE/PDB 样本可能很慢。"),
+                "string_limit": _integer_schema("include_strings=true 时返回多少个关键字符串。", minimum=1),
+                "import_limit_per_category": _integer_schema("每类导入最多展示多少条。", minimum=1),
+                "include_strings": _boolean_schema("是否显式构建字符串索引。默认 false。"),
             },
             include_session=True,
         ),
-        handler=lambda core, arguments: core.summarize_binary(
-            function_limit=_int_or_default(arguments, "function_limit", 12),
-            string_limit=_int_or_default(arguments, "string_limit", 12),
-            import_limit_per_category=_int_or_default(arguments, "import_limit_per_category", 6),
-            include_strings=_bool_or_default(arguments, "include_strings", False),
-        ),
+        handler=triage_binary_handler,
+        requires_session=True,
         preconditions=("必须已存在活动会话，或显式提供 session_id。",),
-        empty_state_behavior="无活动会话时返回 session_required。",
-        input_example={"session_id": "sess-001", "function_limit": 10, "include_strings": False},
+        input_example={"session_id": "sess-001", "include_strings": False, "function_limit": 12},
     )
+    register_management_tool(
+        name="investigate_string",
+        description="V2 字符串牵引调查：输入字符串、URL、路径、错误文案或字符串地址，直接返回 string -> xref -> 所属函数的闭环线索。",
+        schema=_tool_input_schema(
+            properties={
+                "pattern": _string_schema("要查的字符串内容、错误文案、URL、路径或协议字段。"),
+                "addr": _string_schema("字符串地址；与 pattern 二选一。"),
+                "max_strings": _integer_schema("最多展开多少条匹配字符串。", minimum=1),
+                "max_usages": _integer_schema("最多返回多少条使用点。", minimum=1),
+            },
+            include_session=True,
+            any_of=(("pattern",), ("addr",)),
+        ),
+        handler=investigate_string_handler,
+        requires_session=True,
+        preconditions=("必须已存在活动会话，或显式提供 session_id。",),
+        input_example={"session_id": "sess-001", "pattern": "error", "max_strings": 10, "max_usages": 40},
+    )
+    register_management_tool(
+        name="explain_function",
+        description="V2 函数解释：一次返回函数画像、调用关系、字符串/常量、伪代码或托管 C# 表示；可选附带只读 microcode summary 线索。",
+        schema=_tool_input_schema(
+            properties={
+                **ADDR_OR_QUERY_PROPERTIES,
+                "include_asm": _boolean_schema("是否包含完整反汇编。默认 false。"),
+                "include_microcode": _boolean_schema("是否附带只读 microcode summary。需要 Hex-Rays。"),
+                "max_micro_instructions": _integer_schema("microcode summary 最多返回多少条指令。", minimum=1),
+            },
+            include_session=True,
+            any_of=(("addr",), ("query",)),
+        ),
+        handler=explain_function_handler,
+        requires_session=True,
+        preconditions=("必须已存在活动会话，或显式提供 session_id。",),
+        input_example={"session_id": "sess-001", "query": "main", "include_asm": False},
+    )
+    register_management_tool(
+        name="trace_input_to_check",
+        description="V2 输入到检查点追踪：围绕地址或函数做轻量数据流追踪，适合顺着输入、鉴权、路径、协议字段追到比较与分支。",
+        schema=_tool_input_schema(
+            properties={
+                "addr": _string_schema("起始地址、函数名或符号名。"),
+                "direction": _string_schema("追踪方向。", enum=["forward", "backward", "both"]),
+                "max_depth": _integer_schema("最大追踪深度。", minimum=1),
+            },
+            required=("addr",),
+            include_session=True,
+        ),
+        handler=trace_input_to_check_handler,
+        requires_session=True,
+        preconditions=("必须已存在活动会话，或显式提供 session_id。",),
+        input_example={"session_id": "sess-001", "addr": "main", "direction": "both", "max_depth": 4},
+    )
+    register_management_tool(
+        name="export_report",
+        description="V2 报告导出：导出适合 AI 复盘的当前样本报告，包含元数据、入口、导入、字符串、类型、结构与函数摘要。",
+        schema=_tool_input_schema(
+            properties={
+                "function_limit": _integer_schema("最多导出多少个函数。", minimum=1),
+                "string_limit": _integer_schema("最多导出多少条字符串。", minimum=1),
+                "global_limit": _integer_schema("最多导出多少个全局符号。", minimum=1),
+                "import_limit": _integer_schema("最多导出多少条导入。", minimum=1),
+                "type_limit": _integer_schema("最多导出多少条类型记录。", minimum=1),
+                "struct_limit": _integer_schema("最多导出多少条结构体记录。", minimum=1),
+                "include_decompile": _boolean_schema("函数导出中是否包含反编译伪代码。默认 false。"),
+                "include_asm": _boolean_schema("函数导出中是否包含汇编文本。默认 false。"),
+            },
+            include_session=True,
+        ),
+        handler=export_report_handler,
+        requires_session=True,
+        preconditions=("必须已存在活动会话，或显式提供 session_id。",),
+        input_example={"session_id": "sess-001", "function_limit": 80, "include_decompile": False},
+    )
+    register_management_tool(
+        name="save_workspace",
+        description="V2 保存工作区：默认保存当前 working.i64；只有显式传 path 时才导出到用户指定路径。",
+        schema=_tool_input_schema(
+            properties={"path": _string_schema("可选导出路径；为空则保存当前工作 IDB。")},
+            include_session=True,
+        ),
+        handler=save_workspace_handler,
+        requires_session=False,
+        preconditions=("若不传 session_id，则必须存在活动会话。",),
+        input_example={"session_id": "sess-001"},
+    )
+    register_management_tool(
+        name="close_target",
+        description="V2 关闭样本：关闭指定或当前会话，保留 .runtime/sessions 下的工作 IDB。",
+        schema=_tool_input_schema(include_session=True),
+        handler=close_target_handler,
+        requires_session=False,
+        preconditions=("若不传 session_id，则必须存在活动会话。",),
+        input_example={"session_id": "sess-001"},
+    )
+
+def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
     _tool(
         registry,
         name="list_functions",
@@ -1615,12 +1109,17 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     )
     _tool(
         registry,
-        name="get_xrefs_to",
-        description="读取目标地址的交叉引用（xref），查看谁引用了目标函数、符号、地址或字段。",
-        source="core.get_xrefs_to",
+        name="get_import_at",
+        description="IDA 9.3+ import-by-address：按地址解析导入项，并返回 module/name/ordinal 富化信息。",
+        source="core.get_import_at",
         runtime=runtime,
-        input_schema=_tool_input_schema(properties=ADDR_OR_QUERY_PROPERTIES, include_session=True, any_of=(("addr",), ("query",))),
-        handler=lambda core, arguments: core.get_xrefs_to(_addr_or_query(arguments)),
+        input_schema=_tool_input_schema(
+            properties={"addr": _string_schema("导入表地址、IAT thunk 或外部调用目标地址。")},
+            required=("addr",),
+            include_session=True,
+        ),
+        handler=lambda core, arguments: core.get_import_at(_require_string(arguments, "addr")),
+        input_example={"session_id": "sess-001", "addr": "0x401000"},
     )
     _tool(
         registry,
@@ -1642,19 +1141,6 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
             direction=_string_or_default(arguments, "direction", "to"),
             filter_text=_string_or_default(arguments, "filter", ""),
         ),
-    )
-    _tool(
-        registry,
-        name="get_xrefs_to_field",
-        description="读取结构字段交叉引用。",
-        source="core.get_xrefs_to_field",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
-            properties={"struct_name": _string_schema("结构体名。"), "field_name": _string_schema("字段名。")},
-            required=("struct_name", "field_name"),
-            include_session=True,
-        ),
-        handler=lambda core, arguments: core.get_xrefs_to_field(_require_string(arguments, "struct_name"), _require_string(arguments, "field_name")),
     )
     _tool(
         registry,
@@ -1700,30 +1186,6 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
         runtime=runtime,
         input_schema=_tool_input_schema(properties={**SEARCH_TEXT_PROPERTIES, **PAGINATION_PROPERTIES}, include_session=True, required=("pattern",)),
         handler=lambda core, arguments: core.find_strings(_search_text(arguments), offset=_int_or_default(arguments, "offset", 0), limit=_int_or_default(arguments, "count", _int_or_default(arguments, "limit", 100))),
-    )
-    _tool(
-        registry,
-        name="find_string_usage",
-        description="按字符串或字符串地址直接查使用点，返回 字符串 -> xref/引用点 -> 所属函数 的闭环结果，适合替代 grep / strings / 手工拼接。",
-        source="core.find_string_usage",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
-            properties={
-                "pattern": _string_schema("要查的字符串内容、错误文案、URL、路径或协议字段。"),
-                "addr": _string_schema("字符串地址；与 pattern 二选一，也可同时传入做交叉收窄。"),
-                "max_strings": _integer_schema("最多展开多少条匹配字符串。", minimum=1),
-                "max_usages": _integer_schema("最多返回多少条使用点。", minimum=1),
-            },
-            include_session=True,
-            any_of=(("pattern",), ("addr",)),
-        ),
-        handler=lambda core, arguments: core.find_string_usage(
-            pattern=_string_or_default(arguments, "pattern", ""),
-            addr=_string_or_default(arguments, "addr", ""),
-            max_strings=_int_or_default(arguments, "max_strings", 20),
-            max_usages=_int_or_default(arguments, "max_usages", 100),
-        ),
-        input_example={"session_id": "sess-001", "pattern": "error", "max_strings": 10, "max_usages": 30},
     )
     _tool(
         registry,
@@ -2015,6 +1477,46 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     )
     _tool(
         registry,
+        name="microcode_summary",
+        description="读取 Hex-Rays microcode 只读摘要，返回块、指令、defs/uses 线索；这是 experimental 线索工具，不修改数据库。",
+        source="core.microcode_summary",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                **ADDR_OR_QUERY_PROPERTIES,
+                "max_instructions": _integer_schema("最多返回多少条 microcode 指令。", minimum=1),
+            },
+            include_session=True,
+            any_of=(("addr",), ("query",)),
+        ),
+        handler=lambda core, arguments: core.microcode_summary(
+            _addr_or_query(arguments),
+            max_instructions=_int_or_default(arguments, "max_instructions", 80),
+        ),
+        input_example={"session_id": "sess-001", "query": "main", "max_instructions": 80},
+    )
+    _tool(
+        registry,
+        name="microcode_def_use",
+        description="读取 Hex-Rays microcode def-use 线索，适合辅助确认变量定义、使用和条件检查来源；不修改数据库。",
+        source="core.microcode_def_use",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                **ADDR_OR_QUERY_PROPERTIES,
+                "max_instructions": _integer_schema("最多扫描多少条 microcode 指令。", minimum=1),
+            },
+            include_session=True,
+            any_of=(("addr",), ("query",)),
+        ),
+        handler=lambda core, arguments: core.microcode_def_use(
+            _addr_or_query(arguments),
+            max_instructions=_int_or_default(arguments, "max_instructions", 120),
+        ),
+        input_example={"session_id": "sess-001", "query": "main", "max_instructions": 120},
+    )
+    _tool(
+        registry,
         name="convert_integer",
         description="做整数进制/字节转换。",
         source="core.convert_integer",
@@ -2259,6 +1761,28 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
         ),
         handler=lambda core, arguments: core.write_ints(_json_object_list(arguments, "items")),
         writeback_kind="write_int",
+    )
+    _tool(
+        registry,
+        name="microcode_experiment",
+        description="实验性 microcode mutation。该工具只应在 --unsafe 与 --tool-surface expert 同时开启时暴露，用于局部 microcode 实验，不保证长期稳定。",
+        source="core.microcode_experiment",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                **ADDR_OR_QUERY_PROPERTIES,
+                "action": _string_schema("实验动作。第一版仅支持 mark_chains_dirty。", enum=["mark_chains_dirty"]),
+            },
+            include_session=True,
+            any_of=(("addr",), ("query",)),
+        ),
+        handler=lambda core, arguments: core.microcode_experiment(
+            _addr_or_query(arguments),
+            action=_string_or_default(arguments, "action", "mark_chains_dirty"),
+        ),
+        writeback_kind="microcode_experiment",
+        feature_gate="unsafe",
+        input_example={"session_id": "sess-001", "query": "main", "action": "mark_chains_dirty"},
     )
     _tool(
         registry,
@@ -2614,7 +2138,7 @@ def _register_resources(
         def wrapped(params: dict[str, str]) -> JsonValue:
             try:
                 runtime.activate_for_request(None, context_id=request_context_id(params, required=session_requires_context))
-                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(IdaCore()))))
+                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(_new_core()))))
             except Exception as exc:
                 return _normalize_tool_data(
                     _error_result_from_exception(
@@ -2632,7 +2156,7 @@ def _register_resources(
         def wrapped(params: dict[str, str]) -> JsonValue:
             try:
                 runtime.activate_for_request(None, context_id=request_context_id(params, required=session_requires_context))
-                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(IdaCore(), params))))
+                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(_new_core(), params))))
             except Exception as exc:
                 return _normalize_tool_data(
                     _error_result_from_exception(
@@ -2669,7 +2193,7 @@ def _register_resources(
 
     def current_session_resource(context_id: str | None) -> JsonObject:
         try:
-            session: JsonValue = _normalize_tool_data(runtime.current_binary(context_id=context_id))
+            session: JsonValue = _normalize_tool_data(runtime.current_target(context_id=context_id))
         except SessionRequiredError:
             session = None
         return normalize_json_object({"session": session})
@@ -2679,9 +2203,9 @@ def _register_resources(
         current_session: JsonValue = None
         current_snapshot: JsonValue = None
         try:
-            current_session = _normalize_tool_data(runtime.current_binary(context_id=context_id))
+            current_session = _normalize_tool_data(runtime.current_target(context_id=context_id))
             runtime.activate_for_request(None, context_id=context_id)
-            current_snapshot = IdaCore().capabilities()
+            current_snapshot = _new_core().capabilities()
         except Exception:
             current_session = None
             current_snapshot = None
@@ -2695,7 +2219,7 @@ def _register_resources(
                 "ida://idb/segments",
                 "ida://idb/entrypoints",
                 "ida://idb/capabilities",
-                "ida://survey",
+                "ida://triage",
                 "ida://types",
                 "ida://structs",
                 "ida://functions",
@@ -2789,7 +2313,7 @@ def _register_resources(
             requires_session=False,
         )
     )
-    resources.register_static(ResourceSpec("ida://survey", "survey", "当前样本的综合概览。", "application/json", active_reader("resource.survey", lambda core: core.survey_binary()), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://triage", "triage", "当前样本的 V2 triage 概览。", "application/json", active_reader("resource.triage", lambda core: core.binary_survey_snapshot()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://types", "types", "当前类型目录。", "application/json", active_reader("resource.types", lambda core: core.query_types()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://structs", "structs", "当前结构体列表。", "application/json", active_reader("resource.structs", lambda core: core.search_structs()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://functions", "functions", "当前函数列表。", "application/json", active_reader("resource.functions", lambda core: core.list_functions(limit=2000)), requires_context=session_requires_context))
@@ -2831,7 +2355,7 @@ def _register_resources(
             "sessions",
             "当前所有会话；即使为空也返回统一 envelope。",
             "application/json",
-            context_reader("resource.sessions", lambda context_id: runtime.list_binaries(context_id=context_id)),
+            context_reader("resource.sessions", lambda context_id: runtime.list_targets(context_id=context_id)),
             scope=context_scope,
             requires_session=False,
             requires_context=session_requires_context,
@@ -2959,21 +2483,51 @@ def _register_resources(
     )
 
 
-def build_service(runtime: HeadlessRuntime, config: AppConfig, *, allow_unsafe: bool, allow_debugger: bool, profile_path: Path | None) -> ServiceBundle:
+def build_service(
+    runtime: HeadlessRuntime,
+    *,
+    allow_unsafe: bool,
+    allow_debugger: bool,
+    tool_surface: ToolSurface = "slim",
+    profile_path: Path | None = None,
+) -> ServiceBundle:
     """构建完整纯实现 headless 服务。"""
     tools = ToolRegistry()
     resources = ResourceRegistry()
-    protected = _management_tools(tools, runtime, config, allow_unsafe=allow_unsafe, allow_debugger=allow_debugger)
+    prompts = build_prompt_registry()
+    _management_tools(tools, runtime)
     _register_read_tools(tools, runtime)
     if allow_unsafe:
         _register_unsafe_tools(tools, runtime)
     if allow_debugger:
         _register_debug_tools(tools, runtime)
+    _apply_tool_surface(tools, tool_surface)
     if profile_path is not None:
         whitelist = load_profile(profile_path)
-        tools.apply_whitelist(whitelist, protected=protected)
+        tools.apply_whitelist(whitelist)
     _register_resources(resources, runtime, tools, allow_unsafe=allow_unsafe, allow_debugger=allow_debugger)
-    return ServiceBundle(tools=tools, resources=resources)
+    return ServiceBundle(tools=tools, resources=resources, prompts=prompts)
+
+
+def _apply_tool_surface(tools: ToolRegistry, tool_surface: ToolSurface) -> None:
+    """按 V2 工具面裁剪注册表。"""
+    if tool_surface == "slim":
+        tools.apply_whitelist(SLIM_TOOL_NAMES)
+        return
+    if tool_surface == "full":
+        registered = {
+            str(item["name"])
+            for item in tools.list_tools()
+            if isinstance(item.get("name"), str)
+        }
+        tools.apply_whitelist(registered - EXPERT_ONLY_TOOL_NAMES)
+        return
+    registered = {
+        str(item["name"])
+        for item in tools.list_tools()
+        if isinstance(item.get("name"), str)
+    }
+    tools.apply_whitelist(registered)
 
 
 def _require_string(arguments: JsonObject, key: str) -> str:

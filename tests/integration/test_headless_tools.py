@@ -44,7 +44,7 @@ def expect_optional_object(value: JsonValue, *, name: str) -> JsonObject:
 
 
 class HeadlessToolTests(unittest.TestCase):
-    """覆盖多会话、资源读取、目录分析与危险工具。"""
+    """覆盖 V2 多会话、资源读取与危险工具。"""
 
     @staticmethod
     def _repo_root() -> Path:
@@ -60,17 +60,16 @@ class HeadlessToolTests(unittest.TestCase):
             )
         ).resolve()
         cls.pe_fixture = (cls.repo_root / "tests" / "fixtures" / "minimal_pe.exe").resolve()
-        cls.mixed_fixture = (cls.repo_root / "tests" / "fixtures" / "mixed").resolve()
 
     def setUp(self) -> None:
         self.config = load_config(self.repo_root / "setting.toml")
         self.runtime = HeadlessRuntime()
         self.service = build_service(
             self.runtime,
-            self.config,
             allow_unsafe=True,
             allow_debugger=True,
             profile_path=None,
+            tool_surface="expert",
         )
         self.server = StdioMcpServer(
             tools=self.service.tools,
@@ -116,26 +115,25 @@ class HeadlessToolTests(unittest.TestCase):
         return expect_object(response["result"], name="resource.result")
 
     def test_multi_session_open_switch_close_and_resources(self) -> None:
-        opened_elf = self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "elf"})
+        opened_elf = self._call_tool("open_target", {"path": str(self.elf_fixture), "session_id": "elf"})
         self.assertEqual(opened_elf["status"], "ok")
-        opened_pe = self._call_tool("open_binary", {"path": str(self.pe_fixture), "session_id": "pe"})
+        opened_pe = self._call_tool("open_target", {"path": str(self.pe_fixture), "session_id": "pe"})
         self.assertEqual(opened_pe["status"], "ok")
 
-        listing = self._call_tool("list_binaries")
+        listing = self._call_tool("get_workspace_state")
         self.assertEqual(listing["status"], "ok")
-        data = listing["data"]
-        self.assertIsInstance(data, list)
-        assert isinstance(data, list)
+        data = expect_object(listing["data"], name="workspace_state.data")
+        sessions = expect_list(data["sessions"], name="workspace_state.sessions")
         session_ids = [
             str(item["session_id"])
-            for item in data
+            for item in sessions
             if isinstance(item, dict) and isinstance(item.get("session_id"), str)
         ]
         self.assertIn("elf", session_ids)
         self.assertIn("pe", session_ids)
 
-        switched = self._call_tool("switch_binary", {"session_id": "elf"})
-        self.assertEqual(switched["status"], "ok")
+        activated = self._call_tool("list_functions", {"session_id": "elf", "count": 1})
+        self.assertEqual(activated["status"], "ok")
 
         current_resource = self._read_resource("ida://session/current")
         contents = expect_list(current_resource["contents"], name="current_resource.contents")
@@ -147,20 +145,19 @@ class HeadlessToolTests(unittest.TestCase):
         metadata = self._read_resource("ida://idb/metadata")
         self.assertFalse(bool(metadata.get("isError", False)))
 
-        close_pe = self._call_tool("close_binary", {"session_id": "pe"})
+        close_pe = self._call_tool("close_target", {"session_id": "pe"})
         self.assertEqual(close_pe["status"], "ok")
 
     def test_core_read_tools_and_unsafe_write_tool(self) -> None:
-        self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "elf-main"})
+        self._call_tool("open_target", {"path": str(self.elf_fixture), "session_id": "elf-main"})
 
-        survey = self._call_tool("survey_binary", {"session_id": "elf-main"})
+        survey = self._call_tool("triage_binary", {"session_id": "elf-main"})
         self.assertIn(survey["status"], ("ok", "degraded"))
 
-        summary = self._call_tool("summarize_binary", {"session_id": "elf-main", "function_limit": 8, "string_limit": 8})
+        summary = self._call_tool("triage_binary", {"session_id": "elf-main", "function_limit": 8, "string_limit": 8})
         self.assertEqual(summary["status"], "ok")
-        summary_data = summary["data"]
-        self.assertIsInstance(summary_data, dict)
-        assert isinstance(summary_data, dict)
+        summary_payload = expect_object(summary["data"], name="triage.data")
+        summary_data = expect_object(summary_payload["summary"], name="triage.data.summary")
         self.assertIn("interesting_functions", summary_data)
         self.assertIn("interesting_strings", summary_data)
         self.assertIn("recommended_next_tools", summary_data)
@@ -190,7 +187,7 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertIsInstance(first_string_addr, str)
         assert isinstance(first_string_addr, str)
 
-        string_usage = self._call_tool("find_string_usage", {"addr": first_string_addr, "max_usages": 20, "session_id": "elf-main"})
+        string_usage = self._call_tool("investigate_string", {"addr": first_string_addr, "max_usages": 20, "session_id": "elf-main"})
         self.assertEqual(string_usage["status"], "ok")
         string_usage_data = string_usage["data"]
         self.assertIsInstance(string_usage_data, dict)
@@ -214,7 +211,7 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertEqual(comment_data.get("writeback_kind"), "comment")
         self.assertFalse(bool(comment_data.get("persistent_after_save")))
 
-        saved = self._call_tool("save_binary", {"session_id": "elf-main"})
+        saved = self._call_tool("save_workspace", {"session_id": "elf-main"})
         self.assertEqual(saved["status"], "ok")
         saved_data = saved["data"]
         self.assertIsInstance(saved_data, dict)
@@ -228,7 +225,7 @@ class HeadlessToolTests(unittest.TestCase):
         capability_matrix = self._read_resource("ida://capability-matrix")
         self.assertFalse(bool(capability_matrix.get("isError", False)))
 
-        survey_resource = self._read_resource("ida://survey")
+        survey_resource = self._read_resource("ida://triage")
         self.assertFalse(bool(survey_resource.get("isError", False)))
 
         functions_resource = self._read_resource("ida://functions")
@@ -344,13 +341,13 @@ class HeadlessToolTests(unittest.TestCase):
         full_export_data = full_export["data"]
         self.assertIsInstance(full_export_data, dict)
         assert isinstance(full_export_data, dict)
-        self.assertEqual(full_export_data.get("bundle_format"), "full_analysis_v1")
+        self.assertEqual(full_export_data.get("bundle_format"), "analysis_report_v2")
         self.assertIn("summary", full_export_data)
         self.assertIn("functions", full_export_data)
         self.assertIn("types", full_export_data)
 
     def test_extended_type_stack_patch_and_trace_tools(self) -> None:
-        self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "elf-extended"})
+        self._call_tool("open_target", {"path": str(self.elf_fixture), "session_id": "elf-extended"})
 
         type_name = f"__Stage2Struct_{os.getpid()}__"
         stack_name = f"__stage2_stack_{os.getpid()}__"
@@ -580,42 +577,8 @@ class HeadlessToolTests(unittest.TestCase):
         assert isinstance(warnings, list)
         self.assertFalse(any("暂未实现" in str(item) for item in warnings))
 
-    def test_analyze_directory_restores_previous_session(self) -> None:
-        self._call_tool("open_binary", {"path": str(self.elf_fixture), "session_id": "restore-target"})
-        before = self._call_tool("current_binary")
-        self.assertEqual(before["status"], "ok")
-
-        analyzed = self._call_tool(
-            "analyze_directory",
-            {
-                "path": str(self.mixed_fixture),
-                "recursive": True,
-                "max_candidates": 5,
-                "max_deep_analysis": 2,
-                "prefer_entry_binary": True,
-                "prefer_user_code": True,
-                "scoring_profile": "entry_only",
-            },
-        )
-        self.assertIn(analyzed["status"], ("ok", "degraded"))
-        summary = expect_object(analyzed["data"], name="analyze_directory.data")
-        self.assertIn("summary", summary)
-        summary_block = expect_object(summary["summary"], name="analyze_directory.summary")
-        policy = expect_object(summary_block.get("policy"), name="analyze_directory.summary.policy")
-        self.assertEqual(policy.get("scoring_profile"), "entry_only")
-
-        after = self._call_tool("current_binary")
-        self.assertEqual(after["status"], "ok")
-        after_data = after["data"]
-        self.assertIsInstance(after_data, dict)
-        assert isinstance(after_data, dict)
-        current_session = after_data.get("session")
-        self.assertIsInstance(current_session, dict)
-        assert isinstance(current_session, dict)
-        self.assertEqual(current_session.get("session_id"), "restore-target")
-
     def test_query_imports_filter_works(self) -> None:
-        self._call_tool("open_binary", {"path": str(self.pe_fixture), "session_id": "pe-imports"})
+        self._call_tool("open_target", {"path": str(self.pe_fixture), "session_id": "pe-imports"})
         imports_result = self._call_tool("list_imports", {"session_id": "pe-imports"})
         self.assertEqual(imports_result["status"], "ok")
         imports_data = imports_result["data"]
@@ -644,10 +607,10 @@ class HeadlessToolTests(unittest.TestCase):
         isolated_runtime = HeadlessRuntime(isolated_contexts=True)
         isolated_service = build_service(
             isolated_runtime,
-            self.config,
             allow_unsafe=True,
             allow_debugger=True,
             profile_path=None,
+            tool_surface="expert",
         )
         isolated_server = StdioMcpServer(
             tools=isolated_service.tools,
@@ -689,41 +652,39 @@ class HeadlessToolTests(unittest.TestCase):
         try:
             self.assertEqual(
                 call(
-                    "open_binary",
+                    "open_target",
                     {"path": str(self.elf_fixture), "session_id": "agent1-elf", "context_id": "agent-1"},
                 )["status"],
                 "ok",
             )
             self.assertEqual(
                 call(
-                    "open_binary",
+                    "open_target",
                     {"path": str(self.pe_fixture), "session_id": "agent1-pe", "context_id": "agent-1"},
                 )["status"],
                 "ok",
             )
             self.assertEqual(
                 call(
-                    "open_binary",
+                    "open_target",
                     {"path": str(self.elf_fixture), "session_id": "agent2-elf", "context_id": "agent-2"},
                 )["status"],
                 "ok",
             )
 
-            agent1_sessions = call("list_binaries", {"context_id": "agent-1"})
+            agent1_sessions = call("get_workspace_state", {"context_id": "agent-1"})
             self.assertEqual(agent1_sessions["status"], "ok")
-            agent1_data = agent1_sessions["data"]
-            self.assertIsInstance(agent1_data, list)
-            assert isinstance(agent1_data, list)
+            agent1_state = expect_object(agent1_sessions["data"], name="agent1.state")
+            agent1_data = expect_list(agent1_state["sessions"], name="agent1.sessions")
             self.assertEqual(
                 {str(item["session_id"]) for item in agent1_data if isinstance(item, dict)},
                 {"agent1-elf", "agent1-pe"},
             )
 
-            agent2_sessions = call("list_binaries", {"context_id": "agent-2"})
+            agent2_sessions = call("get_workspace_state", {"context_id": "agent-2"})
             self.assertEqual(agent2_sessions["status"], "ok")
-            agent2_data = agent2_sessions["data"]
-            self.assertIsInstance(agent2_data, list)
-            assert isinstance(agent2_data, list)
+            agent2_state = expect_object(agent2_sessions["data"], name="agent2.state")
+            agent2_data = expect_list(agent2_state["sessions"], name="agent2.sessions")
             self.assertEqual(
                 {str(item["session_id"]) for item in agent2_data if isinstance(item, dict)},
                 {"agent2-elf"},
@@ -731,37 +692,37 @@ class HeadlessToolTests(unittest.TestCase):
 
             self.assertEqual(
                 expect_optional_object(
-                    expect_object(call("current_binary", {"context_id": "agent-1"})["data"], name="agent1.current")["session"],
+                    expect_object(call("get_workspace_state", {"context_id": "agent-1"})["data"], name="agent1.current")["current_session"],
                     name="agent1.current.session",
                 )["session_id"],
                 "agent1-pe",
             )
             self.assertEqual(
                 expect_optional_object(
-                    expect_object(call("current_binary", {"context_id": "agent-2"})["data"], name="agent2.current")["session"],
+                    expect_object(call("get_workspace_state", {"context_id": "agent-2"})["data"], name="agent2.current")["current_session"],
                     name="agent2.current.session",
                 )["session_id"],
                 "agent2-elf",
             )
 
-            switched = call("switch_binary", {"session_id": "agent1-elf", "context_id": "agent-1"})
+            switched = call("list_functions", {"session_id": "agent1-elf", "context_id": "agent-1", "count": 1})
             self.assertEqual(switched["status"], "ok")
             self.assertEqual(
                 expect_optional_object(
-                    expect_object(call("current_binary", {"context_id": "agent-1"})["data"], name="agent1.current.after")["session"],
+                    expect_object(call("get_workspace_state", {"context_id": "agent-1"})["data"], name="agent1.current.after")["current_session"],
                     name="agent1.current.after.session",
                 )["session_id"],
                 "agent1-elf",
             )
             self.assertEqual(
                 expect_optional_object(
-                    expect_object(call("current_binary", {"context_id": "agent-2"})["data"], name="agent2.current.after")["session"],
+                    expect_object(call("get_workspace_state", {"context_id": "agent-2"})["data"], name="agent2.current.after")["current_session"],
                     name="agent2.current.after.session",
                 )["session_id"],
                 "agent2-elf",
             )
 
-            forbidden = call("switch_binary", {"session_id": "agent2-elf", "context_id": "agent-1"})
+            forbidden = call("list_functions", {"session_id": "agent2-elf", "context_id": "agent-1", "count": 1})
             self.assertEqual(forbidden["status"], "error")
             forbidden_error = forbidden["error"]
             self.assertIsInstance(forbidden_error, dict)

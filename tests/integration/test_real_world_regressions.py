@@ -58,10 +58,10 @@ class RealWorldRegressionTests(unittest.TestCase):
         self.runtime = HeadlessRuntime()
         self.service = build_service(
             self.runtime,
-            self.config,
             allow_unsafe=True,
             allow_debugger=True,
             profile_path=None,
+            tool_surface="expert",
         )
         self.server = StdioMcpServer(
             tools=self.service.tools,
@@ -121,7 +121,7 @@ class RealWorldRegressionTests(unittest.TestCase):
             shutil.copy2(self.real_managed_fixture, copied_assembly)
 
             opened = self._call_tool(
-                "open_binary",
+                "open_target",
                 {"path": str(copied_assembly), "session_id": "managed-real"},
             )
             self.assertEqual(opened["status"], "ok")
@@ -194,17 +194,17 @@ class RealWorldRegressionTests(unittest.TestCase):
             self.assertIn("bool __fastcall", signature)
 
             saved = self._call_tool(
-                "save_binary",
+                "save_workspace",
                 {"path": str(saved_idb), "session_id": "managed-real"},
             )
             self.assertEqual(saved["status"], "ok")
             self.assertTrue(saved_idb.exists())
 
-            closed = self._call_tool("close_binary", {"session_id": "managed-real"})
+            closed = self._call_tool("close_target", {"session_id": "managed-real"})
             self.assertEqual(closed["status"], "ok")
 
             reopened = self._call_tool(
-                "open_binary",
+                "open_target",
                 {"path": str(saved_idb), "session_id": "managed-reopen"},
             )
             self.assertEqual(reopened["status"], "ok")
@@ -228,7 +228,7 @@ class RealWorldRegressionTests(unittest.TestCase):
         self._require_real_native()
 
         managed_opened = self._call_tool(
-            "open_binary",
+            "open_target",
             {"path": str(self.real_managed_fixture), "session_id": "managed-strings"},
         )
         self.assertEqual(managed_opened["status"], "ok")
@@ -254,7 +254,7 @@ class RealWorldRegressionTests(unittest.TestCase):
         self.assertEqual(managed_read_first.get("string"), "{0}/save{1}.txt")
 
         native_opened = self._call_tool(
-            "open_binary",
+            "open_target",
             {"path": str(self.real_native_fixture), "session_id": "native-strings"},
         )
         self.assertEqual(native_opened["status"], "ok")

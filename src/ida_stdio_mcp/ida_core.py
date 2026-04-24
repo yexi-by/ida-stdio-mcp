@@ -72,6 +72,10 @@ GET_ENTRY_QTY = ida_entry.get_entry_qty if ida_entry is not None else None
 GET_ENTRY_ORDINAL = cast(Callable[[int], int], ida_entry.get_entry_ordinal) if ida_entry is not None else None
 GET_ENTRY = cast(Callable[[int], int], ida_entry.get_entry) if ida_entry is not None else None
 GET_ENTRY_NAME = cast(Callable[[int], str], ida_entry.get_entry_name) if ida_entry is not None else None
+# IDA 9.3 的 import-by-address API 使用 SWIG 对象出参；公开存根还不稳定，
+# 因此边界处先以 object 承接，再由 `_import_entry_from_runtime_object` 收窄。
+IMPORT_ENTRY_T = cast(Callable[[], object] | None, getattr(ida_nalt, "import_entry_t", None))
+GET_IMPORT_ENTRY = cast(Callable[[object, int], bool] | None, getattr(ida_nalt, "get_import_entry", None))
 GET_FUNC = cast(Callable[[int], ida_funcs.func_t | None], ida_funcs.get_func)
 GET_FUNC_NAME = cast(Callable[[int], str], ida_funcs.get_func_name)
 GET_NAME = cast(Callable[[int], str], ida_name.get_name)
@@ -212,7 +216,7 @@ class IdaCore:
                 "is_expensive": True,
                 "can_build": True,
                 "reason": "托管字符串需要从反汇编/IL 文本里按需抽取，默认摘要不会主动扫描全部函数。",
-                "build_tools": ["list_strings", "find_strings", "find_string_usage"],
+                "build_tools": ["list_strings", "find_strings", "investigate_string"],
             })
         return self._json_object({
             "state": "deferred",
@@ -220,7 +224,7 @@ class IdaCore:
             "is_expensive": True,
             "can_build": True,
             "reason": "IDA 原生字符串列表由 ida_strlist.build_strlist 构建；大型 UE/PDB 数据库上可能持续数分钟，默认摘要不会主动触发。",
-            "build_tools": ["list_strings", "find_strings", "find_string_usage"],
+            "build_tools": ["list_strings", "find_strings", "investigate_string"],
         })
 
     def capability_matrix(self) -> JsonObject:
@@ -248,19 +252,6 @@ class IdaCore:
             ],
             "current_domain": self.get_analysis_domain(),
             "current_snapshot": self.capabilities(),
-        })
-
-    def health(self) -> JsonObject:
-        """返回当前数据库健康状态。"""
-        return self._json_object({
-            "metadata": self.idb_metadata(),
-            "processor": ida_idp.get_idp_name(),
-            "has_hexrays": self.hexrays_available(),
-            "is_auto_analysis_enabled": bool(ida_auto.is_auto_enabled()),
-            "entry_count": len(self.entrypoints()),
-            "segment_count": len(self.segments()),
-            "capabilities": self.capabilities(),
-            "debugger": self.debugger_health(),
         })
 
     def idb_metadata(self) -> JsonObject:
@@ -349,7 +340,7 @@ class IdaCore:
         """返回基于代码引用的轻量调用图摘要。"""
         return self._callgraph_summary(self.list_functions(limit=function_limit))
 
-    def survey_binary(self, *, include_strings: bool = False, string_limit: int = 0) -> JsonObject:
+    def binary_survey_snapshot(self, *, include_strings: bool = False, string_limit: int = 0) -> JsonObject:
         """返回默认不触发重型字符串索引的二进制概览。
 
         Args:
@@ -369,7 +360,7 @@ class IdaCore:
                 continue
             try:
                 callees = self.get_callees(addr_text)
-                xrefs = self.get_xrefs_to(addr_text)
+                xrefs = self.xrefs_to(addr_text)
             except Exception:
                 callees = []
                 xrefs = []
@@ -414,7 +405,7 @@ class IdaCore:
             },
         })
 
-    def summarize_binary(
+    def triage_binary_snapshot(
         self,
         *,
         function_limit: int = 12,
@@ -431,7 +422,7 @@ class IdaCore:
             include_strings: 是否显式构建字符串索引。默认关闭，避免大型
                 UE/PDB 数据库在摘要阶段卡进 `ida_strlist.build_strlist`。
         """
-        survey = self.survey_binary(include_strings=include_strings, string_limit=string_limit)
+        survey = self.binary_survey_snapshot(include_strings=include_strings, string_limit=string_limit)
         metadata = self.idb_metadata()
         capabilities = self.capabilities()
         statistics_value = survey.get("statistics")
@@ -468,7 +459,7 @@ class IdaCore:
         )
         opening_moves: list[JsonValue] = [
             "优先查看 entrypoints 与 interesting_functions，先锁定入口函数、初始化逻辑或明显的业务函数。",
-            "如果 interesting_strings 里已经出现 URL、路径、错误文案、协议字段，下一步直接用 find_string_usage 追到所属函数。",
+            "如果 interesting_strings 里已经出现 URL、路径、错误文案、协议字段，下一步直接用 investigate_string 追到所属函数。",
             "如果需要函数级深挖，继续调用 decompile_function、get_function_profile、read_struct、query_types。",
         ]
         if analysis_domain == "managed":
@@ -575,7 +566,7 @@ class IdaCore:
                 "callees": self.get_callees(hex(func.start_ea)),
                 "callers": self.get_callers(hex(func.start_ea)),
                 "xrefs": {
-                    "to": self.get_xrefs_to(hex(func.start_ea)),
+                    "to": self.xrefs_to(hex(func.start_ea)),
                     "from": self.get_xrefs_from(hex(func.start_ea)),
                 },
                 "comments": self.function_comments(func.start_ea),
@@ -732,6 +723,23 @@ class IdaCore:
             ida_nalt.enum_import_names(index, callback)
         return results[offset : offset + limit]
 
+    def get_import_at(self, addr: str) -> JsonObject:
+        """按地址读取导入项。"""
+        ea = self.parse_address(addr)
+        import_entry = self._import_entry_for_ea(ea)
+        if import_entry is None:
+            return self._json_object(
+                {
+                    "addr": hex(ea),
+                    "found": False,
+                    "module": "",
+                    "name": "",
+                    "ordinal": None,
+                }
+            )
+        import_entry["found"] = True
+        return import_entry
+
     def query_imports(self, *, module: str = "", filter_text: str = "", offset: int = 0, limit: int = 200) -> list[JsonObject]:
         """按条件查询导入。"""
         module_text = module.lower()
@@ -747,7 +755,7 @@ class IdaCore:
             results.append(item)
         return results[offset : offset + limit]
 
-    def get_xrefs_to(self, target: str) -> list[JsonObject]:
+    def xrefs_to(self, target: str) -> list[JsonObject]:
         """读取指向目标地址的 xref。"""
         ea = self.parse_address(target)
         return [
@@ -776,14 +784,14 @@ class IdaCore:
         if direction == "from":
             items = self.get_xrefs_from(query)
         elif direction == "to":
-            items = self.get_xrefs_to(query)
+            items = self.xrefs_to(query)
         else:
             raise ValueError("direction 必须是 from 或 to")
         if not filter_text:
             return items
         return [item for item in items if filter_text.lower() in str(item.get("type", "")).lower()]
 
-    def get_xrefs_to_field(self, struct_name: str, field_name: str) -> list[JsonObject]:
+    def xrefs_to_field(self, struct_name: str, field_name: str) -> list[JsonObject]:
         """读取结构体字段 xref。"""
         struct_id = int(idc.get_struc_id(struct_name))
         if struct_id in (-1, BADADDR):
@@ -794,7 +802,7 @@ class IdaCore:
         member_id = int(idc.get_member_id(struct_id, member_offset))
         if member_id in (-1, BADADDR):
             raise ValueError(f"无法解析字段 ID：{struct_name}.{field_name}")
-        return self.get_xrefs_to(hex(member_id))
+        return self.xrefs_to(hex(member_id))
 
     def get_callees(self, query: str) -> list[JsonObject]:
         """读取函数调用目标。"""
@@ -812,15 +820,17 @@ class IdaCore:
                 resolved = callee_func.start_ea if callee_func is not None else target
                 if resolved in edges:
                     continue
+                import_info = self._import_entry_for_ea(resolved) if callee_func is None else None
                 edges[resolved] = {
                     "addr": hex(resolved),
                     "from_addr": hex(func.start_ea),
                     "to_addr": hex(resolved),
-                    "name": self.best_name(resolved),
+                    "name": str(import_info.get("name", "")) if import_info is not None else self.best_name(resolved),
                     "type": "internal" if callee_func is not None else "external",
                     "edge_kind": edge_kind,
                     "source": "coderefs",
                     "resolution": "function_start" if callee_func is not None else "direct_address",
+                    "import": import_info,
                 }
         return list(edges.values())
 
@@ -911,7 +921,7 @@ class IdaCore:
         next_offset = offset + limit if offset + limit < len(matched) else None
         return self._json_object({"data": matched[offset : offset + limit], "next_offset": next_offset})
 
-    def find_string_usage(
+    def investigate_string(
         self,
         *,
         pattern: str = "",
@@ -1022,7 +1032,7 @@ class IdaCore:
             "matches": match_rows,
             "usages": usages,
             "functions": functions,
-            "recommended_next_tools": ["decompile_function", "get_function_profile", "get_xrefs_to", "export_full_analysis"],
+            "recommended_next_tools": ["explain_function", "decompile_function", "query_xrefs", "export_report"],
         })
 
     def find_bytes(self, pattern: str, *, max_hits: int = 100) -> list[JsonObject]:
@@ -1288,7 +1298,7 @@ class IdaCore:
                 row["decompile_representation"] = decompile.get("representation")
                 row["warnings"] = decompile.get("warnings")
                 row["xrefs"] = self._json_object({
-                    "to": self.get_xrefs_to(addr_value),
+                    "to": self.xrefs_to(addr_value),
                     "from": self.get_xrefs_from(addr_value),
                 })
                 row["stack_frame"] = self.get_stack_frame(addr_value)
@@ -1335,12 +1345,12 @@ class IdaCore:
         include_asm: bool = False,
     ) -> JsonObject:
         """导出当前 IDB 的结构化分析总包。"""
-        summary = self.summarize_binary(
+        summary = self.triage_binary_snapshot(
             function_limit=min(function_limit, 12),
             string_limit=min(string_limit, 12),
             import_limit_per_category=6,
         )
-        survey = self.survey_binary()
+        triage_snapshot = self.binary_survey_snapshot()
         functions_block = self.export_functions(format_name="json", limit=function_limit)[0]
         raw_functions = functions_block.get("functions")
         functions = cast(list[JsonObject], raw_functions) if isinstance(raw_functions, list) else []
@@ -1362,17 +1372,17 @@ class IdaCore:
         strings = self.list_strings(offset=0, limit=string_limit)
         all_types = self.query_types()
         all_structs = self.search_structs()
-        statistics_value = survey.get("statistics")
+        statistics_value = triage_snapshot.get("statistics")
         statistics = statistics_value if isinstance(statistics_value, dict) else {}
         total_functions = self._json_int_or_default(statistics.get("total_functions"), len(function_items))
         total_strings = self._json_int_or_default(statistics.get("total_strings"), len(strings))
 
         return self._json_object({
-            "bundle_format": "full_analysis_v1",
+            "bundle_format": "analysis_report_v2",
             "metadata": self.idb_metadata(),
             "capabilities": self.capabilities(),
             "summary": summary,
-            "survey": survey,
+            "triage_snapshot": triage_snapshot,
             "entrypoints": self.entrypoints(),
             "imports": {
                 "total": len(imports),
@@ -1415,12 +1425,12 @@ class IdaCore:
                 "items": function_items,
             },
             "recommended_next_tools": [
+                "explain_function",
                 "decompile_function",
-                "get_function_profile",
-                "find_string_usage",
+                "investigate_string",
                 "read_struct",
                 "query_types",
-                "patch_assembly",
+                "save_workspace",
             ],
         })
 
@@ -1585,6 +1595,155 @@ class IdaCore:
                 "xref_type_histogram": dict(xref_histogram),
             },
         })
+
+    def microcode_summary(self, query: str, *, max_instructions: int = 80) -> ToolEnvelope:
+        """返回只读 microcode 摘要。"""
+        if not self.hexrays_available():
+            return self._json_object(
+                {
+                    "status": "unsupported",
+                    "warnings": ["当前环境不可用 Hex-Rays，无法生成 microcode。"],
+                    "data": None,
+                }
+            )
+        match = self.lookup_function(query)
+        func = self.require_function(self._match_ea(match))
+        try:
+            cfunc = ida_hexrays.decompile(func.start_ea)
+            mba = getattr(cfunc, "mba", None)
+            if mba is None:
+                return self._json_object(
+                    {
+                        "status": "unsupported",
+                        "warnings": ["Hex-Rays 未返回 mba_t，当前反编译结果无法读取 microcode。"],
+                        "data": None,
+                    }
+                )
+            blocks = self._microcode_blocks(mba, max_instructions=max_instructions)
+            instruction_count = 0
+            for block in blocks:
+                raw_count = block.get("instruction_count")
+                if isinstance(raw_count, int):
+                    instruction_count += raw_count
+            return self._json_object(
+                {
+                    "status": "ok",
+                    "warnings": [],
+                    "data": {
+                        "addr": hex(func.start_ea),
+                        "name": self._match_name(match),
+                        "experimental": True,
+                        "read_only": True,
+                        "block_count": len(blocks),
+                        "instruction_count": instruction_count,
+                        "blocks": blocks,
+                    },
+                }
+            )
+        except Exception as exc:
+            return self._json_object(
+                {
+                    "status": "degraded",
+                    "warnings": [f"microcode 读取失败，已降级：{exc}"],
+                    "data": None,
+                }
+            )
+
+    def microcode_def_use(self, query: str, *, max_instructions: int = 120) -> ToolEnvelope:
+        """返回 microcode def-use 线索。"""
+        summary = self.microcode_summary(query, max_instructions=max_instructions)
+        if summary.get("status") != "ok":
+            return summary
+        data = summary.get("data")
+        if not isinstance(data, dict):
+            return summary
+        rows: list[JsonObject] = []
+        blocks = data.get("blocks")
+        if isinstance(blocks, list):
+            for block in blocks:
+                if not isinstance(block, dict):
+                    continue
+                instructions = block.get("instructions")
+                if not isinstance(instructions, list):
+                    continue
+                for instruction in instructions:
+                    if not isinstance(instruction, dict):
+                        continue
+                    defs = instruction.get("defs")
+                    uses = instruction.get("uses")
+                    if defs or uses:
+                        rows.append(
+                            self._json_object(
+                                {
+                                    "block": block.get("serial"),
+                                    "addr": instruction.get("addr"),
+                                    "opcode": instruction.get("opcode"),
+                                    "defs": defs,
+                                    "uses": uses,
+                                    "text": instruction.get("text"),
+                                }
+                            )
+                        )
+        return self._json_object(
+            {
+                "status": "ok",
+                "warnings": ["def-use 来自 Hex-Rays microcode，只作为辅助线索。"],
+                "data": {
+                    "addr": data.get("addr"),
+                    "name": data.get("name"),
+                    "experimental": True,
+                    "rows": rows,
+                },
+            }
+        )
+
+    def microcode_experiment(self, query: str, *, action: str = "mark_chains_dirty") -> ToolEnvelope:
+        """执行实验性 microcode mutation。"""
+        if action not in {"mark_chains_dirty"}:
+            raise ValueError("microcode_experiment 当前仅支持 mark_chains_dirty")
+        if not self.hexrays_available():
+            return self._json_object(
+                {
+                    "status": "unsupported",
+                    "warnings": ["当前环境不可用 Hex-Rays，无法执行 microcode 实验。"],
+                    "data": None,
+                }
+            )
+        match = self.lookup_function(query)
+        func = self.require_function(self._match_ea(match))
+        cfunc = ida_hexrays.decompile(func.start_ea)
+        mba = getattr(cfunc, "mba", None)
+        if mba is None:
+            return self._json_object(
+                {
+                    "status": "unsupported",
+                    "warnings": ["Hex-Rays 未返回 mba_t，无法执行 microcode 实验。"],
+                    "data": None,
+                }
+            )
+        mark_chains_dirty = getattr(mba, "mark_chains_dirty", None)
+        if not callable(mark_chains_dirty):
+            return self._json_object(
+                {
+                    "status": "unsupported",
+                    "warnings": ["当前 IDA 运行时未暴露 mba_t.mark_chains_dirty。"],
+                    "data": None,
+                }
+            )
+        mark_chains_dirty()
+        return self._json_object(
+            {
+                "status": "ok",
+                "warnings": ["这是 experimental microcode mutation；只在 --unsafe 与 --tool-surface expert 下暴露。"],
+                "data": {
+                    "addr": hex(func.start_ea),
+                    "name": self._match_name(match),
+                    "experimental": True,
+                    "action": action,
+                    "mutated": True,
+                },
+            }
+        )
 
     def convert_integer(self, value: str | int, *, width: int = 8, signed: bool = False) -> JsonObject:
         """做整数与字节序转换。"""
@@ -2742,6 +2901,167 @@ class IdaCore:
         name = self.best_name(ea).lower()
         return name.startswith("__imp_") or name.startswith("j_")
 
+    def _import_entry_for_ea(self, ea: int) -> JsonObject | None:
+        """按地址解析导入项，优先使用 IDA 9.3 的 import-by-address API。"""
+        if GET_IMPORT_ENTRY is not None and IMPORT_ENTRY_T is not None:
+            runtime_entry = IMPORT_ENTRY_T()
+            if GET_IMPORT_ENTRY(runtime_entry, ea):
+                parsed = self._import_entry_from_runtime_object(ea, runtime_entry)
+                if parsed is not None:
+                    return parsed
+        for item in self.list_imports(offset=0, limit=100_000):
+            addr_text = item.get("addr")
+            if isinstance(addr_text, str) and int(addr_text, 16) == ea:
+                return self._json_object(item)
+        return None
+
+    def _import_entry_from_runtime_object(self, ea: int, runtime_entry: object) -> JsonObject | None:
+        """把 IDA 9.3 运行时导入对象收窄成稳定 JSON。"""
+        name = self._runtime_attr_text(runtime_entry, ("name", "import_name", "imported_name"))
+        module = self._runtime_attr_text(runtime_entry, ("module", "module_name", "dll", "library"))
+        module_index = self._runtime_attr_int(runtime_entry, ("mod_index", "module_index"))
+        if not module and module_index is not None:
+            module = ida_nalt.get_import_module_name(module_index) or f"module_{module_index}"
+        ordinal = self._runtime_attr_int(runtime_entry, ("ordinal", "ord"))
+        if ordinal is None:
+            ordinal = self._runtime_vector_first_int(getattr(runtime_entry, "ordinals", None))
+        if not name and ordinal is None:
+            return None
+        return self._json_object(
+            {
+                "addr": hex(ea),
+                "name": name or (f"ord_{ordinal}" if ordinal is not None else self.best_name(ea)),
+                "module": module,
+                "ordinal": ordinal,
+                "source": "ida_nalt.get_import_entry",
+            }
+        )
+
+    @staticmethod
+    def _runtime_attr_text(runtime_entry: object, names: tuple[str, ...]) -> str:
+        """从第三方运行时对象读取字符串属性。"""
+        for name in names:
+            value = getattr(runtime_entry, name, None)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    @staticmethod
+    def _runtime_attr_int(runtime_entry: object, names: tuple[str, ...]) -> int | None:
+        """从第三方运行时对象读取整数属性。"""
+        for name in names:
+            value = getattr(runtime_entry, name, None)
+            if isinstance(value, bool):
+                continue
+            if isinstance(value, int):
+                return value
+        return None
+
+    @staticmethod
+    def _runtime_vector_first_int(value: object) -> int | None:
+        """从 SWIG 向量对象里读取第一个整数。"""
+        if value is None:
+            return None
+        get_item = getattr(value, "__getitem__", None)
+        if not callable(get_item):
+            return None
+        get_length = getattr(value, "__len__", None)
+        try:
+            if callable(get_length):
+                length_value = get_length()
+                if isinstance(length_value, bool) or not isinstance(length_value, int):
+                    return None
+                if length_value <= 0:
+                    return None
+            first = get_item(0)
+        except Exception:
+            return None
+        if isinstance(first, bool):
+            return None
+        if isinstance(first, int):
+            return first
+        return None
+
+    def _microcode_blocks(self, mba: object, *, max_instructions: int) -> list[JsonObject]:
+        """把 mba_t 收窄为块与指令摘要。"""
+        qty_value = getattr(mba, "qty", 0)
+        qty = int(qty_value) if isinstance(qty_value, int) else 0
+        get_mblock = getattr(mba, "get_mblock", None)
+        if not callable(get_mblock):
+            return []
+        blocks: list[JsonObject] = []
+        remaining = max(1, max_instructions)
+        for index in range(qty):
+            block = get_mblock(index)
+            if block is None:
+                continue
+            instructions: list[JsonObject] = []
+            current = getattr(block, "head", None)
+            while current is not None and remaining > 0:
+                instruction_ea = self._runtime_attr_int(current, ("ea",))
+                opcode_value = self._runtime_attr_int(current, ("opcode",))
+                instructions.append(
+                    {
+                        "addr": hex(instruction_ea) if instruction_ea is not None and instruction_ea != BADADDR else "",
+                        "opcode": self._micro_opcode_name(opcode_value),
+                        "defs": self._micro_operand_text(getattr(current, "d", None)),
+                        "uses": [
+                            item
+                            for item in (
+                                self._micro_operand_text(getattr(current, "l", None)),
+                                self._micro_operand_text(getattr(current, "r", None)),
+                            )
+                            if item
+                        ],
+                        "text": self._micro_insn_text(current),
+                    }
+                )
+                remaining -= 1
+                current = getattr(current, "next", None)
+            serial = self._runtime_attr_int(block, ("serial",))
+            start = self._runtime_attr_int(block, ("start",))
+            end = self._runtime_attr_int(block, ("end",))
+            blocks.append(
+                self._json_object(
+                    {
+                        "serial": serial if serial is not None else index,
+                        "start": hex(start) if start is not None and start != BADADDR else "",
+                        "end": hex(end) if end is not None and end != BADADDR else "",
+                        "instruction_count": len(instructions),
+                        "instructions": instructions,
+                    }
+                )
+            )
+            if remaining <= 0:
+                break
+        return blocks
+
+    @staticmethod
+    def _micro_opcode_name(opcode: int | None) -> str:
+        """把 microcode opcode 转为尽量可读的名字。"""
+        if opcode is None:
+            return ""
+        return str(opcode)
+
+    @staticmethod
+    def _micro_operand_text(operand: object | None) -> str:
+        """把 microcode 操作数转为短文本。"""
+        if operand is None:
+            return ""
+        text = str(operand).strip()
+        if text.startswith("<") and text.endswith(">"):
+            return ""
+        return text
+
+    @staticmethod
+    def _micro_insn_text(instruction: object) -> str:
+        """把 microcode 指令转为短文本。"""
+        dstr = getattr(instruction, "dstr", None)
+        if callable(dstr):
+            rendered = dstr()
+            return str(rendered).strip()
+        return str(instruction).strip()
+
     def xref_type_name(self, value: int) -> str:
         """把 xref 常量转换为可读名字。"""
         mapping = {
@@ -2917,7 +3237,7 @@ class IdaCore:
                 continue
             seen_addrs.add(addr_value)
             try:
-                xrefs = self.get_xrefs_to(addr_value)
+                xrefs = self.xrefs_to(addr_value)
                 callees = self.get_callees(addr_value)
                 func_type = self._classify_function(addr_value)
             except Exception:
@@ -3094,11 +3414,11 @@ class IdaCore:
         """返回摘要场景下推荐的下一跳工具。"""
         tools: list[str] = ["list_functions", "decompile_function", "get_function_profile"]
         if has_strings:
-            tools.append("find_string_usage")
+            tools.append("investigate_string")
         if analysis_domain == "managed":
-            tools.extend(["query_types", "inspect_type", "export_full_analysis"])
+            tools.extend(["query_types", "inspect_type", "export_report"])
         else:
-            tools.extend(["read_struct", "query_types", "export_full_analysis"])
+            tools.extend(["read_struct", "query_types", "export_report"])
 
         deduped: list[JsonValue] = []
         seen: set[str] = set()

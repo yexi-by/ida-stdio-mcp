@@ -60,22 +60,6 @@ class LimitConfig:
 
 
 @dataclass(slots=True, frozen=True)
-class DirectoryAnalysisConfig:
-    """批处理默认配置。"""
-
-    recursive: bool
-    max_candidates: int
-    max_deep_analysis: int
-    include_extensions: tuple[str, ...]
-    exclude_patterns: tuple[str, ...]
-    prefer_managed: bool
-    prefer_native: bool
-    prefer_entry_binary: bool
-    prefer_user_code: bool
-    scoring_profile: str
-
-
-@dataclass(slots=True, frozen=True)
 class AppConfig:
     """应用总配置。"""
 
@@ -84,7 +68,6 @@ class AppConfig:
     feature_gates: FeatureGateConfig
     runtime_workspace: RuntimeWorkspaceConfig
     limits: LimitConfig
-    directory_analysis: DirectoryAnalysisConfig
     root: Path
 
 
@@ -128,13 +111,6 @@ def _resolve_path(root: Path, value: TomlValue, *, default: str) -> Path:
     return path.resolve()
 
 
-def _to_str_tuple(value: TomlValue) -> tuple[str, ...]:
-    """把 TOML 数组转换成字符串元组。"""
-    if not isinstance(value, list):
-        return ()
-    return tuple(item for item in value if isinstance(item, str))
-
-
 def load_config(config_path: Path) -> AppConfig:
     """加载 `setting.toml`。"""
     if not config_path.exists():
@@ -148,7 +124,6 @@ def load_config(config_path: Path) -> AppConfig:
     gates_raw = _require_table(raw, "feature_gates")
     runtime_workspace_raw = _require_table(raw, "runtime_workspace")
     limits_raw = _require_table(raw, "limits")
-    directory_raw = _require_table(raw, "directory_analysis")
 
     return AppConfig(
         logging=LoggingConfig(
@@ -158,7 +133,7 @@ def load_config(config_path: Path) -> AppConfig:
         server=ServerConfig(
             protocol_version=_as_str(server_raw.get("protocol_version", "2025-06-18"), default="2025-06-18"),
             server_name=_as_str(server_raw.get("server_name", "ida-stdio-mcp"), default="ida-stdio-mcp"),
-            server_version=_as_str(server_raw.get("server_version", "0.2.0"), default="0.2.0"),
+            server_version=_as_str(server_raw.get("server_version", "0.3.0"), default="0.3.0"),
             default_input_path=_as_str(server_raw.get("default_input_path", ""), default=""),
         ),
         feature_gates=FeatureGateConfig(
@@ -179,18 +154,6 @@ def load_config(config_path: Path) -> AppConfig:
             max_page_size=_as_int(limits_raw.get("max_page_size", 1000), default=1000),
             max_search_hits=_as_int(limits_raw.get("max_search_hits", 1000), default=1000),
             max_callgraph_depth=_as_int(limits_raw.get("max_callgraph_depth", 4), default=4),
-        ),
-        directory_analysis=DirectoryAnalysisConfig(
-            recursive=_as_bool(directory_raw.get("recursive", True), default=True),
-            max_candidates=_as_int(directory_raw.get("max_candidates", 20), default=20),
-            max_deep_analysis=_as_int(directory_raw.get("max_deep_analysis", 5), default=5),
-            include_extensions=tuple(item.lower() for item in _to_str_tuple(directory_raw.get("include_extensions", []))),
-            exclude_patterns=_to_str_tuple(directory_raw.get("exclude_patterns", [])),
-            prefer_managed=_as_bool(directory_raw.get("prefer_managed", False), default=False),
-            prefer_native=_as_bool(directory_raw.get("prefer_native", False), default=False),
-            prefer_entry_binary=_as_bool(directory_raw.get("prefer_entry_binary", True), default=True),
-            prefer_user_code=_as_bool(directory_raw.get("prefer_user_code", True), default=True),
-            scoring_profile=_as_str(directory_raw.get("scoring_profile", "default"), default="default"),
         ),
         root=root,
     )

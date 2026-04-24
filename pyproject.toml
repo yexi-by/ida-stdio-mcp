@@ -1,12 +1,18 @@
 [project]
 name = "ida-stdio-mcp"
-version = "0.2.0"
+version = "0.3.0"
 description = "IDA Headless + 原生 stdio 的 MCP 服务"
 readme = "README.md"
+license = { file = "LICENSE" }
 authors = [
     { name = "yexi", email = "fanguojun066@gmail.com" }
 ]
 requires-python = ">=3.11"
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
 dependencies = [
     "idapro>=0.0.7",
     "loguru>=0.7.3",
