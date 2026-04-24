@@ -68,7 +68,7 @@ args = [
     "expert",
 ]
 startup_timeout_sec = 240
-tool_timeout_sec = 1800
+tool_timeout_sec = 21600
 
 [mcp_servers.ida-stdio-mcp.env]
 IDADIR = '<IDA_INSTALL_DIR>'
@@ -88,7 +88,10 @@ args = [
     "--tool-surface",
     "slim",
 ]
+tool_timeout_sec = 3600
 ```
+
+`tool_timeout_sec` 应按分析目标调整。普通样本或轻量工作流可设置为 `3600` 秒；UE、Chrome、游戏客户端、带大型 PDB 的 native 样本在执行全量自动分析时可能持续几十分钟到数小时，建议设置为 `21600` 秒。超时时间只影响 MCP 客户端等待工具返回的窗口，不改变 IDA 的实际分析内容。
 
 ## 工具面
 
@@ -141,7 +144,7 @@ get_workspace_state -> open_target -> triage_binary -> investigate_string / expl
 
 Hex-Rays 可用时，`decompile_function` 与 `explain_function` 返回 C 伪代码。缺少 Hex-Rays 时，服务返回汇编降级结果。
 
-大型 native 样本默认采用轻量打开：IDA loader、导入表、PDB/调试符号与 working IDB 会正常加载和保存，但 `open_target` 不等待全库自动分析队列清空。需要等待全库自动分析时可显式传入 `run_auto_analysis=true`；对 UE、Chrome、游戏客户端等大型目标，推荐保持默认值，并由 `triage_binary`、`explain_function`、`investigate_string` 对具体目标触发定点分析。
+大型 native 样本默认采用轻量打开：IDA loader、导入表、PDB/调试符号与 working IDB 会正常加载和保存，但 `open_target` 不等待全库自动分析队列清空。需要等待全库自动分析时可显式传入 `run_auto_analysis=true`；UE、Chrome、游戏客户端等大型目标带有大型 PDB 时，全量自动分析可能持续几十分钟到数小时，应把 MCP `tool_timeout_sec` 按目标设置到 `3600` 秒或 `21600` 秒级别。轻量打开后可由 `triage_binary`、`explain_function`、`investigate_string` 对具体目标触发定点分析。
 
 `open_target` 的 `metadata` 字段会返回打开结果报告，包括 `database_loaded`、`working_idb_ready`、`auto_analysis_waited`、`analysis_completeness`、PDB 路径、同目录 PDB 列表、打开耗时、working IDB 大小、入口数量和 segment 预览。AI Agent 应根据这些字段判断当前结果可信边界。
 
