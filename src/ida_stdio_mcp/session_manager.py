@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
+from time import perf_counter
 
 from .errors import SessionNotFoundError, SessionRequiredError
 from .ida_bootstrap import ensure_ida_environment
@@ -119,8 +120,16 @@ class SessionManager:
                 self._context_sessions.setdefault(context_id, set()).add(created_id)
             self._active_session_id = created_id
             if run_auto_analysis:
+                analysis_started_at = perf_counter()
+                logger.info("开始等待 IDA 自动分析：session_id={} path={}", created_id, resolved)
                 ida_auto.auto_wait()
                 session.is_analyzing = False
+                logger.info(
+                    "IDA 自动分析完成：session_id={} duration_ms={:.1f} path={}",
+                    created_id,
+                    (perf_counter() - analysis_started_at) * 1000.0,
+                    resolved,
+                )
             logger.info("已创建会话：{} -> {}", created_id, resolved)
             return created_id
 
@@ -248,9 +257,34 @@ class SessionManager:
         if self._active_session_id is not None:
             idapro.close_database()
             self._active_session_id = None
+        started_at = perf_counter()
+        logger.info("开始打开 IDA 数据库：path={} run_auto_analysis={}", input_path, run_auto_analysis)
         with symbol_cache_scope():
             if idapro.open_database(str(input_path), run_auto_analysis=run_auto_analysis):
-                raise RuntimeError(f"打开数据库失败：{input_path}")
+                sidecars = self._existing_database_sidecars(input_path)
+                sidecar_hint = ""
+                if sidecars:
+                    sidecar_hint = f"；检测到 IDA 伴生文件：{', '.join(str(path) for path in sidecars)}"
+                raise RuntimeError(
+                    f"打开数据库失败：{input_path}{sidecar_hint}；"
+                    "如果上一次打开被中断，建议先备份或清理这些伴生文件后重试"
+                )
+        logger.info(
+            "IDA 数据库打开完成：duration_ms={:.1f} path={}",
+            (perf_counter() - started_at) * 1000.0,
+            input_path,
+        )
+
+    @staticmethod
+    def _existing_database_sidecars(input_path: Path) -> list[Path]:
+        """列出 IDA 可能遗留在样本旁边的数据库伴生文件。"""
+        suffixes = (".i64", ".id0", ".id1", ".id2", ".nam", ".til")
+        sidecars: list[Path] = []
+        for suffix in suffixes:
+            candidate = input_path.with_name(f"{input_path.name}{suffix}")
+            if candidate.exists():
+                sidecars.append(candidate)
+        return sidecars
 
     def _require_session_locked(self, session_id: str) -> IdaSession:
         session = self._sessions.get(session_id)

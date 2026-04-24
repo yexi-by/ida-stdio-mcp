@@ -167,6 +167,7 @@ class IdaCore:
     def capabilities(self) -> JsonObject:
         """返回当前数据库的能力矩阵。"""
         analysis_domain = self.get_analysis_domain()
+        string_index_status = self.string_index_status()
         representations: list[JsonValue] = ["asm_fallback"]
         if analysis_domain == "managed":
             representations.insert(0, "il")
@@ -195,9 +196,31 @@ class IdaCore:
             "decompiler_state": decompiler_state,
             "decompile_mode": decompile_mode,
             "string_index_quality": self._string_index_quality(),
+            "string_index_status": string_index_status,
             "type_writeback_support": self._type_writeback_support(),
             "debugger_support": "available" if debugger_available else "unavailable",
             "managed_support": self._managed_support_matrix(),
+        })
+
+    def string_index_status(self) -> JsonObject:
+        """返回字符串索引状态说明，不触发 IDA 全库字符串重建。"""
+        analysis_domain = self.get_analysis_domain()
+        if analysis_domain == "managed":
+            return self._json_object({
+                "state": "lazy_symbolic",
+                "quality": "deferred",
+                "is_expensive": True,
+                "can_build": True,
+                "reason": "托管字符串需要从反汇编/IL 文本里按需抽取，默认摘要不会主动扫描全部函数。",
+                "build_tools": ["list_strings", "find_strings", "find_string_usage"],
+            })
+        return self._json_object({
+            "state": "deferred",
+            "quality": "unknown_until_requested",
+            "is_expensive": True,
+            "can_build": True,
+            "reason": "IDA 原生字符串列表由 ida_strlist.build_strlist 构建；大型 UE/PDB 数据库上可能持续数分钟，默认摘要不会主动触发。",
+            "build_tools": ["list_strings", "find_strings", "find_string_usage"],
         })
 
     def capability_matrix(self) -> JsonObject:
@@ -218,7 +241,7 @@ class IdaCore:
                     "managed": "full" if self.managed_csharp_available() else "degraded",
                     "notes": "托管目标优先走外部 C# 反编译，失败时才回退到 IL/反汇编文本",
                 },
-                {"capability": "list_strings", "native": "full", "managed": self._string_index_quality(), "notes": "managed 字符串索引来自 IL/反汇编文本抽取"},
+                {"capability": "list_strings", "native": "explicit_heavy", "managed": self._string_index_quality(), "notes": "字符串索引是显式重任务；默认摘要只报告状态，不主动构建全库字符串列表"},
                 {"capability": "set_types", "native": "full", "managed": self._type_writeback_support(), "notes": "类型写回作用于 IDA 数据库，native/managed 都可持久化到 IDB"},
                 {"capability": "patch_bytes", "native": "full", "managed": "full", "notes": "只要地址可写，补丁能力本身不依赖 GUI"},
                 {"capability": "debugger", "native": "available" if debugger_available else "unavailable", "managed": "available" if debugger_available else "unavailable", "notes": "是否真正可用取决于当前调试器后端"},
@@ -318,11 +341,27 @@ class IdaCore:
             )
         return results
 
-    def survey_binary(self) -> JsonObject:
-        """返回综合二进制概览。"""
+    def import_categories(self) -> JsonObject:
+        """返回导入表分类摘要。"""
+        return self._categorize_imports()
+
+    def callgraph_summary(self, *, function_limit: int = 2000) -> JsonObject:
+        """返回基于代码引用的轻量调用图摘要。"""
+        return self._callgraph_summary(self.list_functions(limit=function_limit))
+
+    def survey_binary(self, *, include_strings: bool = False, string_limit: int = 0) -> JsonObject:
+        """返回默认不触发重型字符串索引的二进制概览。
+
+        Args:
+            include_strings: 是否显式构建并返回字符串样本。原生 IDA 字符串
+                索引会调用 `ida_strlist.build_strlist`，大型 UE/PDB 数据库上
+                可能非常慢，因此默认关闭。
+            string_limit: `include_strings` 为 true 时最多返回多少条字符串。
+        """
         functions = self.list_functions(limit=2000)
-        strings = self.list_strings(limit=2000)
+        strings = self.list_strings(limit=max(0, string_limit)) if include_strings else []
         segments = self.segments()
+        string_index = self.string_index_status()
         interesting_functions: list[JsonObject] = []
         for item in functions[:15]:
             addr_text = item.get("addr")
@@ -345,6 +384,8 @@ class IdaCore:
                     "signature": item.get("signature", ""),
                 }
             )
+        total_strings: JsonValue = len(strings) if include_strings else None
+        string_count_status = "counted" if include_strings else "deferred"
         return self._json_object({
             "metadata": self.idb_metadata(),
             "statistics": {
@@ -352,13 +393,15 @@ class IdaCore:
                 "named_functions": len([item for item in functions if not str(item.get("name", "")).startswith("sub_")]),
                 "library_functions": len([item for item in functions if bool(item.get("is_library", False))]),
                 "unnamed_functions": len([item for item in functions if str(item.get("name", "")).startswith("sub_")]),
-                "total_strings": len(strings),
+                "total_strings": total_strings,
+                "string_count_status": string_count_status,
                 "total_segments": len(segments),
             },
+            "string_index": string_index,
             "capabilities": self.capabilities(),
             "segments": segments,
             "entrypoints": self.entrypoints(),
-            "interesting_strings": strings[:15],
+            "interesting_strings": strings[: max(0, string_limit)],
             "interesting_functions": interesting_functions,
             "imports_by_category": self._categorize_imports(),
             "call_graph_summary": self._callgraph_summary(functions),
@@ -377,9 +420,18 @@ class IdaCore:
         function_limit: int = 12,
         string_limit: int = 12,
         import_limit_per_category: int = 6,
+        include_strings: bool = False,
     ) -> JsonObject:
-        """返回更适合快速开局的样本摘要。"""
-        survey = self.survey_binary()
+        """返回更适合快速开局的样本摘要。
+
+        Args:
+            function_limit: 返回多少个关键函数摘要。
+            string_limit: `include_strings` 为 true 时返回多少个关键字符串。
+            import_limit_per_category: 每个导入分类返回多少个示例。
+            include_strings: 是否显式构建字符串索引。默认关闭，避免大型
+                UE/PDB 数据库在摘要阶段卡进 `ida_strlist.build_strlist`。
+        """
+        survey = self.survey_binary(include_strings=include_strings, string_limit=string_limit)
         metadata = self.idb_metadata()
         capabilities = self.capabilities()
         statistics_value = survey.get("statistics")
@@ -393,11 +445,15 @@ class IdaCore:
         binary_kind = str(metadata.get("binary_kind", "unknown"))
         decompile_mode = str(capabilities.get("decompile_mode", "unknown"))
         total_functions = self._json_int_or_default(statistics.get("total_functions"), 0)
-        total_strings = self._json_int_or_default(statistics.get("total_strings"), 0)
+        total_strings_value = statistics.get("total_strings")
+        if isinstance(total_strings_value, int) and not isinstance(total_strings_value, bool):
+            total_strings_text = str(total_strings_value)
+        else:
+            total_strings_text = "未构建索引"
 
         entrypoints = self.entrypoints()
         interesting_functions = self._interesting_function_rows(limit=function_limit)
-        interesting_strings = self._interesting_string_rows(limit=string_limit)
+        interesting_strings = self._interesting_string_rows(limit=string_limit) if include_strings else []
         import_summary = self._import_category_summary(limit_per_category=import_limit_per_category)
         recommended_queries = self._recommended_binary_queries(entrypoints, interesting_functions)
         recommended_next_tools = self._recommended_binary_tools(
@@ -407,7 +463,7 @@ class IdaCore:
 
         summary_text = (
             f"当前样本属于 {analysis_domain} 分析域，文件类型为 {binary_kind}；"
-            f"已识别 {total_functions} 个函数、{total_strings} 个字符串，"
+            f"已识别 {total_functions} 个函数、字符串状态为 {total_strings_text}，"
             f"当前反编译模式为 {decompile_mode}。"
         )
         opening_moves: list[JsonValue] = [
@@ -429,6 +485,7 @@ class IdaCore:
             "entrypoints": entrypoints,
             "interesting_functions": interesting_functions,
             "interesting_strings": interesting_strings,
+            "string_index": survey.get("string_index", {}),
             "imports": import_summary,
             "managed_summary": managed_summary,
             "recommended_queries": recommended_queries,
@@ -809,7 +866,13 @@ class IdaCore:
         return self._json_object({"count": len(blocks), "cyclomatic_complexity": cyclomatic, "blocks": blocks})
 
     def list_strings(self, *, offset: int = 0, limit: int = 100) -> list[JsonObject]:
-        """分页列出字符串。"""
+        """分页列出字符串。
+
+        这是显式字符串工具，原生样本会触发 IDA 字符串列表构建；大型
+        数据库上可能很慢。默认摘要路径不得隐式调用本方法。
+        """
+        if limit <= 0:
+            return []
         results: list[JsonObject] = []
         seen: set[tuple[str, str]] = set()
         for row in self._native_string_rows(limit=10_000):
@@ -2209,9 +2272,12 @@ class IdaCore:
 
     def _native_string_rows(self, *, limit: int = 2000) -> list[JsonObject]:
         """提取原生字符串索引。"""
+        if limit <= 0:
+            return []
         results: list[JsonObject] = []
         strings = CREATE_STRINGS()
-        cast(Callable[[], None], getattr(strings, "setup"))()
+        # `idautils.Strings()` 构造时已经 refresh；再次 setup 会重复
+        # 调用 ida_strlist.build_strlist，在大型 UE/PDB 样本上代价很高。
         for item in cast(list[_StringItem], self._iter_objects(strings)):
             text = str(item)
             if not text:
@@ -2386,6 +2452,18 @@ class IdaCore:
     def managed_summary(self) -> JsonObject:
         """返回托管/.NET 目标的能力与类型摘要。"""
         analysis_domain = self.get_analysis_domain()
+        if analysis_domain != "managed":
+            return self._json_object({
+                "analysis_domain": analysis_domain,
+                "available": False,
+                "support_level": "not_managed",
+                "external_decompiler": managed_decompiler_command() or "",
+                "type_count": 0,
+                "namespace_count": 0,
+                "top_namespaces": [],
+                "sample_types": [],
+                "sample_methods": [],
+            })
         managed_rows = self.managed_types()
         namespace_histogram: dict[str, int] = defaultdict(int)
         sample_methods: list[JsonObject] = []
@@ -2406,12 +2484,10 @@ class IdaCore:
             self._json_object({"namespace": namespace, "count": count})
             for namespace, count in sorted(namespace_histogram.items(), key=lambda item: item[1], reverse=True)[:20]
         ]
-        support_level = "not_managed"
-        if analysis_domain == "managed":
-            support_level = "csharp_external" if self.managed_csharp_available() else "symbolic_il"
+        support_level = "csharp_external" if self.managed_csharp_available() else "symbolic_il"
         return self._json_object({
             "analysis_domain": analysis_domain,
-            "available": analysis_domain == "managed",
+            "available": True,
             "support_level": support_level,
             "external_decompiler": managed_decompiler_command() or "",
             "type_count": len(managed_rows),
@@ -2583,15 +2659,11 @@ class IdaCore:
         }
 
     def _string_index_quality(self) -> str:
-        """评估字符串索引质量。"""
+        """返回字符串索引质量的非阻塞声明。"""
         analysis_domain = self.get_analysis_domain()
-        try:
-            total_strings = len(self.list_strings(limit=2000))
-        except Exception:
-            total_strings = 0
         if analysis_domain == "managed":
-            return "full" if total_strings > 0 else "none"
-        return "full" if total_strings > 0 else "partial"
+            return "symbolic_lazy"
+        return "deferred"
 
     def _type_writeback_support(self) -> str:
         """评估类型写回能力。"""

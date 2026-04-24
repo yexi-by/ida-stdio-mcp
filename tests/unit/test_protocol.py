@@ -472,7 +472,11 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(
             set(schema_properties(by_name["summarize_binary"], name="summarize_binary").keys()),
-            {"function_limit", "string_limit", "import_limit_per_category", "session_id"},
+            {"function_limit", "string_limit", "import_limit_per_category", "include_strings", "session_id"},
+        )
+        self.assertEqual(
+            set(schema_properties(by_name["survey_binary"], name="survey_binary").keys()),
+            {"include_strings", "string_limit", "session_id"},
         )
         self.assertEqual(
             set(schema_properties(by_name["find_string_usage"], name="find_string_usage").keys()),
@@ -622,11 +626,11 @@ class ProtocolTests(unittest.TestCase):
             logger.remove(sink_id)
 
         merged = "\n".join(rendered_logs)
-        self.assertIn("开始调用工具：health", merged)
+        self.assertIn("工具调用开始：health", merged)
         self.assertIn("工具调用完成：health", merged)
         self.assertIn("tool_call_start", merged)
         self.assertIn("tool_call_finish", merged)
-        self.assertIn("开始读取资源：ida://capability-matrix", merged)
+        self.assertIn("资源读取开始：ida://capability-matrix", merged)
         self.assertIn("资源读取完成：ida://capability-matrix", merged)
         self.assertIn("resource_read_start", merged)
         self.assertIn("resource_read_finish", merged)

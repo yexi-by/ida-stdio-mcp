@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import sys
+import traceback
 from datetime import datetime
 from pathlib import Path
+from types import TracebackType
 from typing import TYPE_CHECKING, TypeAlias, cast
 
 from loguru import logger
@@ -22,6 +24,7 @@ else:
 
 CONSOLE = Console(stderr=True, soft_wrap=True)
 _SUMMARY_LIMIT = 600
+_CONSOLE_HIDDEN_EVENTS = {"tool_call_traceback", "resource_read_traceback"}
 _DEFAULT_EXTRA: JsonObject = {
     "event": "",
     "category": "",
@@ -37,6 +40,14 @@ _DEFAULT_EXTRA: JsonObject = {
 
 
 logger.configure(extra=_DEFAULT_EXTRA)
+
+
+class LoguruExceptionRecordProtocol:
+    """描述 loguru 异常记录对象中本模块需要读取的字段。"""
+
+    type: type[BaseException]
+    value: BaseException
+    traceback: TracebackType | None
 
 
 def _truncate_text(text: str, *, limit: int = _SUMMARY_LIMIT) -> str:
@@ -71,6 +82,16 @@ def _summarize_value(value: JsonValue, *, depth: int = 0) -> JsonValue:
     return summary
 
 
+def _compact_json(value: JsonValue, *, limit: int = _SUMMARY_LIMIT) -> str:
+    """把 JSON 值压缩成单行文本，供终端日志展示。"""
+    return _truncate_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")), limit=limit)
+
+
+def _escape_loguru_template(text: str) -> str:
+    """转义 loguru formatter 会再次解释的花括号。"""
+    return text.replace("{", "{{").replace("}", "}}")
+
+
 def _render_detail_value(value: JsonValue) -> str:
     """把结构化日志字段渲染成可读字符串。"""
     if value is None:
@@ -82,6 +103,33 @@ def _render_detail_value(value: JsonValue) -> str:
     if isinstance(value, str):
         return value
     return _truncate_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+
+
+def _format_exception(record: Record) -> str:
+    """渲染完整异常链，确保未知异常可在文件日志中复盘。"""
+    exception = record.get("exception")
+    if exception is None:
+        return ""
+    typed_exception = cast(LoguruExceptionRecordProtocol, exception)
+    return "".join(
+        traceback.format_exception(
+            typed_exception.type,
+            typed_exception.value,
+            typed_exception.traceback,
+        )
+    )
+
+
+def _exception_traceback_text(exc: Exception) -> str:
+    """把异常对象转换成完整 traceback 文本。"""
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _console_filter(record: Record) -> bool:
+    """过滤只应该进入文件日志的排障明细。"""
+    extra_value = record["extra"]
+    event = extra_value.get("event")
+    return event not in _CONSOLE_HIDDEN_EVENTS
 
 
 def _file_formatter(record: Record) -> str:
@@ -113,7 +161,10 @@ def _file_formatter(record: Record) -> str:
         field = _render_detail_value(cast(JsonValue, raw_field))
         if field:
             rendered.append(f"{key}={field}")
-    return " | ".join(rendered) + "\n"
+    exception_text = _format_exception(record)
+    if exception_text:
+        return _escape_loguru_template(" | ".join(rendered) + "\n" + exception_text)
+    return _escape_loguru_template(" | ".join(rendered)) + "\n"
 
 
 def _event_logger(
@@ -165,10 +216,18 @@ def _call_context_fields(arguments: JsonObject) -> JsonObject:
 def log_tool_call_started(tool_name: str, request_id: JsonValue, arguments: JsonObject) -> None:
     """记录工具调用开始。"""
     fields = _call_context_fields(arguments)
-    fields["request_id"] = _request_id_text(request_id)
+    request_id_text = _request_id_text(request_id)
+    arguments_summary = _summarize_value(arguments)
+    fields["request_id"] = request_id_text
     fields["tool_name"] = tool_name
-    fields["details"] = {"arguments": _summarize_value(arguments)}
-    _event_logger(level="DEBUG", message=f"开始调用工具：{tool_name}", event="tool_call_start", category="tool", fields=fields)
+    fields["details"] = {"arguments": arguments_summary}
+    _event_logger(
+        level="INFO",
+        message=f"工具调用开始：{tool_name} request_id={request_id_text} args={_compact_json(arguments_summary)}",
+        event="tool_call_start",
+        category="tool",
+        fields=fields,
+    )
 
 
 def log_tool_call_finished(tool_name: str, request_id: JsonValue, arguments: JsonObject, result: ToolResult, *, duration_ms: float) -> None:
@@ -192,37 +251,72 @@ def log_tool_call_finished(tool_name: str, request_id: JsonValue, arguments: Jso
             "details": details,
         }
     )
-    _event_logger(level="DEBUG", message=f"工具调用完成：{tool_name}", event="tool_call_finish", category="tool", fields=fields)
+    _event_logger(
+        level="INFO",
+        message=f"工具调用完成：{tool_name} status={status} duration={duration_ms:.1f}ms",
+        event="tool_call_finish",
+        category="tool",
+        fields=fields,
+    )
     if status != "ok":
-        _event_logger(level="WARNING", message=f"工具返回非成功状态：{tool_name} -> {status}", event="tool_call_attention", category="tool", fields=fields)
+        attention_level = "ERROR" if status == "error" else "WARNING"
+        _event_logger(
+            level=attention_level,
+            message=f"工具返回非成功状态：{tool_name} status={status} duration={duration_ms:.1f}ms error={_compact_json(error_summary)}",
+            event="tool_call_attention",
+            category="tool",
+            fields=fields,
+        )
 
 
 def log_tool_call_exception(tool_name: str, request_id: JsonValue, arguments: JsonObject, exc: Exception, *, duration_ms: float) -> None:
     """记录工具调用异常。"""
     fields = _call_context_fields(arguments)
+    traceback_text = _exception_traceback_text(exc)
     fields.update(
         {
             "request_id": _request_id_text(request_id),
             "tool_name": tool_name,
             "status": "exception",
             "duration_ms": round(duration_ms, 3),
-            "details": {"message": str(exc)},
+            "details": {"exception_type": type(exc).__name__, "message": str(exc)},
         }
     )
-    logger.bind(**normalize_event_fields(event="tool_call_exception", category="tool", fields=fields)).exception("工具调用异常：{}", tool_name)
+    _event_logger(
+        level="ERROR",
+        message=f"工具调用异常：{tool_name} duration={duration_ms:.1f}ms error={type(exc).__name__}: {exc}",
+        event="tool_call_exception",
+        category="tool",
+        fields=fields,
+    )
+    trace_fields = dict(fields)
+    trace_fields["details"] = {"traceback": "<完整 traceback 已写入当前日志行正文>"}
+    logger.bind(**normalize_event_fields(event="tool_call_traceback", category="tool", fields=trace_fields)).debug(
+        "工具调用完整异常栈：{}\n{}",
+        tool_name,
+        traceback_text,
+    )
 
 
 def log_resource_read_started(uri: str, request_id: JsonValue, params: JsonObject) -> None:
     """记录资源读取开始。"""
     fields = _call_context_fields(params)
+    request_id_text = _request_id_text(request_id)
+    params_summary = _summarize_value(params)
     fields.update(
         {
-            "request_id": _request_id_text(request_id),
+            "request_id": request_id_text,
             "resource_uri": uri,
-            "details": {"params": _summarize_value(params)},
+            "details": {"params": params_summary},
         }
     )
-    _event_logger(level="DEBUG", message=f"开始读取资源：{uri}", event="resource_read_start", category="resource", fields=fields)
+    _event_logger(
+        level="INFO",
+        message=f"资源读取开始：{uri} request_id={request_id_text} params={_compact_json(params_summary)}",
+        event="resource_read_start",
+        category="resource",
+        fields=fields,
+    )
 
 
 def log_resource_read_finished(
@@ -245,30 +339,57 @@ def log_resource_read_finished(
             "details": {"payload": _summarize_value(payload_summary)},
         }
     )
-    _event_logger(level="DEBUG", message=f"资源读取完成：{uri}", event="resource_read_finish", category="resource", fields=fields)
+    status = "error" if is_error else "ok"
+    _event_logger(
+        level="INFO",
+        message=f"资源读取完成：{uri} status={status} duration={duration_ms:.1f}ms",
+        event="resource_read_finish",
+        category="resource",
+        fields=fields,
+    )
     if is_error:
-        _event_logger(level="WARNING", message=f"资源返回错误状态：{uri}", event="resource_read_attention", category="resource", fields=fields)
+        _event_logger(
+            level="ERROR",
+            message=f"资源返回错误状态：{uri} duration={duration_ms:.1f}ms",
+            event="resource_read_attention",
+            category="resource",
+            fields=fields,
+        )
 
 
 def log_resource_read_exception(uri: str, request_id: JsonValue, params: JsonObject, exc: Exception, *, duration_ms: float) -> None:
     """记录资源读取异常。"""
     fields = _call_context_fields(params)
+    traceback_text = _exception_traceback_text(exc)
     fields.update(
         {
             "request_id": _request_id_text(request_id),
             "resource_uri": uri,
             "status": "exception",
             "duration_ms": round(duration_ms, 3),
-            "details": {"message": str(exc), "params": _summarize_value(params)},
+            "details": {"exception_type": type(exc).__name__, "message": str(exc), "params": _summarize_value(params)},
         }
     )
-    logger.bind(**normalize_event_fields(event="resource_read_exception", category="resource", fields=fields)).exception("资源读取异常：{}", uri)
+    _event_logger(
+        level="ERROR",
+        message=f"资源读取异常：{uri} duration={duration_ms:.1f}ms error={type(exc).__name__}: {exc}",
+        event="resource_read_exception",
+        category="resource",
+        fields=fields,
+    )
+    trace_fields = dict(fields)
+    trace_fields["details"] = {"traceback": "<完整 traceback 已写入当前日志行正文>"}
+    logger.bind(**normalize_event_fields(event="resource_read_traceback", category="resource", fields=trace_fields)).debug(
+        "资源读取完整异常栈：{}\n{}",
+        uri,
+        traceback_text,
+    )
 
 
 def configure_logging(config: LoggingConfig) -> Path:
     """配置终端与文件日志。"""
     config.directory.mkdir(parents=True, exist_ok=True)
-    log_path = config.directory / f"ida-stdio-mcp-{datetime.now().strftime('%Y%m%d-%H%M%S')}.log"
+    log_path = config.directory / f"ida-stdio-mcp-{datetime.now().strftime('%Y%m%d')}.log"
 
     logger.remove()
     logger.add(
@@ -276,12 +397,14 @@ def configure_logging(config: LoggingConfig) -> Path:
         level=config.level,
         colorize=True,
         format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{message}</cyan>",
+        filter=_console_filter,
     )
     logger.add(
         log_path,
         level="DEBUG",
         encoding="utf-8",
         enqueue=False,
+        mode="a",
         format=_file_formatter,
     )
     logger.info("日志系统已初始化，文件日志：{}", log_path)

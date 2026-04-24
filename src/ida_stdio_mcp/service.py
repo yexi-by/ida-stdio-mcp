@@ -1343,11 +1343,11 @@ def _management_tools(
     )
     register_management_tool(
         name="open_binary",
-        description="打开二进制样本并绑定当前会话；这是做函数枚举、反编译伪代码、查 xref、查字符串、查结构体/类型前的起点工具。",
+        description="打开二进制样本并绑定当前会话；这是做函数枚举、反编译伪代码、查 xref、查字符串、查结构体/类型前的起点工具。大型 UE/Shipping 样本建议先传 run_auto_analysis=false，避免工具调用长时间阻塞，再按需调用 warmup。",
         schema=_tool_input_schema(
             properties={
                 "path": _string_schema("二进制文件路径。"),
-                "run_auto_analysis": _boolean_schema("是否在打开后等待自动分析。默认 true。"),
+                "run_auto_analysis": _boolean_schema("是否在打开后等待自动分析。默认 true；大型 UE/Shipping 样本建议传 false。"),
             },
             required=("path",),
             include_session=True,
@@ -1449,11 +1449,20 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="survey_binary",
-        description="返回当前会话的二进制概览、架构、段、入口点与能力摘要；适合作为样本逆向前的总览入口。",
+        description="返回当前会话的快速二进制概览、架构、段、入口点与能力摘要；默认不构建全库字符串索引，避免大型样本卡住。",
         source="core.survey_binary",
         runtime=runtime,
-        input_schema=_tool_input_schema(include_session=True),
-        handler=lambda core, _: core.survey_binary(),
+        input_schema=_tool_input_schema(
+            properties={
+                "include_strings": _boolean_schema("是否显式构建并返回字符串样本。默认 false；大型 UE/PDB 样本可能很慢。"),
+                "string_limit": _integer_schema("include_strings=true 时最多返回多少条字符串。", minimum=0),
+            },
+            include_session=True,
+        ),
+        handler=lambda core, arguments: core.survey_binary(
+            include_strings=_bool_or_default(arguments, "include_strings", False),
+            string_limit=_int_or_default(arguments, "string_limit", 0),
+        ),
         preconditions=("必须已存在活动会话，或显式提供 session_id。",),
         empty_state_behavior="无活动会话时返回 session_required。",
         input_example={"session_id": "sess-001"},
@@ -1461,14 +1470,15 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="summarize_binary",
-        description="样本摘要 / binary summary / 开局总览：直接给出入口点、关键函数、关键字符串、导入分类、能力边界和推荐下一步，适合替代先用 shell 随便扫一圈。",
+        description="样本摘要 / binary summary / 开局总览：直接给出入口点、关键函数、字符串索引状态、导入分类、能力边界和推荐下一步；默认不构建全库字符串索引，需要关键字符串时显式传 include_strings=true。",
         source="core.summarize_binary",
         runtime=runtime,
         input_schema=_tool_input_schema(
             properties={
                 "function_limit": _integer_schema("返回多少个关键函数摘要。", minimum=1),
-                "string_limit": _integer_schema("返回多少个关键字符串摘要。", minimum=1),
+                "string_limit": _integer_schema("include_strings=true 时返回多少个关键字符串摘要。", minimum=1),
                 "import_limit_per_category": _integer_schema("每个导入分类最多展示多少个示例。", minimum=1),
+                "include_strings": _boolean_schema("是否显式构建字符串索引并返回关键字符串。默认 false；大型 UE/PDB 样本可能很慢。"),
             },
             include_session=True,
         ),
@@ -1476,10 +1486,11 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
             function_limit=_int_or_default(arguments, "function_limit", 12),
             string_limit=_int_or_default(arguments, "string_limit", 12),
             import_limit_per_category=_int_or_default(arguments, "import_limit_per_category", 6),
+            include_strings=_bool_or_default(arguments, "include_strings", False),
         ),
         preconditions=("必须已存在活动会话，或显式提供 session_id。",),
         empty_state_behavior="无活动会话时返回 session_required。",
-        input_example={"session_id": "sess-001", "function_limit": 10, "string_limit": 10},
+        input_example={"session_id": "sess-001", "function_limit": 10, "include_strings": False},
     )
     _tool(
         registry,
@@ -1675,7 +1686,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="list_strings",
-        description="分页列字符串，适合做字符串总览、字面量审计、提示词/路径/URL 快速摸排。",
+        description="分页列字符串，适合做字符串总览、字面量审计、提示词/路径/URL 摸排；这是显式重任务，原生样本可能触发 IDA 全库字符串索引构建。",
         source="core.list_strings",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=PAGINATION_PROPERTIES, include_session=True),
@@ -2785,9 +2796,9 @@ def _register_resources(
     resources.register_static(ResourceSpec("ida://functions/profiles", "function_profiles", "当前函数画像摘要。", "application/json", active_reader("resource.function_profiles", lambda core: [core.get_function_profile(str(item.get("addr")), include_asm=False) for item in core.list_functions(limit=200)]), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://globals", "globals", "当前全局符号列表。", "application/json", active_reader("resource.globals", lambda core: core.list_globals(limit=2000)), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://imports", "imports", "当前导入表。", "application/json", active_reader("resource.imports", lambda core: core.list_imports(limit=2000)), requires_context=session_requires_context))
-    resources.register_static(ResourceSpec("ida://imports/categories", "imports_categories", "当前导入的分类视图。", "application/json", active_reader("resource.imports_categories", lambda core: core.survey_binary()["imports_by_category"]), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://imports/categories", "imports_categories", "当前导入的分类视图。", "application/json", active_reader("resource.imports_categories", lambda core: core.import_categories()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://strings", "strings", "当前字符串列表。", "application/json", active_reader("resource.strings", lambda core: core.list_strings(limit=2000)), requires_context=session_requires_context))
-    resources.register_static(ResourceSpec("ida://callgraph/summary", "callgraph_summary", "当前样本的调用图摘要。", "application/json", active_reader("resource.callgraph_summary", lambda core: core.survey_binary()["call_graph_summary"]), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://callgraph/summary", "callgraph_summary", "当前样本的调用图摘要。", "application/json", active_reader("resource.callgraph_summary", lambda core: core.callgraph_summary()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://managed/summary", "managed_summary", "托管/.NET 能力与符号级摘要。", "application/json", active_reader("resource.managed_summary", lambda core: core.managed_summary()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://managed/types", "managed_types", "托管/.NET 符号级类型目录。", "application/json", active_reader("resource.managed_types", lambda core: core.managed_types(limit=2000)), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://managed/namespaces", "managed_namespaces", "托管/.NET 命名空间统计。", "application/json", active_reader("resource.managed_namespaces", lambda core: core.managed_summary()["top_namespaces"]), requires_context=session_requires_context))

@@ -2,10 +2,10 @@
 
 让 Agent 直接操控 IDA Pro 进行逆向分析的 MCP Server。
 
-本项目灵感来自 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，专注于 IDA Pro 9.2+ 的命令行模式（headless），让支持 MCP 的 Agent 客户端能够：
+本项目灵感来自 [ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp)，推荐使用 IDA Pro 9.3 或 9.3sp1 的命令行模式（headless），让支持 MCP 的 Agent 客户端能够：
 
 - 打开并分析二进制文件
-- 读取样本摘要、入口点、关键函数与关键字符串
+- 读取样本摘要、入口点、关键函数，并按需分析字符串
 - 反编译函数、查看汇编代码
 - 搜索字符串、追踪字符串使用点、查看交叉引用
 - 重命名符号、添加注释
@@ -24,8 +24,10 @@
 ## 环境要求
 
 - Python 3.11+
-- IDA Pro 9.2+（需包含 idalib）
+- IDA Pro 9.3 或 9.3sp1（需包含 idalib）
 - [uv](https://docs.astral.sh/uv/) 包管理器
+
+> IDA 9.2 理论上可运行，但在大型 UE Shipping 样本、相邻 PDB 和全量字符串索引场景下容易出现明显卡顿。实测 IDA 9.3 对大型 PDB 的加载更稳定，推荐作为默认环境。
 
 ## 安装
 
@@ -33,10 +35,10 @@
 
 ```powershell
 # Windows
-$env:IDADIR = "C:\Program Files\IDA Professional 9.2"
+$env:IDADIR = "C:\Program Files\IDA Professional 9.3"
 
 # Linux/macOS
-export IDADIR="/opt/ida-9.2"
+export IDADIR="/opt/ida-9.3"
 ```
 
 ### 2. 安装依赖
@@ -191,7 +193,7 @@ IDADIR = "<ida-dir>"
 |------|------|
 | `describe_capabilities` | 返回工具目录、能力矩阵、门控状态与推荐入口 |
 | `survey_binary` | 文件概览：架构、段、入口点 |
-| `summarize_binary` | 样本摘要：入口点、关键函数、关键字符串、导入分类、推荐下一步 |
+| `summarize_binary` | 样本摘要：入口点、关键函数、导入分类、推荐下一步；默认不构建全量字符串索引 |
 | `list_functions` | 列出所有函数 |
 | `get_function` | 获取函数详情 |
 | `decompile_function` | 反编译函数（native 返回伪代码，.NET 返回 C#） |
@@ -246,6 +248,8 @@ IDADIR = "<ida-dir>"
 ```text
 open_binary -> summarize_binary -> list_functions / find_string_usage -> decompile_function / read_struct / query_types
 ```
+
+`summarize_binary` 默认走轻量路径，不会主动触发 IDA 的全量字符串索引。需要字符串时，优先用 `find_string_usage` 定点查；确实要扫字符串列表时，再显式调用 `list_strings` 或为摘要传入 `include_strings=true`。
 
 ### 字符串驱动的定位流程
 
