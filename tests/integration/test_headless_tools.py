@@ -44,14 +44,16 @@ def expect_optional_object(value: JsonValue, *, name: str) -> JsonObject:
 
 
 class HeadlessToolTests(unittest.TestCase):
-    """覆盖 V2 多会话、资源读取与危险工具。"""
+    """覆盖多会话、资源读取与危险工具。"""
 
     @staticmethod
     def _repo_root() -> Path:
+        """返回仓库根目录。"""
         return Path(__file__).resolve().parents[2]
 
     @classmethod
     def setUpClass(cls) -> None:
+        """解析集成测试使用的 ELF 与 PE fixture 路径。"""
         cls.repo_root = cls._repo_root()
         cls.elf_fixture = Path(
             os.environ.get(
@@ -62,6 +64,7 @@ class HeadlessToolTests(unittest.TestCase):
         cls.pe_fixture = (cls.repo_root / "tests" / "fixtures" / "minimal_pe.exe").resolve()
 
     def setUp(self) -> None:
+        """为每个用例创建独立 runtime、service 和 stdio server。"""
         self.config = load_config(self.repo_root / "setting.toml")
         self.runtime = HeadlessRuntime()
         self.service = build_service(
@@ -82,9 +85,11 @@ class HeadlessToolTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        """关闭测试期间打开的所有 IDA 会话。"""
         self.runtime.shutdown()
 
     def _call_tool(self, name: str, arguments: JsonObject | None = None) -> JsonObject:
+        """通过 stdio server 调用工具并返回 structuredContent。"""
         response = self.server.dispatch_message(
             {
                 "jsonrpc": "2.0",
@@ -99,6 +104,7 @@ class HeadlessToolTests(unittest.TestCase):
         return expect_object(response_result["structuredContent"], name="tool.structured")
 
     def _read_resource(self, uri: str, params: JsonObject | None = None) -> JsonObject:
+        """通过 stdio server 读取资源并返回 result。"""
         request_params: JsonObject = {"uri": uri}
         if params is not None:
             request_params.update(params)
@@ -115,6 +121,7 @@ class HeadlessToolTests(unittest.TestCase):
         return expect_object(response["result"], name="resource.result")
 
     def test_multi_session_open_switch_close_and_resources(self) -> None:
+        """验证多会话打开、切换、资源读取和关闭流程。"""
         opened_elf = self._call_tool("open_target", {"path": str(self.elf_fixture), "session_id": "elf"})
         self.assertEqual(opened_elf["status"], "ok")
         opened_pe = self._call_tool("open_target", {"path": str(self.pe_fixture), "session_id": "pe"})
@@ -149,6 +156,7 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertEqual(close_pe["status"], "ok")
 
     def test_core_read_tools_and_unsafe_write_tool(self) -> None:
+        """验证核心只读工具、字符串缓存和受控脚本输出。"""
         self._call_tool("open_target", {"path": str(self.elf_fixture), "session_id": "elf-main"})
 
         survey = self._call_tool("triage_binary", {"session_id": "elf-main"})
@@ -176,16 +184,22 @@ class HeadlessToolTests(unittest.TestCase):
 
         strings_page = self._call_tool("list_strings", {"limit": 20, "session_id": "elf-main"})
         self.assertEqual(strings_page["status"], "ok")
-        strings_data = strings_page["data"]
-        self.assertIsInstance(strings_data, list)
-        assert isinstance(strings_data, list)
+        strings_payload = expect_object(strings_page["data"], name="strings.data")
+        strings_data = expect_list(strings_payload["data"], name="strings.data.data")
+        strings_cache = expect_object(strings_payload["cache"], name="strings.data.cache")
+        self.assertIn("cache_hit", strings_cache)
+        self.assertIn("limit_contract", strings_cache)
         self.assertGreater(len(strings_data), 0)
-        first_string = strings_data[0]
-        self.assertIsInstance(first_string, dict)
-        assert isinstance(first_string, dict)
+        first_string = expect_object(strings_data[0], name="strings.data.data[0]")
         first_string_addr = first_string.get("addr")
         self.assertIsInstance(first_string_addr, str)
         assert isinstance(first_string_addr, str)
+
+        string_search = self._call_tool("find_strings", {"pattern": str(first_string.get("string", ""))[:4], "limit": 5, "session_id": "elf-main"})
+        self.assertEqual(string_search["status"], "ok")
+        string_search_payload = expect_object(string_search["data"], name="string_search.data")
+        string_search_cache = expect_object(string_search_payload["cache"], name="string_search.data.cache")
+        self.assertTrue(bool(string_search_cache.get("cache_hit")))
 
         string_usage = self._call_tool("investigate_string", {"addr": first_string_addr, "max_usages": 20, "session_id": "elf-main"})
         self.assertEqual(string_usage["status"], "ok")
@@ -195,6 +209,27 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertIn("matches", string_usage_data)
         self.assertIn("usages", string_usage_data)
         self.assertIn("functions", string_usage_data)
+
+        script_result = self._call_tool(
+            "evaluate_python",
+            {
+                "code": "result = list(range(10000))\nprint('bounded')",
+                "include_locals": True,
+                "max_output_chars": 2000,
+                "session_id": "elf-main",
+            },
+        )
+        self.assertEqual(script_result["status"], "ok")
+        script_data = expect_object(script_result["data"], name="script.data")
+        self.assertEqual(script_data.get("stdout"), "bounded\n")
+        self.assertNotIn("locals", script_data)
+        self.assertIn("local_keys", script_data)
+        safe_result = expect_object(script_data["result"], name="script.data.result")
+        self.assertEqual(safe_result.get("type"), "list")
+        self.assertEqual(safe_result.get("count"), 10000)
+        self.assertTrue(bool(safe_result.get("truncated")))
+        locals_summary = expect_list(script_data["locals_summary"], name="script.data.locals_summary")
+        self.assertGreater(len(locals_summary), 0)
 
         comment = self._call_tool(
             "set_comments",
@@ -347,6 +382,7 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertIn("types", full_export_data)
 
     def test_extended_type_stack_patch_and_trace_tools(self) -> None:
+        """验证类型、栈帧、补丁、追踪和调用图扩展工具。"""
         self._call_tool("open_target", {"path": str(self.elf_fixture), "session_id": "elf-extended"})
 
         type_name = f"__Stage2Struct_{os.getpid()}__"
@@ -563,6 +599,7 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertEqual(component["status"], "ok")
 
     def test_debug_registers_all_threads_without_debuggee_is_cleanly_unsupported(self) -> None:
+        """验证未启动调试目标时线程寄存器工具返回清晰 unsupported。"""
         result = self._call_tool("debug_registers_all_threads")
         self.assertEqual(result["status"], "unsupported")
         result_data = result["data"]
@@ -578,6 +615,7 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertFalse(any("暂未实现" in str(item) for item in warnings))
 
     def test_query_imports_filter_works(self) -> None:
+        """验证导入表筛选工具能按导入名返回命中项。"""
         self._call_tool("open_target", {"path": str(self.pe_fixture), "session_id": "pe-imports"})
         imports_result = self._call_tool("list_imports", {"session_id": "pe-imports"})
         self.assertEqual(imports_result["status"], "ok")
@@ -604,6 +642,7 @@ class HeadlessToolTests(unittest.TestCase):
         )
 
     def test_isolated_contexts_keep_sessions_and_resources_separate(self) -> None:
+        """验证上下文隔离下的会话和资源互不串用。"""
         isolated_runtime = HeadlessRuntime(isolated_contexts=True)
         isolated_service = build_service(
             isolated_runtime,
@@ -623,6 +662,7 @@ class HeadlessToolTests(unittest.TestCase):
         )
 
         def call(name: str, arguments: JsonObject) -> JsonObject:
+            """在隔离 server 上调用工具。"""
             response = isolated_server.dispatch_message(
                 {
                     "jsonrpc": "2.0",
@@ -637,6 +677,7 @@ class HeadlessToolTests(unittest.TestCase):
             return expect_object(response_result["structuredContent"], name="isolated.tool.structured")
 
         def read(uri: str, params: JsonObject) -> JsonObject:
+            """在隔离 server 上读取资源。"""
             response = isolated_server.dispatch_message(
                 {
                     "jsonrpc": "2.0",

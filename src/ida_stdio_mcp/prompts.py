@@ -24,6 +24,7 @@ class PromptRegistry:
     """管理 prompts/list 与 prompts/get。"""
 
     def __init__(self, prompts: tuple[PromptSpec, ...]) -> None:
+        """按名称索引服务端 prompt 模板。"""
         self._prompts = {prompt.name: prompt for prompt in prompts}
 
     def has_prompts(self) -> bool:
@@ -79,16 +80,16 @@ class PromptRegistry:
 
 
 def build_prompt_registry() -> PromptRegistry:
-    """构建 V2 默认 prompt 模板。"""
+    """构建默认 MCP prompt 模板。"""
     return PromptRegistry(
         (
             PromptSpec(
                 name="triage-native",
                 title="Native 样本开局分析",
-                description="按 V2 slim 工作流完成原生样本快速 triage。",
+                description="按 slim 工作流完成原生样本开局分析。",
                 argument_names=("target_path",),
                 template="""
-请用 ida-stdio-mcp V2 slim 工作流分析原生样本。
+请用 ida-stdio-mcp 的 slim 工作流分析原生样本。
 
 固定顺序：
 1. 调用 get_workspace_state，确认当前状态。
@@ -101,10 +102,10 @@ def build_prompt_registry() -> PromptRegistry:
             PromptSpec(
                 name="triage-managed",
                 title="托管/.NET 样本开局分析",
-                description="按 V2 slim 工作流优先使用托管类型、字符串与 C# 反编译信息。",
+                description="按 slim 工作流优先使用托管类型、字符串与 C# 反编译信息。",
                 argument_names=("target_path",),
                 template="""
-请用 ida-stdio-mcp V2 slim 工作流分析托管/.NET 样本。
+请用 ida-stdio-mcp 的 slim 工作流分析托管/.NET 样本。
 
 固定顺序：
 1. get_workspace_state。

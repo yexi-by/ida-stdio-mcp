@@ -18,7 +18,7 @@ from .stdio_server import ServerIdentity, StdioMcpServer
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """解析命令行参数。"""
-    parser = argparse.ArgumentParser(description="IDA Headless + 通用 stdio MCP 服务")
+    parser = argparse.ArgumentParser(description="面向 AI Agent 的 IDA Pro 9.3+ stdio MCP 逆向分析服务")
     parser.add_argument("input_path", nargs="?", type=Path, help="可选：启动后立即打开的样本路径")
     parser.add_argument("--config", type=Path, default=Path("setting.toml"), help="配置文件路径")
     parser.add_argument("--unsafe", action="store_true", help="启用危险写操作与 Python 执行工具")

@@ -40,9 +40,9 @@ _runtime_info: IdaRuntimeInfo | None = None
 def ensure_ida_environment() -> ModuleType:
     """加载 `idapro` 并确认当前 IDA 运行时不低于 9.3。
 
-    IDA 9.3 开始提供更灵活的 `idapro` wheel/激活方式，因此这里不再
-    直接检查 `IDADIR/idalib.dll`。真正可靠的准入条件是 `idapro` 能加载
-    运行时，并且 `get_library_version()` 返回 9.3 或更新版本。
+    准入条件由运行时自身提供：`idapro` 必须可以导入，并且
+    `get_library_version()` 必须返回 9.3 或更新版本。`IDADIR`
+    只作为定位运行时和诊断安装目录的输入，不作为唯一可信依据。
     """
     global _idapro_module
     if _idapro_module is not None:

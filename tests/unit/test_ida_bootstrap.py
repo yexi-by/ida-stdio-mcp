@@ -24,7 +24,7 @@ class IdaBootstrapTests(unittest.TestCase):
                 ida_bootstrap.ensure_ida_environment()
 
     def test_low_version_fails_fast(self) -> None:
-        """低于 9.3 的运行时不再兼容。"""
+        """低于 9.3 的运行时应立即失败。"""
         module = self._fake_idapro((9, 2, 0))
         with patch("ida_stdio_mcp.ida_bootstrap.import_module", return_value=module):
             with self.assertRaises(RuntimeNotReadyError):

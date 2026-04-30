@@ -1,7 +1,7 @@
 [project]
 name = "ida-stdio-mcp"
 version = "0.3.0"
-description = "IDA Headless + 原生 stdio 的 MCP 服务"
+description = "面向 AI Agent 的 IDA Pro 9.3+ stdio MCP 逆向分析服务"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [

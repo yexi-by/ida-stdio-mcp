@@ -21,6 +21,7 @@ class HeadlessRuntime:
     """封装 stdio-only 的多会话运行时。"""
 
     def __init__(self, *, isolated_contexts: bool = False) -> None:
+        """创建运行时并记录是否启用上下文隔离。"""
         self._manager_instance: SessionManager | None = None
         self._isolated_contexts = isolated_contexts
 
@@ -50,9 +51,9 @@ class HeadlessRuntime:
     def require_ida_dir(self) -> Path:
         """返回 IDA 安装目录诊断信息。
 
-        V2 已不再把 `IDADIR/idalib.dll` 作为唯一入口；此方法只保留给
-        运行时诊断读取。如果运行时通过 9.3 wheel 激活且无法定位
-        安装目录，会显式报错而不是伪造路径。
+        该路径用于展示和排障，不参与运行时准入判断。如果当前
+        `idapro` 运行时没有暴露安装目录，方法会显式报错，避免
+        让调用方拿到伪造路径后继续执行。
         """
         install_dir = get_ida_runtime_info().install_dir
         if install_dir is None:

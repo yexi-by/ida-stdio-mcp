@@ -35,10 +35,12 @@ class RealWorldRegressionTests(unittest.TestCase):
 
     @staticmethod
     def _repo_root() -> Path:
+        """返回仓库根目录。"""
         return Path(__file__).resolve().parents[2]
 
     @classmethod
     def setUpClass(cls) -> None:
+        """解析真实原生样本和托管样本路径。"""
         cls.repo_root = cls._repo_root()
         cls.real_native_fixture = Path(
             os.environ.get(
@@ -54,6 +56,7 @@ class RealWorldRegressionTests(unittest.TestCase):
         ).resolve()
 
     def setUp(self) -> None:
+        """为每个回归用例创建独立服务实例。"""
         self.config = load_config(self.repo_root / "setting.toml")
         self.runtime = HeadlessRuntime()
         self.service = build_service(
@@ -74,17 +77,21 @@ class RealWorldRegressionTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        """关闭回归测试期间打开的所有会话。"""
         self.runtime.shutdown()
 
     def _require_real_managed(self) -> None:
+        """缺少真实托管样本时跳过当前用例。"""
         if not self.real_managed_fixture.exists():
             self.skipTest(f"真实托管样本不存在：{self.real_managed_fixture}")
 
     def _require_real_native(self) -> None:
+        """缺少真实原生样本时跳过当前用例。"""
         if not self.real_native_fixture.exists():
             self.skipTest(f"真实原生样本不存在：{self.real_native_fixture}")
 
     def _call_tool(self, name: str, arguments: JsonObject | None = None) -> JsonObject:
+        """通过 stdio server 调用工具并返回 structuredContent。"""
         response = self.server.dispatch_message(
             {
                 "jsonrpc": "2.0",
@@ -99,6 +106,7 @@ class RealWorldRegressionTests(unittest.TestCase):
         return expect_object(response_result["structuredContent"], name="tool.structured")
 
     def _read_resource(self, uri: str) -> JsonObject:
+        """通过 stdio server 读取资源并返回 result。"""
         response = self.server.dispatch_message(
             {
                 "jsonrpc": "2.0",

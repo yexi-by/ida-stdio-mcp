@@ -1,10 +1,8 @@
 # ida-stdio-mcp
 
-ida-stdio-mcp 是面向 AI Agent 的 IDA Pro 9.3+ MCP 服务。服务通过 IDA headless runtime 提供二进制分析、函数解释、字符串牵引、托管程序集反编译、数据流追踪、报告导出、调试与受控写回能力。
+ida-stdio-mcp 是面向 AI Agent 的 IDA Pro 9.3+ stdio MCP 逆向分析服务。服务通过 IDA headless runtime 打开样本、维护隔离工作 IDB，并提供二进制概览、函数解释、字符串牵引、托管程序集反编译、轻量数据流追踪、结构化报告、调试与受控写回能力。
 
-当前 V2 特性分支：[codex/ida93-ai-state-refactor](https://github.com/yexi-by/ida-stdio-mcp/tree/codex/ida93-ai-state-refactor)
-
-## 特性
+## 能力概览
 
 - IDA 9.3+ runtime 校验：启动时使用 `idapro.get_library_version()` 检查版本，低于 9.3 直接失败。
 - AI 工作流工具面：默认 `slim` 只暴露高层逆向入口，降低工具选择成本。
@@ -35,7 +33,6 @@ IDA 运行时可通过以下任一方式提供：
 ```powershell
 git clone https://github.com/yexi-by/ida-stdio-mcp.git
 cd ida-stdio-mcp
-git checkout codex/ida93-ai-state-refactor
 uv sync
 uv run ida-stdio-mcp --help
 ```
@@ -46,9 +43,11 @@ uv run ida-stdio-mcp --help
 dotnet tool install --global ilspycmd
 ```
 
-## Codex MCP 配置
+## MCP 客户端配置
 
-以下配置开启最大能力，适合本地可信环境中的 Codex 或高级 Agent。请将 `<UV_PATH>`、`<REPO_PATH>` 和 `<IDA_INSTALL_DIR>` 替换为本机实际路径。
+请将 `<UV_PATH>`、`<REPO_PATH>` 和 `<IDA_INSTALL_DIR>` 替换为本机实际路径。`<UV_PATH>` 是 `uv` 可执行文件路径，`<REPO_PATH>` 是本仓库路径，`<IDA_INSTALL_DIR>` 是 IDA 9.3+ 安装目录。
+
+TOML 示例：
 
 ```toml
 [mcp_servers.ida-stdio-mcp]
@@ -74,7 +73,38 @@ tool_timeout_sec = 21600
 IDADIR = '<IDA_INSTALL_DIR>'
 ```
 
-面向普通 MCP 客户端时建议使用默认 `slim` 工具面：
+JSON 示例：
+
+```json
+{
+  "mcpServers": {
+    "ida-stdio-mcp": {
+      "command": "<UV_PATH>",
+      "args": [
+        "--directory",
+        "<REPO_PATH>",
+        "run",
+        "--no-sync",
+        "python",
+        "-m",
+        "ida_stdio_mcp",
+        "--unsafe",
+        "--debugger",
+        "--isolated-contexts",
+        "--tool-surface",
+        "expert"
+      ],
+      "env": {
+        "IDADIR": "<IDA_INSTALL_DIR>"
+      },
+      "startup_timeout_sec": 240,
+      "tool_timeout_sec": 21600
+    }
+  }
+}
+```
+
+本地可信环境可使用 `expert` 最大工具面。普通分析建议使用默认 `slim` 工具面：
 
 ```toml
 args = [
@@ -92,6 +122,41 @@ tool_timeout_sec = 3600
 ```
 
 `tool_timeout_sec` 应按分析目标调整。普通样本或轻量工作流可设置为 `3600` 秒；UE、Chrome、游戏客户端、带大型 PDB 的 native 样本在执行全量自动分析时可能持续几十分钟到数小时，建议设置为 `21600` 秒。超时时间只影响 MCP 客户端等待工具返回的窗口，不改变 IDA 的实际分析内容。
+
+## Skill 使用
+
+仓库内提供本地 skill：
+
+```text
+skills/ida-stdio-mcp
+```
+
+支持本地 skill 的客户端应配置或复制整个 `skills/ida-stdio-mcp` 目录。该目录包含：
+
+- `SKILL.md`：最小入口说明。
+- `references/`：按需加载的工作流、工具面、专家能力和排障指南。
+- `agents/openai.yaml`：可选 UI 元数据。
+
+TOML 示例：
+
+```toml
+[skills.ida-stdio-mcp]
+path = '<REPO_PATH>/skills/ida-stdio-mcp'
+```
+
+JSON 示例：
+
+```json
+{
+  "skills": {
+    "ida-stdio-mcp": {
+      "path": "<REPO_PATH>/skills/ida-stdio-mcp"
+    }
+  }
+}
+```
+
+不同客户端的字段名可能不同，核心要求是把 `skills/ida-stdio-mcp` 目录加入客户端的 skill 搜索路径。使用时可显式引用 `$ida-stdio-mcp`，或让客户端按描述在 IDA/MCP/逆向任务中自动触发。
 
 ## 工具面
 
@@ -113,7 +178,7 @@ microcode mutation 需要同时启用 `--unsafe --tool-surface expert`。
 
 ## 推荐工作流
 
-AI Agent 使用 V2 时建议遵循固定顺序：
+AI Agent 分析样本时建议遵循固定顺序：
 
 ```text
 get_workspace_state -> open_target -> triage_binary -> investigate_string / explain_function -> export_report
@@ -133,6 +198,12 @@ get_workspace_state -> open_target -> triage_binary -> investigate_string / expl
 | `export_report` | 导出结构化分析报告 |
 | `save_workspace` | 保存当前 working IDB，或显式导出到指定路径 |
 | `close_target` | 关闭当前或指定 session |
+
+## 字符串与脚本契约
+
+`list_strings`、`find_strings`、`search_regex` 与 `investigate_string` 会为当前 working IDB 构建并复用会话级字符串缓存。首次字符串查询可能触发 IDA 字符串枚举；后续同一工作库内的字符串搜索直接复用缓存。返回结构统一包含 `data`、`next_offset`、`statistics`、`cache` 与 `recommended_next_tools`。`limit` / `count` 只控制返回行数，`cache.truncated_by_scan_limit=true` 表示当前缓存是受控样本，未命中不能视为全库不存在。
+
+`evaluate_python` 与 `execute_python_file` 只在 `--unsafe` 下暴露，并作用于当前或指定 session 的 working IDB。脚本结果返回受控大小的 `stdout`、`stderr`、`result`、`local_keys` 与可选 `locals_summary`；服务不会回传完整局部变量表。自定义脚本应把小型结构化摘要赋给 `result`。
 
 ## Native 分析
 

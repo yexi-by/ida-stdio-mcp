@@ -83,6 +83,7 @@ class SessionManager:
     """管理 headless 模式下的多会话与上下文绑定。"""
 
     def __init__(self) -> None:
+        """初始化会话表、上下文绑定表和活动会话锁。"""
         self._sessions: dict[str, IdaSession] = {}
         self._context_bindings: dict[str, str] = {}
         self._context_sessions: dict[str, set[str]] = {}
@@ -100,9 +101,9 @@ class SessionManager:
     ) -> str:
         """打开样本并创建会话。
 
-        `run_auto_analysis=False` 仍然会完整执行 IDA loader 与调试符号加载，
-        并保存隔离 working IDB；它只是不等待全库自动分析完成。这样能够
-        保持 UE 等大型样本的打开体验接近 GUI，后续按函数或字符串定点分析。
+        打开流程会完整执行 IDA loader 与调试符号加载，并保存隔离
+        working IDB。`run_auto_analysis` 控制是否等待全库自动分析完成；
+        大型样本可先完成轻量打开，再由函数或字符串工具触发定点分析。
         """
         resolved = source_path.resolve()
         if not resolved.exists():
@@ -306,6 +307,7 @@ class SessionManager:
             return session
 
     def _activate_session_locked(self, session_id: str) -> None:
+        """在锁内激活指定会话对应的工作 IDB。"""
         if self._active_session_id == session_id:
             return
         session = self._require_session_locked(session_id)
@@ -315,6 +317,7 @@ class SessionManager:
         self._active_session_id = session_id
 
     def _open_database_locked(self, input_path: Path, *, run_auto_analysis: bool) -> float:
+        """在锁内打开 IDA 数据库并返回耗时毫秒。"""
         if self._active_session_id is not None:
             idapro.close_database(True)
             self._active_session_id = None
@@ -452,12 +455,14 @@ class SessionManager:
         return sidecars
 
     def _require_session_locked(self, session_id: str) -> IdaSession:
+        """在锁内读取会话，不存在时抛出会话缺失错误。"""
         session = self._sessions.get(session_id)
         if session is None:
             raise SessionNotFoundError(f"找不到会话：{session_id}")
         return session
 
     def _require_context_owns_session_locked(self, context_id: str, session_id: str) -> None:
+        """确认上下文拥有目标会话。"""
         owned_sessions = self._context_sessions.get(context_id, set())
         if session_id not in owned_sessions:
             raise SessionNotFoundError(f"上下文 {context_id} 不拥有会话：{session_id}")

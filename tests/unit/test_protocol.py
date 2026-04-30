@@ -1,4 +1,4 @@
-"""V2 协议与门控单元测试。"""
+"""协议、工具面与门控单元测试。"""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from ida_stdio_mcp.runtime import HeadlessRuntime
 from ida_stdio_mcp.service import build_service
 from ida_stdio_mcp.stdio_server import ServerIdentity, StdioMcpServer
 
-REMOVED_V1_TOOLS = {
+EXCLUDED_PROTOCOL_TOOLS = {
     "describe_capabilities",
     "health",
     "warmup",
@@ -76,10 +76,11 @@ def schema_properties(tool: JsonObject, *, name: str) -> JsonObject:
 
 
 class ProtocolTests(unittest.TestCase):
-    """覆盖 V2 initialize、tools/list、prompts、resources 与门控。"""
+    """覆盖 initialize、tools/list、prompts、resources 与能力门控。"""
 
     @staticmethod
     def _repo_root() -> Path:
+        """返回仓库根目录。"""
         return Path(__file__).resolve().parents[2]
 
     def _service(self, *, tool_surface: ToolSurface = "slim", unsafe: bool = False, debugger: bool = False, isolated: bool = False) -> tuple[StdioMcpServer, list[JsonObject]]:
@@ -121,18 +122,18 @@ class ProtocolTests(unittest.TestCase):
             raise AssertionError("资源文本解码后不是对象")
         return cast(JsonObject, payload)
 
-    def test_default_surface_is_v2_slim_and_has_no_legacy_tools(self) -> None:
-        """默认工具面只暴露 V2 高层入口。"""
+    def test_default_surface_is_slim_workflow_tools(self) -> None:
+        """默认工具面只暴露高层工作流入口。"""
         _, tools = self._service()
         tool_names = self._tool_names(tools)
         self.assertEqual(tool_names, SLIM_TOOLS)
-        self.assertFalse(tool_names & REMOVED_V1_TOOLS)
+        self.assertFalse(tool_names & EXCLUDED_PROTOCOL_TOOLS)
 
-    def test_full_and_expert_surfaces_do_not_reenable_legacy_tools(self) -> None:
-        """full/expert 也不能把旧 MCP 工具面作为兼容层暴露回来。"""
+    def test_full_and_expert_surfaces_keep_protocol_boundary(self) -> None:
+        """full/expert 工具面保持当前公开边界。"""
         _, full_tools = self._service(tool_surface="full", unsafe=True, debugger=True)
         full_names = self._tool_names(full_tools)
-        self.assertFalse(full_names & REMOVED_V1_TOOLS)
+        self.assertFalse(full_names & EXCLUDED_PROTOCOL_TOOLS)
         self.assertIn("get_import_at", full_names)
         self.assertIn("microcode_summary", full_names)
         self.assertIn("microcode_def_use", full_names)
@@ -140,7 +141,7 @@ class ProtocolTests(unittest.TestCase):
 
         _, expert_tools = self._service(tool_surface="expert", unsafe=True, debugger=True)
         expert_names = self._tool_names(expert_tools)
-        self.assertFalse(expert_names & REMOVED_V1_TOOLS)
+        self.assertFalse(expert_names & EXCLUDED_PROTOCOL_TOOLS)
         self.assertIn("microcode_experiment", expert_names)
 
     def test_initialize_and_prompts_are_real_capabilities(self) -> None:
@@ -177,7 +178,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("CreateFile", expect_string(content.get("text"), name="prompt.text"))
 
     def test_workspace_state_is_ai_recoverable_without_ida(self) -> None:
-        """无 IDA 环境也应返回 V2 可修复状态，而不是回退 V1 健康检查。"""
+        """无 IDA 环境也应返回可修复工作区状态。"""
         server, _ = self._service()
         response = server.dispatch_message(
             {
@@ -196,12 +197,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(data["recommended_next_tools"], ["open_target"])
         self.assertIn("runtime_ready", data)
 
-    def test_tool_schema_is_explicit_and_v2_entrypoints_have_expected_fields(self) -> None:
+    def test_tool_schema_is_explicit_and_workflow_entrypoints_have_expected_fields(self) -> None:
         """工具 schema 仍保持显式、稳定、无顶层组合关键字。"""
         _, tools = self._service(tool_surface="full", unsafe=True, debugger=True)
         by_name = {str(item["name"]): item for item in tools if isinstance(item.get("name"), str)}
         self.assertGreater(len(by_name), 40)
-        self.assertFalse(set(by_name) & REMOVED_V1_TOOLS)
+        self.assertFalse(set(by_name) & EXCLUDED_PROTOCOL_TOOLS)
 
         for name, item in by_name.items():
             schema = expect_object(item.get("inputSchema"), name=f"{name}.inputSchema")
@@ -259,7 +260,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(error.get("code"), "session_required")
 
     def test_isolated_context_schema_uses_v2_names(self) -> None:
-        """隔离模式只在 V2 工具上暴露 context_id。"""
+        """隔离模式只在会话工具上暴露 context_id。"""
         _, tools = self._service(tool_surface="full", isolated=True)
         by_name = {str(item["name"]): item for item in tools if isinstance(item.get("name"), str)}
         self.assertTrue(bool(by_name["open_target"]["requiresContext"]))
@@ -294,7 +295,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(flavor, "line_json")
 
     def test_tool_and_resource_calls_are_written_to_debug_log(self) -> None:
-        """日志测试使用 V2 工具名。"""
+        """日志测试使用当前工作流工具名。"""
         server, _ = self._service(tool_surface="full")
         rendered_logs: list[str] = []
         sink_id = logger.add(

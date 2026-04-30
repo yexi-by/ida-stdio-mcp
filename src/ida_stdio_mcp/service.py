@@ -141,12 +141,10 @@ def _tool_input_schema(
 ) -> JsonObject:
     """构造统一的 tool 输入 schema。
 
-    这里刻意避免在顶层使用 anyOf/oneOf/allOf。
-    原因不是 JSON Schema 本身不支持，而是 Codex、Claude Code、Cherry
-    等主流 agent/client 在把 MCP tool 转成函数调用 schema 时，普遍只接受
-    “顶层 object + properties + required + additionalProperties=false”这一子集。
-    因此像“addr/query 二选一”这类约束，统一降级为自定义扩展字段，
-    由服务端自己的校验器负责执行。
+    公开 schema 固定使用“顶层 object + properties + required +
+    additionalProperties=false”结构，便于 MCP 客户端和模型工具接口
+    稳定读取字段。`any_of` 约束写入内部扩展字段，由服务端校验器
+    在调用边界执行。
     """
     final_properties: JsonObject = {}
     if properties is not None:
@@ -354,7 +352,7 @@ STACK_VAR_DECLARE_ITEM_SCHEMA = _object_param_schema(
         "addr": _string_schema("函数地址或函数名。"),
         "name": _string_schema("栈变量名。"),
         "type": _string_schema("变量类型；推荐字段。"),
-        "ty": _string_schema("兼容别名；等同于 type。"),
+        "ty": _string_schema("type 的别名。"),
         "offset": {
             "description": "栈变量偏移；可为整数，也可为如 -0x20 的字符串。",
             "oneOf": [{"type": "integer"}, {"type": "string"}],
@@ -391,6 +389,7 @@ class ServiceBundle:
 
 
 def _ensure_session(arguments: JsonObject, runtime: HeadlessRuntime) -> None:
+    """按请求参数激活会话，缺少会话时抛出结构化前置错误。"""
     raw_session = arguments.get("session_id")
     session_id = raw_session if isinstance(raw_session, str) and raw_session else None
     runtime.activate_for_request(session_id, context_id=_context_id(arguments))
@@ -480,9 +479,9 @@ def _with_context_example(
 def _normalize_tool_data(value: object) -> JsonValue:
     """在协议边界把任意运行时值收窄为 JSON 值。
 
-    这里只保留一个 `object` 边界入口，用来承接 IDA 运行时与资源层回传的
-    各类对象；本函数立即递归收窄，避免协议层在无 IDA 环境下为了错误包装
-    而强制创建 `IdaCore`。
+    本函数是协议层接收任意 `object` 的边界入口，用来承接 IDA 运行时
+    与资源层回传的各类对象；入口处立即递归收窄，保证后续流程只处理
+    可序列化的 JSON 值。
     """
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
@@ -499,6 +498,7 @@ def _normalize_tool_data(value: object) -> JsonValue:
 
 
 def _unwrap_statusful(value: object) -> tuple[ToolStatus, JsonValue, list[str]]:
+    """识别核心层自带状态的结果并提取状态、数据与告警。"""
     if isinstance(value, dict):
         payload = cast(JsonObject, value)
         if {"status", "data", "warnings"} <= set(payload.keys()):
@@ -548,6 +548,7 @@ def _tool(
     empty_state_behavior: str = "",
     input_example: JsonValue | None = None,
 ) -> None:
+    """注册一个绑定 IDA 能力层的工具并包裹会话、错误和写回语义。"""
     effective_context_required = runtime.isolated_contexts if context_required is None else context_required
     schema_with_context = _context_enabled_schema(runtime, input_schema, required=effective_context_required)
     effective_preconditions = _with_context_preconditions(
@@ -562,6 +563,7 @@ def _tool(
     )
 
     def wrapped(arguments: JsonObject) -> ToolResult:
+        """执行单次工具调用并转换为统一工具结果。"""
         try:
             if session_required:
                 _ensure_session(arguments, runtime)
@@ -614,6 +616,7 @@ def _management_tools(
     registry: ToolRegistry,
     runtime: HeadlessRuntime,
 ) -> None:
+    """注册不直接复用 `_tool` 包装器的工作流管理工具。"""
     context_required = runtime.isolated_contexts
 
     def register_management_tool(
@@ -628,6 +631,7 @@ def _management_tools(
         empty_state_behavior: str = "",
         input_example: JsonValue | None = None,
     ) -> None:
+        """注册一个工作流管理工具并补齐上下文隔离元数据。"""
         effective_requires_context = context_required if requires_context is None else requires_context
         schema_with_context = _context_enabled_schema(
             runtime,
@@ -659,6 +663,7 @@ def _management_tools(
         )
 
     def management_error_result(name: str, source: str, exc: Exception, *, session_required: bool, requires_context: bool) -> ToolResult:
+        """把工作流管理工具异常转换为统一结果。"""
         return _error_result_from_exception(
             name=name,
             source=source,
@@ -668,6 +673,7 @@ def _management_tools(
         )
 
     def get_workspace_state_handler(arguments: JsonObject) -> ToolResult:
+        """处理工作区状态查询。"""
         try:
             return build_result(
                 status="ok",
@@ -678,6 +684,7 @@ def _management_tools(
             return management_error_result("get_workspace_state", "workflow.get_workspace_state", exc, session_required=False, requires_context=context_required)
 
     def open_target_handler(arguments: JsonObject) -> ToolResult:
+        """处理样本打开请求并返回绑定会话摘要。"""
         try:
             raw_path = _require_string(arguments, "path")
             summary = runtime.open_target(
@@ -691,6 +698,7 @@ def _management_tools(
             return management_error_result("open_target", "workflow.open_target", exc, session_required=False, requires_context=context_required)
 
     def triage_binary_handler(arguments: JsonObject) -> ToolResult:
+        """处理开局分析请求并记录工作流活动。"""
         try:
             _ensure_session(arguments, runtime)
             core = _new_core()
@@ -720,6 +728,7 @@ def _management_tools(
             return management_error_result("triage_binary", "workflow.triage_binary", exc, session_required=True, requires_context=context_required)
 
     def investigate_string_handler(arguments: JsonObject) -> ToolResult:
+        """处理字符串牵引调查请求。"""
         try:
             _ensure_session(arguments, runtime)
             pattern = _string_or_default(arguments, "pattern", "")
@@ -742,6 +751,7 @@ def _management_tools(
             return management_error_result("investigate_string", "workflow.investigate_string", exc, session_required=True, requires_context=context_required)
 
     def explain_function_handler(arguments: JsonObject) -> ToolResult:
+        """处理函数解释请求并聚合画像、反编译和可选 microcode。"""
         try:
             _ensure_session(arguments, runtime)
             query = _addr_or_query(arguments)
@@ -773,6 +783,7 @@ def _management_tools(
             return management_error_result("explain_function", "workflow.explain_function", exc, session_required=True, requires_context=context_required)
 
     def trace_input_to_check_handler(arguments: JsonObject) -> ToolResult:
+        """处理输入到检查点的轻量追踪请求。"""
         try:
             _ensure_session(arguments, runtime)
             query = _require_string(arguments, "addr")
@@ -793,6 +804,7 @@ def _management_tools(
             return management_error_result("trace_input_to_check", "workflow.trace_input_to_check", exc, session_required=True, requires_context=context_required)
 
     def export_report_handler(arguments: JsonObject) -> ToolResult:
+        """处理结构化报告导出请求。"""
         try:
             _ensure_session(arguments, runtime)
             core = _new_core()
@@ -826,6 +838,7 @@ def _management_tools(
             return management_error_result("export_report", "workflow.export_report", exc, session_required=True, requires_context=context_required)
 
     def save_workspace_handler(arguments: JsonObject) -> ToolResult:
+        """处理工作 IDB 保存或导出请求。"""
         try:
             session_id = _string_or_default(arguments, "session_id", "") or None
             path = _string_or_default(arguments, "path", "")
@@ -838,6 +851,7 @@ def _management_tools(
             return management_error_result("save_workspace", "workflow.save_workspace", exc, session_required=True, requires_context=context_required)
 
     def close_target_handler(arguments: JsonObject) -> ToolResult:
+        """处理会话关闭请求。"""
         try:
             raw_session = arguments.get("session_id")
             session_id = raw_session if isinstance(raw_session, str) else None
@@ -852,7 +866,7 @@ def _management_tools(
 
     register_management_tool(
         name="get_workspace_state",
-        description="V2 工作区状态：返回 IDA 9.3+ 运行时、当前会话、工作 IDB、最近目标和推荐下一步；AI 默认先调用它。旧 session_id/context_id 心智负担由服务端下沉处理。",
+        description="工作区状态：返回 IDA 9.3+ 运行时、当前会话、工作 IDB、最近目标和推荐下一步；适合作为 AI 分析流程的第一步。",
         schema=_tool_input_schema(),
         handler=get_workspace_state_handler,
         requires_session=False,
@@ -861,7 +875,7 @@ def _management_tools(
     )
     register_management_tool(
         name="open_target",
-        description="V2 打开样本入口：打开原始样本并创建 .runtime/sessions/<session_id>/working.i64 工作库；后续切换只操作工作 IDB，不隐式污染原样本。",
+        description="打开样本：加载原始文件并创建 .runtime/sessions/<session_id>/working.i64 工作库；后续分析、写回和保存都作用于工作 IDB。",
         schema=_tool_input_schema(
             properties={
                 "path": _string_schema("二进制文件路径。"),
@@ -880,7 +894,7 @@ def _management_tools(
     )
     register_management_tool(
         name="triage_binary",
-        description="V2 开局 triage：返回样本摘要、入口点、关键函数、导入分类、字符串索引状态、托管质量等级和推荐下一步；默认不构建全量字符串索引。",
+        description="开局分析：返回样本摘要、入口点、关键函数、导入分类、字符串索引状态、托管质量等级和推荐下一步；默认不构建全量字符串索引。",
         schema=_tool_input_schema(
             properties={
                 "function_limit": _integer_schema("返回多少个关键函数摘要。", minimum=1),
@@ -897,7 +911,7 @@ def _management_tools(
     )
     register_management_tool(
         name="investigate_string",
-        description="V2 字符串牵引调查：输入字符串、URL、路径、错误文案或字符串地址，直接返回 string -> xref -> 所属函数的闭环线索。",
+        description="字符串牵引调查：输入字符串、URL、路径、错误文案或字符串地址，返回 string -> xref -> 所属函数的闭环线索。",
         schema=_tool_input_schema(
             properties={
                 "pattern": _string_schema("要查的字符串内容、错误文案、URL、路径或协议字段。"),
@@ -915,7 +929,7 @@ def _management_tools(
     )
     register_management_tool(
         name="explain_function",
-        description="V2 函数解释：一次返回函数画像、调用关系、字符串/常量、伪代码或托管 C# 表示；可选附带只读 microcode summary 线索。",
+        description="函数解释：一次返回函数画像、调用关系、字符串/常量、伪代码或托管 C# 表示；可选附带只读 microcode summary 线索。",
         schema=_tool_input_schema(
             properties={
                 **ADDR_OR_QUERY_PROPERTIES,
@@ -933,7 +947,7 @@ def _management_tools(
     )
     register_management_tool(
         name="trace_input_to_check",
-        description="V2 输入到检查点追踪：围绕地址或函数做轻量数据流追踪，适合顺着输入、鉴权、路径、协议字段追到比较与分支。",
+        description="输入到检查点追踪：围绕地址或函数做轻量数据流追踪，适合顺着输入、鉴权、路径、协议字段追到比较与分支。",
         schema=_tool_input_schema(
             properties={
                 "addr": _string_schema("起始地址、函数名或符号名。"),
@@ -950,7 +964,7 @@ def _management_tools(
     )
     register_management_tool(
         name="export_report",
-        description="V2 报告导出：导出适合 AI 复盘的当前样本报告，包含元数据、入口、导入、字符串、类型、结构与函数摘要。",
+        description="报告导出：导出适合 AI 复盘的当前样本报告，包含元数据、入口、导入、字符串、类型、结构与函数摘要。",
         schema=_tool_input_schema(
             properties={
                 "function_limit": _integer_schema("最多导出多少个函数。", minimum=1),
@@ -971,7 +985,7 @@ def _management_tools(
     )
     register_management_tool(
         name="save_workspace",
-        description="V2 保存工作区：默认保存当前 working.i64；只有显式传 path 时才导出到用户指定路径。",
+        description="保存工作区：默认保存当前 working.i64；显式传 path 时导出到用户指定路径。",
         schema=_tool_input_schema(
             properties={"path": _string_schema("可选导出路径；为空则保存当前工作 IDB。")},
             include_session=True,
@@ -983,7 +997,7 @@ def _management_tools(
     )
     register_management_tool(
         name="close_target",
-        description="V2 关闭样本：关闭指定或当前会话，保留 .runtime/sessions 下的工作 IDB。",
+        description="关闭样本：关闭指定或当前会话，保留 .runtime/sessions 下的工作 IDB。",
         schema=_tool_input_schema(include_session=True),
         handler=close_target_handler,
         requires_session=False,
@@ -992,6 +1006,7 @@ def _management_tools(
     )
 
 def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
+    """注册只读分析、查询与导出工具。"""
     _tool(
         registry,
         name="list_functions",
@@ -1178,7 +1193,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="list_strings",
-        description="分页列字符串，适合做字符串总览、字面量审计、提示词/路径/URL 摸排；这是显式重任务，原生样本可能触发 IDA 全库字符串索引构建。",
+        description="分页列字符串，适合做字符串总览、字面量审计、提示词/路径/URL 摸排；首次调用会构建当前 working IDB 的受控字符串缓存，返回 data/cache/statistics。",
         source="core.list_strings",
         runtime=runtime,
         input_schema=_tool_input_schema(properties=PAGINATION_PROPERTIES, include_session=True),
@@ -1187,7 +1202,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="find_strings",
-        description="按子串搜索字符串，快速查提示词、错误文案、URL、路径、协议字段。",
+        description="按子串搜索字符串，快速查提示词、错误文案、URL、路径、协议字段；复用当前 working IDB 的字符串缓存并返回 cache 命中状态。",
         source="core.find_strings",
         runtime=runtime,
         input_schema=_tool_input_schema(properties={**SEARCH_TEXT_PROPERTIES, **PAGINATION_PROPERTIES}, include_session=True, required=("pattern",)),
@@ -1196,7 +1211,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="search_regex",
-        description="对字符串做正则搜索，适合批量查模式化字面量、路径、域名、格式串。",
+        description="对字符串做正则搜索，适合批量查模式化字面量、路径、域名、格式串；复用当前 working IDB 的字符串缓存并返回 cache 命中状态。",
         source="core.search_regex",
         runtime=runtime,
         input_schema=_tool_input_schema(properties={**SEARCH_TEXT_PROPERTIES, **PAGINATION_PROPERTIES}, include_session=True, required=("pattern",)),
@@ -1367,10 +1382,10 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
         input_schema=_tool_input_schema(
             properties={
                 "items": _array_schema("要导出的函数列表；不传则按 limit 导出全部函数。", _string_schema("函数地址或函数名。")),
-                "query": _string_schema("单个函数；兼容别名。"),
-                "addr": _string_schema("单个函数地址；兼容别名。"),
+                "query": _string_schema("单个函数；items 的别名。"),
+                "addr": _string_schema("单个函数地址；items 的别名。"),
                 "format": _string_schema("导出格式。", enum=["json", "c_header", "prototypes"]),
-                "format_name": _string_schema("导出格式兼容别名。", enum=["json", "c_header", "prototypes"]),
+                "format_name": _string_schema("导出格式别名。", enum=["json", "c_header", "prototypes"]),
                 "limit": _integer_schema("最多导出多少个函数。", minimum=1),
             },
             include_session=True,
@@ -1421,8 +1436,8 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
         input_schema=_tool_input_schema(
             properties={
                 "items": _array_schema("根函数列表。", _string_schema("函数地址或函数名。"), min_items=1),
-                "query": _string_schema("单个根函数查询；兼容别名。"),
-                "addr": _string_schema("单个根函数地址；兼容别名。"),
+                "query": _string_schema("单个根函数查询；items 的别名。"),
+                "addr": _string_schema("单个根函数地址；items 的别名。"),
                 "max_depth": _integer_schema("最大展开深度。", minimum=1),
             },
             include_session=True,
@@ -1544,6 +1559,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
 
 
 def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
+    """注册写回、脚本执行和 microcode 实验工具。"""
     _tool(
         registry,
         name="set_comments",
@@ -1777,7 +1793,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
         input_schema=_tool_input_schema(
             properties={
                 **ADDR_OR_QUERY_PROPERTIES,
-                "action": _string_schema("实验动作。第一版仅支持 mark_chains_dirty。", enum=["mark_chains_dirty"]),
+                "action": _string_schema("实验动作；当前支持 mark_chains_dirty。", enum=["mark_chains_dirty"]),
             },
             include_session=True,
             any_of=(("addr",), ("query",)),
@@ -1793,32 +1809,43 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="evaluate_python",
-        description="在 IDA 上下文执行 Python / IDAPython 代码；当现成工具不够时可做高级自定义分析。",
+        description="在当前或指定会话的 IDB 上执行 Python / IDAPython 代码；返回 stdout/stderr/result 的受控摘要，不回传完整局部变量。",
         source="core.evaluate_python",
         runtime=runtime,
         input_schema=_tool_input_schema(
-            properties={"code": _string_schema("要执行的 Python 代码。")},
+            properties={
+                "code": _string_schema("要执行的 Python 代码。"),
+                "include_locals": _boolean_schema("是否返回局部变量安全摘要。默认 false；不会返回完整大对象。", default=False),
+                "max_output_chars": _integer_schema("stdout/stderr 最大返回字符数；服务端仍有硬上限，避免拖垮 MCP 客户端。", minimum=1000),
+            },
             required=("code",),
+            include_session=True,
         ),
-        handler=lambda core, arguments: core.evaluate_python(_require_string(arguments, "code")),
-        session_required=False,
+        handler=lambda core, arguments: core.evaluate_python(
+            _require_string(arguments, "code"),
+            include_locals=_bool_or_default(arguments, "include_locals", False),
+            max_output_chars=_int_or_default(arguments, "max_output_chars", 120_000),
+        ),
+        input_example={"session_id": "sess-001", "code": "import idautils\nresult = {'functions': len(list(idautils.Functions()))}"},
     )
     _tool(
         registry,
         name="execute_python_file",
-        description="执行磁盘上的 Python / IDAPython 脚本文件，适合复用现有分析脚本。",
+        description="在当前或指定会话的 IDB 上执行磁盘 Python / IDAPython 脚本文件，适合复用现有分析脚本。",
         source="core.execute_python_file",
         runtime=runtime,
         input_schema=_tool_input_schema(
             properties={"path": _string_schema("Python 脚本文件路径。")},
             required=("path",),
+            include_session=True,
         ),
         handler=lambda core, arguments: core.execute_python_file(_require_string(arguments, "path")),
-        session_required=False,
+        input_example={"session_id": "sess-001", "path": "D:/analysis/script.py"},
     )
 
 
 def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
+    """注册 IDA 调试器相关工具。"""
     _tool(
         registry,
         name="debug_start",
@@ -2066,6 +2093,7 @@ def _register_resources(
     allow_unsafe: bool,
     allow_debugger: bool,
 ) -> None:
+    """注册 MCP resources 与 resource templates。"""
     session_requires_context = runtime.isolated_contexts
     session_scope = "session"
     context_scope = "context" if runtime.isolated_contexts else "global"
@@ -2078,16 +2106,20 @@ def _register_resources(
         warnings: list[str] | None = None,
         error: JsonObject | None = None,
     ) -> JsonObject:
+        """构造资源读取使用的统一结果 envelope。"""
         return cast(JsonObject, build_result(status=status, source=source, data=data, warnings=warnings, error=error))
 
     def request_context_id(params: dict[str, str], *, required: bool) -> str | None:
+        """从资源读取参数中提取上下文 ID。"""
         context_id = params.get("context_id")
         if context_id is None and required:
             raise SessionRequiredError("当前启用了 --isolated-contexts，资源读取必须显式提供 context_id")
         return context_id
 
     def global_reader(source: str, reader: Callable[[], object]) -> Callable[[dict[str, str]], JsonValue]:
+        """把无参全局资源读取函数包装为统一 reader。"""
         def wrapped(_: dict[str, str]) -> JsonValue:
+            """读取全局资源并把异常转换为资源 envelope。"""
             try:
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader())))
             except Exception as exc:
@@ -2107,7 +2139,9 @@ def _register_resources(
         source: str,
         reader: Callable[[dict[str, str]], object],
     ) -> Callable[[dict[str, str]], JsonValue]:
+        """把带参数的全局资源读取函数包装为统一 reader。"""
         def wrapped(params: dict[str, str]) -> JsonValue:
+            """读取带参数的全局资源并包装结果。"""
             try:
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(params))))
             except Exception as exc:
@@ -2124,7 +2158,9 @@ def _register_resources(
         return wrapped
 
     def global_template_reader(source: str, reader: Callable[[dict[str, str]], object]) -> Callable[[dict[str, str]], JsonValue]:
+        """把全局模板资源读取函数包装为统一 reader。"""
         def wrapped(params: dict[str, str]) -> JsonValue:
+            """读取全局模板资源并包装结果。"""
             try:
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(params))))
             except Exception as exc:
@@ -2141,7 +2177,9 @@ def _register_resources(
         return wrapped
 
     def active_reader(source: str, reader: Callable[[IdaCore], object]) -> Callable[[dict[str, str]], JsonValue]:
+        """把依赖当前 IDB 的资源读取函数包装为统一 reader。"""
         def wrapped(params: dict[str, str]) -> JsonValue:
+            """激活当前会话后读取资源并包装结果。"""
             try:
                 runtime.activate_for_request(None, context_id=request_context_id(params, required=session_requires_context))
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(_new_core()))))
@@ -2159,7 +2197,9 @@ def _register_resources(
         return wrapped
 
     def template_reader(source: str, reader: Callable[[IdaCore, dict[str, str]], object]) -> Callable[[dict[str, str]], JsonValue]:
+        """把依赖当前 IDB 的模板资源读取函数包装为统一 reader。"""
         def wrapped(params: dict[str, str]) -> JsonValue:
+            """激活当前会话后读取模板资源并包装结果。"""
             try:
                 runtime.activate_for_request(None, context_id=request_context_id(params, required=session_requires_context))
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(_new_core(), params))))
@@ -2180,7 +2220,9 @@ def _register_resources(
         source: str,
         reader: Callable[[str | None], object],
     ) -> Callable[[dict[str, str]], JsonValue]:
+        """把依赖上下文的资源读取函数包装为统一 reader。"""
         def wrapped(params: dict[str, str]) -> JsonValue:
+            """读取上下文资源并包装结果。"""
             try:
                 context_id = request_context_id(params, required=session_requires_context)
                 return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(context_id))))
@@ -2198,6 +2240,7 @@ def _register_resources(
         return wrapped
 
     def current_session_resource(context_id: str | None) -> JsonObject:
+        """返回当前上下文绑定的会话摘要。"""
         try:
             session: JsonValue = _normalize_tool_data(runtime.current_target(context_id=context_id))
         except SessionRequiredError:
@@ -2205,6 +2248,7 @@ def _register_resources(
         return normalize_json_object({"session": session})
 
     def capability_matrix_document(params: dict[str, str]) -> JsonObject:
+        """构造全局能力矩阵资源内容。"""
         context_id = request_context_id(params, required=False)
         current_session: JsonValue = None
         current_snapshot: JsonValue = None
@@ -2319,7 +2363,7 @@ def _register_resources(
             requires_session=False,
         )
     )
-    resources.register_static(ResourceSpec("ida://triage", "triage", "当前样本的 V2 triage 概览。", "application/json", active_reader("resource.triage", lambda core: core.binary_survey_snapshot()), requires_context=session_requires_context))
+    resources.register_static(ResourceSpec("ida://triage", "triage", "当前样本的开局分析概览。", "application/json", active_reader("resource.triage", lambda core: core.binary_survey_snapshot()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://types", "types", "当前类型目录。", "application/json", active_reader("resource.types", lambda core: core.query_types()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://structs", "structs", "当前结构体列表。", "application/json", active_reader("resource.structs", lambda core: core.search_structs()), requires_context=session_requires_context))
     resources.register_static(ResourceSpec("ida://functions", "functions", "当前函数列表。", "application/json", active_reader("resource.functions", lambda core: core.list_functions(limit=2000)), requires_context=session_requires_context))
@@ -2516,7 +2560,7 @@ def build_service(
 
 
 def _apply_tool_surface(tools: ToolRegistry, tool_surface: ToolSurface) -> None:
-    """按 V2 工具面裁剪注册表。"""
+    """按工具面裁剪注册表。"""
     if tool_surface == "slim":
         tools.apply_whitelist(SLIM_TOOL_NAMES)
         return
@@ -2537,6 +2581,7 @@ def _apply_tool_surface(tools: ToolRegistry, tool_surface: ToolSurface) -> None:
 
 
 def _require_string(arguments: JsonObject, key: str) -> str:
+    """读取必填字符串参数。"""
     value = arguments.get(key)
     if not isinstance(value, str):
         raise ValueError(f"{key} 必须是字符串")
@@ -2574,6 +2619,7 @@ def _bool_or_default(arguments: JsonObject, key: str, default: bool = False) -> 
 
 
 def _string_list(arguments: JsonObject, key: str) -> list[str]:
+    """读取字符串列表参数。"""
     value = arguments.get(key)
     if not isinstance(value, list):
         raise ValueError(f"{key} 必须是字符串列表")
@@ -2582,6 +2628,7 @@ def _string_list(arguments: JsonObject, key: str) -> list[str]:
 
 
 def _optional_query_list(arguments: JsonObject) -> list[str] | None:
+    """读取可选批量查询列表或单个 query/addr。"""
     raw_queries = arguments.get("items")
     if isinstance(raw_queries, list):
         return [str(item) for item in raw_queries]
@@ -2593,6 +2640,7 @@ def _optional_query_list(arguments: JsonObject) -> list[str] | None:
 
 
 def _json_object_list(arguments: JsonObject, key: str) -> list[JsonObject]:
+    """读取 JSON 对象列表参数。"""
     value = arguments.get(key)
     if not isinstance(value, list):
         raise ValueError(f"{key} 必须是对象列表")
@@ -2605,10 +2653,12 @@ def _json_object_list(arguments: JsonObject, key: str) -> list[JsonObject]:
 
 
 def _query_filter(arguments: JsonObject) -> str:
+    """读取函数或符号筛选文本。"""
     return _string_or_default(arguments, "filter", "")
 
 
 def _search_text(arguments: JsonObject) -> str:
+    """读取必填搜索文本 pattern。"""
     value = arguments.get("pattern")
     if isinstance(value, str):
         return value
@@ -2616,6 +2666,7 @@ def _search_text(arguments: JsonObject) -> str:
 
 
 def _addr_list(arguments: JsonObject, key: str) -> list[str]:
+    """读取地址列表，支持单个 addr 作为快捷输入。"""
     value = arguments.get(key)
     if isinstance(value, list):
         return [str(item) for item in value]
@@ -2626,6 +2677,7 @@ def _addr_list(arguments: JsonObject, key: str) -> list[str]:
 
 
 def _root_queries(arguments: JsonObject) -> list[str]:
+    """读取调用图根函数列表。"""
     raw_roots = arguments.get("items")
     if isinstance(raw_roots, list):
         return [str(item) for item in raw_roots]
@@ -2637,6 +2689,7 @@ def _root_queries(arguments: JsonObject) -> list[str]:
 
 
 def _addr_or_query(arguments: JsonObject) -> str:
+    """读取地址或名称查询参数。"""
     for key in ("addr", "query"):
         value = arguments.get(key)
         if isinstance(value, str):
@@ -2645,6 +2698,7 @@ def _addr_or_query(arguments: JsonObject) -> str:
 
 
 def _int_value(value: JsonValue) -> str | int:
+    """读取可作为整数写入值的字符串或整数。"""
     if isinstance(value, (str, int)):
         return value
     raise ValueError("value 必须是字符串或整数")
