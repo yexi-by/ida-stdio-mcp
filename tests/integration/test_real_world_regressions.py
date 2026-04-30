@@ -35,10 +35,12 @@ class RealWorldRegressionTests(unittest.TestCase):
 
     @staticmethod
     def _repo_root() -> Path:
+        """返回仓库根目录。"""
         return Path(__file__).resolve().parents[2]
 
     @classmethod
     def setUpClass(cls) -> None:
+        """解析真实原生样本和托管样本路径。"""
         cls.repo_root = cls._repo_root()
         cls.real_native_fixture = Path(
             os.environ.get(
@@ -54,14 +56,15 @@ class RealWorldRegressionTests(unittest.TestCase):
         ).resolve()
 
     def setUp(self) -> None:
+        """为每个回归用例创建独立服务实例。"""
         self.config = load_config(self.repo_root / "setting.toml")
         self.runtime = HeadlessRuntime()
         self.service = build_service(
             self.runtime,
-            self.config,
             allow_unsafe=True,
             allow_debugger=True,
             profile_path=None,
+            tool_surface="expert",
         )
         self.server = StdioMcpServer(
             tools=self.service.tools,
@@ -74,17 +77,21 @@ class RealWorldRegressionTests(unittest.TestCase):
         )
 
     def tearDown(self) -> None:
+        """关闭回归测试期间打开的所有会话。"""
         self.runtime.shutdown()
 
     def _require_real_managed(self) -> None:
+        """缺少真实托管样本时跳过当前用例。"""
         if not self.real_managed_fixture.exists():
             self.skipTest(f"真实托管样本不存在：{self.real_managed_fixture}")
 
     def _require_real_native(self) -> None:
+        """缺少真实原生样本时跳过当前用例。"""
         if not self.real_native_fixture.exists():
             self.skipTest(f"真实原生样本不存在：{self.real_native_fixture}")
 
     def _call_tool(self, name: str, arguments: JsonObject | None = None) -> JsonObject:
+        """通过 stdio server 调用工具并返回 structuredContent。"""
         response = self.server.dispatch_message(
             {
                 "jsonrpc": "2.0",
@@ -99,6 +106,7 @@ class RealWorldRegressionTests(unittest.TestCase):
         return expect_object(response_result["structuredContent"], name="tool.structured")
 
     def _read_resource(self, uri: str) -> JsonObject:
+        """通过 stdio server 读取资源并返回 result。"""
         response = self.server.dispatch_message(
             {
                 "jsonrpc": "2.0",
@@ -121,7 +129,7 @@ class RealWorldRegressionTests(unittest.TestCase):
             shutil.copy2(self.real_managed_fixture, copied_assembly)
 
             opened = self._call_tool(
-                "open_binary",
+                "open_target",
                 {"path": str(copied_assembly), "session_id": "managed-real"},
             )
             self.assertEqual(opened["status"], "ok")
@@ -194,17 +202,17 @@ class RealWorldRegressionTests(unittest.TestCase):
             self.assertIn("bool __fastcall", signature)
 
             saved = self._call_tool(
-                "save_binary",
+                "save_workspace",
                 {"path": str(saved_idb), "session_id": "managed-real"},
             )
             self.assertEqual(saved["status"], "ok")
             self.assertTrue(saved_idb.exists())
 
-            closed = self._call_tool("close_binary", {"session_id": "managed-real"})
+            closed = self._call_tool("close_target", {"session_id": "managed-real"})
             self.assertEqual(closed["status"], "ok")
 
             reopened = self._call_tool(
-                "open_binary",
+                "open_target",
                 {"path": str(saved_idb), "session_id": "managed-reopen"},
             )
             self.assertEqual(reopened["status"], "ok")
@@ -228,7 +236,7 @@ class RealWorldRegressionTests(unittest.TestCase):
         self._require_real_native()
 
         managed_opened = self._call_tool(
-            "open_binary",
+            "open_target",
             {"path": str(self.real_managed_fixture), "session_id": "managed-strings"},
         )
         self.assertEqual(managed_opened["status"], "ok")
@@ -254,7 +262,7 @@ class RealWorldRegressionTests(unittest.TestCase):
         self.assertEqual(managed_read_first.get("string"), "{0}/save{1}.txt")
 
         native_opened = self._call_tool(
-            "open_binary",
+            "open_target",
             {"path": str(self.real_native_fixture), "session_id": "native-strings"},
         )
         self.assertEqual(native_opened["status"], "ok")

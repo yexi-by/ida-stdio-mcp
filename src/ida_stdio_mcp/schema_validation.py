@@ -1,4 +1,4 @@
-"""最小可控的 JSON schema 校验器。
+"""MCP 工具入参使用的 JSON Schema 子集校验器。
 
 这里只支持本项目真实使用到的 schema 子集：
 
@@ -9,12 +9,12 @@
 - oneOf
 - x-required-any-of（项目自定义：表达“至少满足一组字段”）
 
-设计目标不是兼容完整 JSON Schema，而是把 MCP 工具入参约束做成
-可预测、可定位、可机器修复的协议层校验。
+校验器负责在协议边界给出可定位、可机器修复的入参错误。
+公开的 `inputSchema` 使用显式 `object/properties/required` 结构，
+让客户端和上游模型接口能稳定读取字段、类型和必填项。
 
-注意：顶层 anyOf/oneOf/allOf 在不少 MCP 客户端和上游模型工具接口中
-都存在兼容性问题，因此项目对外暴露的 inputSchema 不再使用顶层组合关键字，
-而是把“至少满足一组字段”降级成 x-required-any-of，由服务端显式校验。
+“至少满足一组字段”的约束由服务端通过 `x-required-any-of` 显式校验；
+该扩展只存在于内部校验阶段，公开 schema 会剥离内部扩展字段。
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ def validate_arguments(schema: JsonObject, arguments: JsonObject) -> None:
 
 
 def _validate_node(*, schema: JsonObject, value: JsonValue, path: str) -> None:
+    """按 schema 节点类型分派具体校验逻辑。"""
     one_of = schema.get("oneOf")
     if isinstance(one_of, list):
         _validate_one_of(one_of, value, path)
@@ -67,6 +68,7 @@ def _validate_node(*, schema: JsonObject, value: JsonValue, path: str) -> None:
 
 
 def _validate_object(schema: JsonObject, value: JsonValue, path: str) -> None:
+    """校验对象字段、必填项、额外字段和备选字段组。"""
     _ensure_type(isinstance(value, dict), path=path, expected="object", actual=value)
     assert isinstance(value, dict)
     properties = schema.get("properties", {})
@@ -133,6 +135,7 @@ def _validate_object(schema: JsonObject, value: JsonValue, path: str) -> None:
 
 
 def _validate_array(schema: JsonObject, value: JsonValue, path: str) -> None:
+    """校验数组类型、最小长度和元素 schema。"""
     _ensure_type(isinstance(value, list), path=path, expected="array", actual=value)
     assert isinstance(value, list)
     min_items = schema.get("minItems")
@@ -152,6 +155,7 @@ def _validate_array(schema: JsonObject, value: JsonValue, path: str) -> None:
 
 
 def _validate_one_of(options: Sequence[JsonValue], value: JsonValue, path: str) -> None:
+    """校验值是否命中任一 oneOf 分支。"""
     last_error: ToolInputValidationError | None = None
     for option in options:
         if not isinstance(option, dict):
@@ -173,6 +177,7 @@ def _validate_one_of(options: Sequence[JsonValue], value: JsonValue, path: str) 
 
 
 def _validate_enum(schema: JsonObject, value: JsonValue, path: str) -> None:
+    """校验字符串枚举值。"""
     raw_enum = schema.get("enum")
     if not isinstance(raw_enum, list):
         return
@@ -190,6 +195,7 @@ def _validate_enum(schema: JsonObject, value: JsonValue, path: str) -> None:
 
 
 def _match_required_any_of(branches: Sequence[JsonValue], value: JsonObject) -> bool:
+    """判断对象是否满足任一必填字段组合。"""
     for branch in branches:
         if not isinstance(branch, list):
             continue
@@ -200,6 +206,7 @@ def _match_required_any_of(branches: Sequence[JsonValue], value: JsonObject) -> 
 
 
 def _ensure_type(condition: bool, *, path: str, expected: str, actual: object) -> None:
+    """在类型不匹配时抛出统一校验错误。"""
     if condition:
         return
     _raise_validation_error(
@@ -212,6 +219,7 @@ def _ensure_type(condition: bool, *, path: str, expected: str, actual: object) -
 
 
 def _actual_type_name(value: object) -> str:
+    """把运行时值转换成 JSON Schema 风格类型名。"""
     if value is None:
         return "null"
     if isinstance(value, bool):
@@ -238,6 +246,7 @@ def _raise_validation_error(
     actual: object,
     next_steps: list[str] | None = None,
 ) -> None:
+    """抛出带详情和修复建议的工具入参错误。"""
     details: JsonObject = {
         "path": path,
         "expected": _to_json_value(expected),

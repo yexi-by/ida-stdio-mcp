@@ -18,6 +18,7 @@ class RuntimeWorkspacePaths:
 
     directory: Path
     symbol_cache_directory: Path
+    sessions_directory: Path
 
 
 _workspace_paths: RuntimeWorkspacePaths | None = None
@@ -28,11 +29,14 @@ def configure_runtime_workspace(config: RuntimeWorkspaceConfig) -> RuntimeWorksp
     """初始化运行时副作用目录。"""
     directory = config.directory.resolve()
     symbol_cache_directory = config.symbol_cache_directory.resolve()
+    sessions_directory = directory / "sessions"
     directory.mkdir(parents=True, exist_ok=True)
     symbol_cache_directory.mkdir(parents=True, exist_ok=True)
+    sessions_directory.mkdir(parents=True, exist_ok=True)
     paths = RuntimeWorkspacePaths(
         directory=directory,
         symbol_cache_directory=symbol_cache_directory,
+        sessions_directory=sessions_directory,
     )
     global _workspace_paths
     with _workspace_lock:
@@ -48,11 +52,14 @@ def get_runtime_workspace_paths() -> RuntimeWorkspacePaths:
         if paths is None:
             directory = (Path.cwd() / ".runtime").resolve()
             symbol_cache_directory = (directory / "symbol-cache").resolve()
+            sessions_directory = directory / "sessions"
             directory.mkdir(parents=True, exist_ok=True)
             symbol_cache_directory.mkdir(parents=True, exist_ok=True)
+            sessions_directory.mkdir(parents=True, exist_ok=True)
             paths = RuntimeWorkspacePaths(
                 directory=directory,
                 symbol_cache_directory=symbol_cache_directory,
+                sessions_directory=sessions_directory,
             )
             _workspace_paths = paths
     return paths

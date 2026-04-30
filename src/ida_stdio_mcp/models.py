@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Literal, TypedDict
 
 JsonScalar = str | int | float | bool | None
@@ -13,6 +11,7 @@ ToolStatus = Literal["ok", "degraded", "unsupported", "error"]
 BinaryKind = Literal["pe", "elf", "macho", "unknown"]
 AnalysisDomain = Literal["native", "managed", "unknown"]
 GateName = Literal["public", "unsafe", "debugger"]
+ToolSurface = Literal["slim", "full", "expert"]
 
 
 class ToolResult(TypedDict):
@@ -46,7 +45,8 @@ class BinarySummary(TypedDict):
     """当前二进制摘要。"""
 
     session_id: str
-    input_path: str
+    source_path: str
+    working_idb_path: str
     filename: str
     created_at: str
     last_accessed: str
@@ -60,15 +60,6 @@ class BinarySummary(TypedDict):
     persistent_after_save: bool
     saved_path: str
     undo_supported: bool
-
-
-@dataclass(slots=True, frozen=True)
-class CandidateFile:
-    """目录扫描阶段识别出的候选文件。"""
-
-    path: Path
-    binary_kind: BinaryKind
-    score: int
-    size: int
-    sha256: str
-    reasons: tuple[str, ...] = field(default_factory=tuple)
+    last_active_tool: str
+    recent_targets: list[str]
+    recommended_next_tools: list[str]

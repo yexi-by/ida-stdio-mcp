@@ -1,4 +1,4 @@
-"""原生 stdio MCP 服务。"""
+"""stdio MCP 服务实现。"""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .logging import (
     log_tool_call_started,
 )
 from .models import JsonObject, JsonValue
+from .prompts import PromptRegistry
 from .result import build_error_info, build_result, normalize_json_object
 from .tool_registry import ResourceRegistry, ToolRegistry
 
@@ -42,10 +43,13 @@ class StdioMcpServer:
         tools: ToolRegistry,
         resources: ResourceRegistry,
         identity: ServerIdentity,
+        prompts: PromptRegistry | None = None,
     ) -> None:
+        """注入工具、资源、服务身份与可选 prompt 注册表。"""
         self._tools = tools
         self._resources = resources
         self._identity = identity
+        self._prompts = prompts
         self._transport_flavor: TransportFlavor | None = None
 
     def serve(self) -> int:
@@ -91,8 +95,8 @@ class StdioMcpServer:
     def dispatch_message(self, request_obj: JsonObject) -> JsonObject | None:
         """公开单条消息分发入口。
 
-        这个方法主要服务于单元测试和未来可能的嵌入式宿主，
-        避免测试代码直接依赖私有 `_dispatch`，同时也让协议层语义更清晰。
+        这个方法服务于单元测试和嵌入式宿主，让外部调用方通过稳定入口
+        测试协议分发行为。
         """
         return self._dispatch(request_obj)
 
@@ -101,7 +105,7 @@ class StdioMcpServer:
         stream: BinaryIO,
         current_flavor: TransportFlavor | None = None,
     ) -> tuple[str | None, TransportFlavor]:
-        """公开消息读取入口，便于测试 framing 兼容性。"""
+        """公开消息读取入口，便于测试不同传输格式。"""
         return StdioMcpServer._read_message(stream, current_flavor)
 
     @staticmethod
@@ -114,21 +118,24 @@ class StdioMcpServer:
         StdioMcpServer._write_message(stream, payload, transport_flavor)
 
     def _dispatch(self, request_obj: JsonObject) -> JsonObject | None:
+        """分发单条 JSON-RPC 请求并返回响应对象。"""
         method = request_obj.get("method")
         request_id = request_obj.get("id")
         if not isinstance(method, str):
             return self._error_response(request_id, -32600, "请求缺少 method")
 
         if method == "initialize":
+            capabilities: JsonObject = {
+                "tools": {},
+                "resources": {"subscribe": False, "listChanged": False},
+            }
+            if self._prompts is not None and self._prompts.has_prompts():
+                capabilities["prompts"] = {}
             return self._ok_response(
                 request_id,
                 {
                     "protocolVersion": self._identity.protocol_version,
-                    "capabilities": {
-                        "tools": {},
-                        "resources": {"subscribe": False, "listChanged": False},
-                        "prompts": {},
-                    },
+                    "capabilities": capabilities,
                     "serverInfo": {
                         "name": self._identity.server_name,
                         "version": self._identity.server_version,
@@ -279,14 +286,42 @@ class StdioMcpServer:
                 {"contents": [cast(JsonValue, item) for item in contents], "isError": is_error},
             )
 
+        if method == "prompts/list":
+            if self._prompts is None:
+                return self._error_response(request_id, -32601, "当前服务未启用 prompts")
+            return self._ok_response(
+                request_id,
+                {"prompts": [cast(JsonValue, item) for item in self._prompts.list_prompts()]},
+            )
+
+        if method == "prompts/get":
+            if self._prompts is None:
+                return self._error_response(request_id, -32601, "当前服务未启用 prompts")
+            params = request_obj.get("params")
+            if not isinstance(params, dict):
+                return self._error_response(request_id, -32602, "prompts/get 缺少 params")
+            name = params.get("name")
+            arguments = params.get("arguments", {})
+            if not isinstance(name, str):
+                return self._error_response(request_id, -32602, "prompts/get 需要字符串 name")
+            if not isinstance(arguments, dict):
+                return self._error_response(request_id, -32602, "prompts/get arguments 必须是对象")
+            try:
+                prompt_payload = self._prompts.get_prompt(name, cast(JsonObject, arguments))
+            except KeyError as exc:
+                return self._error_response(request_id, -32602, str(exc))
+            return self._ok_response(request_id, prompt_payload)
+
         return self._error_response(request_id, -32601, f"未知方法：{method}")
 
     @staticmethod
     def _ok_response(request_id: JsonValue, result: JsonObject) -> JsonObject:
+        """构造 JSON-RPC 成功响应。"""
         return normalize_json_object({"jsonrpc": "2.0", "result": result, "id": request_id})
 
     @staticmethod
     def _error_response(request_id: JsonValue, code: int, message: str) -> JsonObject:
+        """构造 JSON-RPC 错误响应。"""
         return normalize_json_object(
             {
             "jsonrpc": "2.0",
@@ -300,7 +335,7 @@ class StdioMcpServer:
         stream: BinaryIO,
         current_flavor: TransportFlavor | None = None,
     ) -> tuple[str | None, TransportFlavor]:
-        """读取一条 stdio 消息，同时兼容 framing 与逐行 JSON 两种实现。"""
+        """读取一条 stdio 消息，支持 Content-Length framing 与逐行 JSON。"""
         if current_flavor == "line_json":
             return StdioMcpServer._read_line_json_message(stream), "line_json"
         if current_flavor == "framed":

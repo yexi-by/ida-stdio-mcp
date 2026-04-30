@@ -37,6 +37,7 @@ class ToolInputValidationError(IdaStdioMcpError):
     """工具输入不符合 schema。"""
 
     def __init__(self, message: str, *, details: JsonObject, next_steps: list[str] | None = None) -> None:
+        """保存校验错误详情和可执行修复建议。"""
         super().__init__(message)
         self.details = details
         self.next_steps = next_steps or []

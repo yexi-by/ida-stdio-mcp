@@ -11,6 +11,7 @@ class ManagedDecompilerTests(unittest.TestCase):
     """验证托管源码截取逻辑。"""
 
     def test_extracts_block_method(self) -> None:
+        """从普通块状方法中截取完整方法源码。"""
         source = """
 namespace Demo;
 
@@ -30,6 +31,7 @@ public class PlayerInformation
         self.assertIn('var value = "ok";', method)
 
     def test_extracts_expression_bodied_method(self) -> None:
+        """从表达式体方法中截取单行方法源码。"""
         source = """
 public class DemoType
 {
@@ -40,6 +42,7 @@ public class DemoType
         self.assertEqual(method, 'public string Name() => "demo";')
 
     def test_returns_none_when_method_missing(self) -> None:
+        """目标方法不存在时返回 None。"""
         source = "public class DemoType { public void Save() { } }"
         self.assertIsNone(extract_method_source(source, "Load"))
 

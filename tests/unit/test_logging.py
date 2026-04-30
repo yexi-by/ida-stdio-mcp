@@ -41,22 +41,22 @@ class LoggingTests(unittest.TestCase):
                 log_path = configure_logging(LoggingConfig(level="INFO", directory=Path(temp_dir)))
 
                 log_tool_call_started(
-                    "open_binary",
+                    "open_target",
                     1,
                     {"path": "D:/samples/sample.exe", "session_id": "sample"},
                 )
                 log_tool_call_finished(
-                    "open_binary",
+                    "open_target",
                     1,
                     {"path": "D:/samples/sample.exe", "session_id": "sample"},
-                    build_result(status="ok", source="runtime.open_binary", data={"session_id": "sample"}),
+                    build_result(status="ok", source="workflow.open_target", data={"session_id": "sample"}),
                     duration_ms=12.345,
                 )
                 logger.complete()
 
                 text = log_path.read_text(encoding="utf-8")
-                self.assertIn("工具调用开始：open_binary", text)
-                self.assertIn("工具调用完成：open_binary status=ok duration=12.3ms", text)
+                self.assertIn("工具调用开始：open_target", text)
+                self.assertIn("工具调用完成：open_target status=ok duration=12.3ms", text)
                 self.assertIn("event=tool_call_start", text)
                 self.assertIn("event=tool_call_finish", text)
                 self.assertIn("path", text)
@@ -72,10 +72,10 @@ class LoggingTests(unittest.TestCase):
 
                 error = cast(JsonObject, build_error_info(code="file_not_found", message="样本不存在"))
                 log_tool_call_finished(
-                    "open_binary",
+                    "open_target",
                     "req-1",
                     {"path": "D:/missing.exe"},
-                    build_result(status="error", source="runtime.open_binary", data=None, error=error),
+                    build_result(status="error", source="workflow.open_target", data=None, error=error),
                     duration_ms=20.0,
                 )
                 logger.complete()
@@ -96,11 +96,11 @@ class LoggingTests(unittest.TestCase):
                 try:
                     raise RuntimeError("模拟未知异常")
                 except RuntimeError as exc:
-                    log_tool_call_exception("summarize_binary", "req-2", {}, exc, duration_ms=5.0)
+                    log_tool_call_exception("triage_binary", "req-2", {}, exc, duration_ms=5.0)
                 logger.complete()
 
                 text = log_path.read_text(encoding="utf-8")
-                self.assertIn("工具调用异常：summarize_binary", text)
+                self.assertIn("工具调用异常：triage_binary", text)
                 self.assertIn("Traceback", text)
                 self.assertIn("RuntimeError: 模拟未知异常", text)
             finally:

@@ -69,9 +69,11 @@ class ToolRegistry:
     """管理 MCP 工具定义与调用。"""
 
     def __init__(self) -> None:
+        """初始化工具名到工具定义的索引。"""
         self._tools: dict[str, ToolSpec] = {}
 
     def register(self, tool: ToolSpec) -> None:
+        """注册或覆盖一个工具定义。"""
         self._tools[tool.name] = tool
 
     def apply_whitelist(self, whitelist: set[str], *, protected: set[str] | None = None) -> tuple[list[str], list[str]]:
@@ -86,6 +88,7 @@ class ToolRegistry:
         return kept, unknown
 
     def list_tools(self) -> list[JsonObject]:
+        """返回 MCP tools/list 可序列化结果。"""
         return [
             {
                 "name": tool.name,
@@ -103,6 +106,7 @@ class ToolRegistry:
         ]
 
     def call(self, name: str, arguments: JsonObject) -> ToolResult:
+        """校验参数并调用指定工具。"""
         tool = self._tools.get(name)
         if tool is None:
             raise KeyError(f"未知工具：{name}")
@@ -131,6 +135,7 @@ class ToolRegistry:
 
     @staticmethod
     def format_tool_result(result: ToolResult) -> JsonObject:
+        """把统一工具结果包装为 MCP tools/call 响应体。"""
         payload = json.dumps(result, ensure_ascii=False)
         return cast(
             JsonObject,
@@ -146,6 +151,7 @@ class ToolRegistry:
         return self._example_for_schema(schema)
 
     def _example_for_schema(self, schema: JsonObject, field_name: str | None = None) -> JsonValue:
+        """递归生成符合 schema 的最小示例值。"""
         one_of = schema.get("oneOf")
         if isinstance(one_of, list) and one_of:
             first = one_of[0]
@@ -204,6 +210,7 @@ class ToolRegistry:
 
     @staticmethod
     def _string_example(field_name: str | None) -> str:
+        """按字段名生成字符串参数示例。"""
         examples = {
             "path": "D:/samples/sample.exe",
             "session_id": "sess-001",
@@ -232,10 +239,12 @@ class ResourceRegistry:
     """管理 MCP resources/list、templates/list 与 read。"""
 
     def __init__(self) -> None:
+        """初始化静态资源与模板资源注册表。"""
         self._static_resources: dict[str, ResourceSpec] = {}
         self._templates: list[ResourceTemplateSpec] = []
 
     def register_static(self, spec: ResourceSpec) -> None:
+        """注册静态资源。"""
         self._static_resources[spec.uri] = spec
 
     def register_template(
@@ -250,6 +259,7 @@ class ResourceRegistry:
         requires_session: bool = True,
         requires_context: bool = False,
     ) -> None:
+        """注册带路径参数的资源模板。"""
         parameter_names = tuple(re.findall(r"\{([^{}]+)\}", uri_template))
         pattern_text = re.escape(uri_template)
         for parameter_name in parameter_names:
@@ -271,6 +281,7 @@ class ResourceRegistry:
         )
 
     def list_resources(self) -> list[JsonObject]:
+        """返回 MCP resources/list 可序列化结果。"""
         return [
             {
                 "uri": spec.uri,
@@ -285,6 +296,7 @@ class ResourceRegistry:
         ]
 
     def list_templates(self) -> list[JsonObject]:
+        """返回 MCP resources/templates/list 可序列化结果。"""
         return [
             {
                 "uriTemplate": spec.uri_template,
@@ -299,6 +311,7 @@ class ResourceRegistry:
         ]
 
     def read(self, uri: str, request_params: JsonObject | None = None) -> tuple[list[ResourceContent], bool]:
+        """读取静态资源或匹配模板资源。"""
         merged_params: dict[str, str] = {}
         if request_params is not None:
             for key, value in request_params.items():
@@ -324,6 +337,7 @@ class ResourceRegistry:
 
     @staticmethod
     def _content(uri: str, mime_type: str, payload: JsonValue) -> ResourceContent:
+        """把资源载荷转换为 MCP resource content。"""
         return {
             "uri": uri,
             "mimeType": mime_type,
@@ -332,6 +346,7 @@ class ResourceRegistry:
 
     @staticmethod
     def _payload_is_error(payload: JsonValue) -> bool:
+        """判断资源 envelope 是否表示错误。"""
         if not isinstance(payload, dict):
             return False
         status = payload.get("status")
