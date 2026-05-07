@@ -14,12 +14,12 @@
 
 | 能力 | 需要 |
 | --- | --- |
-| IDAPython / 脚本文件 | `--unsafe --tool-surface expert` |
+| IDAPython / 脚本文件 | `--unsafe` |
 | 注释、重命名、类型写回、补丁 | `--unsafe` |
 | 调试器 | `--debugger` |
 | microcode mutation | `--unsafe --tool-surface expert` |
 
-如果工具列表里没有对应工具，不要假装可用。先解释需要的运行参数。
+默认 `slim` 工具面不暴露 IDAPython / 脚本文件；需要时切到 `full` 或 `expert` 工具面。如果工具列表里没有对应工具，不要假装可用。先解释需要的运行参数。
 
 ## IDAPython
 

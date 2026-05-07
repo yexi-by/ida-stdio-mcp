@@ -45,7 +45,7 @@ get_workspace_state -> open_target -> triage_binary -> investigate_string / expl
 - 只需要伪代码：用 `decompile_function`。需要上下文、字符串、调用关系、建议：用 `explain_function`。
 - UE、Chrome、游戏客户端、大 PDB 样本：保持 `run_auto_analysis=false` 做轻量打开；用户明确要全库自动分析时再用 `run_auto_analysis=true`，并提醒客户端超时设为 1 到 6 小时。
 - 字符串工具首次查询会构建会话级缓存。未命中且 `cache.truncated_by_scan_limit=true` 时，不得断言全库不存在。
-- IDAPython 只能在 `--unsafe --tool-surface expert` 下使用。脚本只返回小型摘要，必须把结果赋给 `result`。
+- IDAPython 需要 `--unsafe`，且默认 `slim` 工具面不暴露脚本工具。脚本只返回小型摘要，必须把结果赋给 `result`。
 - microcode mutation 只能在 `--unsafe --tool-surface expert` 下使用，结论标记为 `experimental`。
 
 ## 按需读取
