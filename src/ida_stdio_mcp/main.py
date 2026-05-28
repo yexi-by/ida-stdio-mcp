@@ -21,10 +21,8 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="面向 AI Agent 的 IDA Pro 9.3+ stdio MCP 逆向分析服务")
     parser.add_argument("input_path", nargs="?", type=Path, help="可选：启动后立即打开的样本路径")
     parser.add_argument("--config", type=Path, default=Path("setting.toml"), help="配置文件路径")
-    parser.add_argument("--unsafe", action="store_true", help="启用危险写操作与 Python 执行工具")
-    parser.add_argument("--debugger", action="store_true", help="启用调试器工具")
     parser.add_argument("--isolated-contexts", action="store_true", help="按 context_id 隔离不同 agent/工作流的默认上下文")
-    parser.add_argument("--tool-surface", choices=["slim", "full", "expert"], default="slim", help="工具暴露面：默认 slim 只暴露 AI 工作流入口")
+    parser.add_argument("--tool-surface", choices=["all", "workflow"], default="all", help="工具展示面：all 暴露全部能力，workflow 只保留高层工作流入口")
     parser.add_argument("--profile", type=Path, help="工具白名单 profile 文件")
     return parser.parse_args(argv)
 
@@ -36,9 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     log_path = configure_logging(config.logging)
     workspace_paths = configure_runtime_workspace(config.runtime_workspace)
 
-    allow_unsafe = config.feature_gates.allow_unsafe or args.unsafe
-    allow_debugger = config.feature_gates.allow_debugger or args.debugger
-    isolated_contexts = config.feature_gates.isolated_contexts or args.isolated_contexts
+    isolated_contexts = config.server.isolated_contexts or args.isolated_contexts
     tool_surface: ToolSurface = args.tool_surface
     runtime = HeadlessRuntime(isolated_contexts=isolated_contexts)
 
@@ -53,12 +49,10 @@ def main(argv: list[str] | None = None) -> int:
     profile_path = args.profile.resolve() if args.profile is not None else None
 
     logger.info(
-        "启动参数：config={} log_path={} ida_runtime={} unsafe={} debugger={} isolated_contexts={} tool_surface={} profile={}",
+        "启动参数：config={} log_path={} ida_runtime={} isolated_contexts={} tool_surface={} profile={}",
         args.config,
         log_path,
         get_ida_runtime_info().to_json(),
-        allow_unsafe,
-        allow_debugger,
         isolated_contexts,
         tool_surface,
         profile_path,
@@ -71,10 +65,9 @@ def main(argv: list[str] | None = None) -> int:
 
     service = build_service(
         runtime,
-        allow_unsafe=allow_unsafe,
-        allow_debugger=allow_debugger,
         tool_surface=tool_surface,
         profile_path=profile_path,
+        external_analyzers=config.external_analyzers,
     )
 
     startup_binary = args.input_path

@@ -7,12 +7,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, cast
 
+from .analysis_artifacts import import_analysis_artifact, list_analysis_artifacts, run_external_analyzer
+from .config import ExternalAnalyzerConfig
 from .errors import RuntimeNotReadyError, SessionNotFoundError, SessionRequiredError
-from .models import BinarySummary, GateName, JsonObject, JsonValue, ToolResult, ToolStatus, ToolSurface
+from .models import BinarySummary, JsonObject, JsonValue, ToolResult, ToolStatus, ToolSurface
 from .profile_loader import load_profile
 from .prompts import PromptRegistry, build_prompt_registry
 from .result import build_error_info, build_result, normalize_json_object
 from .runtime import HeadlessRuntime
+from .service_arguments import (
+    addr_list as _addr_list,
+    addr_or_query as _addr_or_query,
+    bool_or_default as _bool_or_default,
+    int_list as _int_list,
+    int_or_default as _int_or_default,
+    int_value as _int_value,
+    json_object_list as _json_object_list,
+    optional_query_list as _optional_query_list,
+    query_filter as _query_filter,
+    require_string as _require_string,
+    root_queries as _root_queries,
+    search_text as _search_text,
+    string_list as _string_list,
+    string_or_default as _string_or_default,
+)
 from .tool_registry import ResourceRegistry, ResourceSpec, ToolRegistry, ToolSpec
 
 if TYPE_CHECKING:
@@ -102,7 +120,7 @@ def _object_param_schema(
 
 SESSION_ID_SCHEMA = _string_schema("可选。指定会话 ID；不传时默认作用于当前激活会话。")
 CONTEXT_ID_SCHEMA = _string_schema("上下文 ID；启用 --isolated-contexts 时必须显式提供，用于隔离不同 agent 的默认会话。")
-SLIM_TOOL_NAMES = {
+WORKFLOW_TOOL_NAMES = {
     "get_workspace_state",
     "open_target",
     "triage_binary",
@@ -113,9 +131,6 @@ SLIM_TOOL_NAMES = {
     "export_report",
     "save_workspace",
     "close_target",
-}
-EXPERT_ONLY_TOOL_NAMES = {
-    "microcode_experiment",
 }
 ADDR_OR_QUERY_PROPERTIES: dict[str, JsonObject] = {
     "addr": _string_schema("地址字符串，可写 0x 地址、十进制地址，或能解析到地址的符号名。"),
@@ -129,6 +144,7 @@ PAGINATION_PROPERTIES: dict[str, JsonObject] = {
     "count": _integer_schema("返回数量；优先于 limit。", minimum=1),
     "limit": _integer_schema("返回数量上限。", minimum=1),
 }
+GENERAL_REGISTER_NAMES = ["eax", "ebx", "ecx", "edx", "esi", "edi", "esp", "ebp", "rip", "rsp", "rbp"]
 
 
 def _tool_input_schema(
@@ -543,7 +559,6 @@ def _tool(
     session_required: bool = True,
     context_required: bool | None = None,
     writeback_kind: str | None = None,
-    feature_gate: GateName = "public",
     preconditions: tuple[str, ...] = (),
     empty_state_behavior: str = "",
     input_example: JsonValue | None = None,
@@ -604,7 +619,6 @@ def _tool(
             validation_schema=schema_with_context,
             requires_session=session_required,
             requires_context=effective_context_required,
-            feature_gate=feature_gate,
             preconditions=effective_preconditions,
             empty_state_behavior=empty_state_behavior,
             input_example=effective_input_example,
@@ -808,7 +822,7 @@ def _management_tools(
         try:
             _ensure_session(arguments, runtime)
             core = _new_core()
-            report = core.export_full_analysis(
+            report = core.build_analysis_report(
                 function_limit=_int_or_default(arguments, "function_limit", 120),
                 string_limit=_int_or_default(arguments, "string_limit", 200),
                 global_limit=_int_or_default(arguments, "global_limit", 120),
@@ -890,7 +904,7 @@ def _management_tools(
         handler=open_target_handler,
         requires_session=False,
         empty_state_behavior="无需现有会话；成功后返回绑定会话和工作 IDB 路径。",
-        input_example={"path": "D:/samples/sample.exe", "run_auto_analysis": False, "session_id": "sess-001"},
+        input_example={"path": "<输入文件>", "run_auto_analysis": False, "session_id": "sess-001"},
     )
     register_management_tool(
         name="triage_binary",
@@ -1399,7 +1413,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     _tool(
         registry,
         name="export_full_analysis",
-        description="导出当前 IDB 的完整分析结果 / full analysis bundle，包含 metadata、入口点、imports、globals、strings、types、structs、functions 等，适合报告、批处理和继续喂给 AI。",
+        description="导出当前 IDB 的完整分析结果，包含 metadata、入口点、imports、globals、strings、types、structs、functions 等结构化内容。",
         source="core.export_full_analysis",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1558,7 +1572,7 @@ def _register_read_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> No
     )
 
 
-def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
+def _register_write_script_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
     """注册写回、脚本执行和 microcode 实验工具。"""
     _tool(
         registry,
@@ -1702,20 +1716,6 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     )
     _tool(
         registry,
-        name="apply_types",
-        description="批量应用类型声明，和 set_types 等价；适合批量恢复函数原型和变量类型。",
-        source="core.apply_types",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
-            properties={"items": _array_schema("类型赋值列表。", TYPE_ASSIGN_ITEM_SCHEMA, min_items=1)},
-            required=("items",),
-            include_session=True,
-        ),
-        handler=lambda core, arguments: core.apply_types(_json_object_list(arguments, "items")),
-        writeback_kind="apply_type",
-    )
-    _tool(
-        registry,
         name="infer_types",
         description="推断并尽量写回类型，适合恢复函数原型、字符串指针、指针链和基础整数类型。",
         source="core.infer_types",
@@ -1772,6 +1772,45 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     )
     _tool(
         registry,
+        name="patch_diff",
+        description="预览字节补丁差异，不写入 IDB；返回当前字节、目标字节和逐字节变化。",
+        source="core.patch_diff",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={"items": _array_schema("字节补丁预览列表。", PATCH_BYTES_ITEM_SCHEMA, min_items=1)},
+            required=("items",),
+            include_session=True,
+        ),
+        handler=lambda core, arguments: core.patch_diff(_json_object_list(arguments, "items")),
+    )
+    _tool(
+        registry,
+        name="patch_history",
+        description="读取当前 working IDB 的补丁历史，包含 patch_id、地址、写入前后字节和变化偏移。",
+        source="core.patch_history",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={"limit": _integer_schema("最多返回多少条历史记录。", minimum=1)},
+            include_session=True,
+        ),
+        handler=lambda core, arguments: core.patch_history(limit=_int_or_default(arguments, "limit", 50)),
+    )
+    _tool(
+        registry,
+        name="rollback_patch",
+        description="按 patch_id 回滚补丁历史；按传入顺序的逆序恢复原始字节。",
+        source="core.rollback_patch",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={"ids": _array_schema("要回滚的 patch_id 列表。", _integer_schema("patch_id。", minimum=1), min_items=1)},
+            required=("ids",),
+            include_session=True,
+        ),
+        handler=lambda core, arguments: core.rollback_patch(_int_list(arguments, "ids")),
+        writeback_kind="rollback_patch",
+    )
+    _tool(
+        registry,
         name="write_ints",
         description="写入整数。",
         source="core.write_ints",
@@ -1787,7 +1826,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
     _tool(
         registry,
         name="microcode_experiment",
-        description="实验性 microcode mutation。该工具只应在 --unsafe 与 --tool-surface expert 同时开启时暴露，用于局部 microcode 实验，不保证长期稳定。",
+        description="实验性 microcode mutation，用于局部 microcode 实验，不保证长期稳定。",
         source="core.microcode_experiment",
         runtime=runtime,
         input_schema=_tool_input_schema(
@@ -1803,7 +1842,6 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
             action=_string_or_default(arguments, "action", "mark_chains_dirty"),
         ),
         writeback_kind="microcode_experiment",
-        feature_gate="unsafe",
         input_example={"session_id": "sess-001", "query": "main", "action": "mark_chains_dirty"},
     )
     _tool(
@@ -1815,7 +1853,7 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
         input_schema=_tool_input_schema(
             properties={
                 "code": _string_schema("要执行的 Python 代码。"),
-                "include_locals": _boolean_schema("是否返回局部变量安全摘要。默认 false；不会返回完整大对象。", default=False),
+                "include_locals": _boolean_schema("是否返回局部变量可序列化摘要。默认 false；不会返回完整大对象。", default=False),
                 "max_output_chars": _integer_schema("stdout/stderr 最大返回字符数；服务端仍有硬上限，避免拖垮 MCP 客户端。", minimum=1000),
             },
             required=("code",),
@@ -1840,20 +1878,232 @@ def _register_unsafe_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> 
             include_session=True,
         ),
         handler=lambda core, arguments: core.execute_python_file(_require_string(arguments, "path")),
-        input_example={"session_id": "sess-001", "path": "D:/analysis/script.py"},
+        input_example={"session_id": "sess-001", "path": "<脚本文件>"},
+    )
+
+
+def _register_artifact_tools(
+    registry: ToolRegistry,
+    runtime: HeadlessRuntime,
+    *,
+    external_analyzers: tuple[ExternalAnalyzerConfig, ...],
+) -> None:
+    """注册 dispatcher 扫描、外部分析器和 artifact 关联工具。"""
+
+    def register_plain_tool(
+        *,
+        name: str,
+        description: str,
+        source: str,
+        input_schema: JsonObject,
+        handler: Callable[[JsonObject], object],
+        input_example: JsonValue | None = None,
+    ) -> None:
+        """注册不需要 IDA core 的本地 artifact 工具。"""
+
+        def wrapped(arguments: JsonObject) -> ToolResult:
+            """执行本地 artifact 工具并转换为统一结果。"""
+            try:
+                raw = handler(arguments)
+                status, data, warnings = _unwrap_statusful(raw)
+                return build_result(status=status, source=source, data=data, warnings=warnings)
+            except Exception as exc:
+                return _error_result_from_exception(
+                    name=name,
+                    source=source,
+                    exc=exc,
+                    session_required=False,
+                    context_required=False,
+                )
+
+        registry.register(
+            ToolSpec(
+                name=name,
+                description=description,
+                input_schema=_public_tool_schema(input_schema),
+                output_schema=COMMON_OUTPUT_SCHEMA,
+                handler=wrapped,
+                validation_schema=input_schema,
+                requires_session=False,
+                requires_context=False,
+                input_example=input_example,
+            )
+        )
+
+    register_plain_tool(
+        name="run_external_analyzer",
+        description="执行 setting.toml 中配置的外部分析器，并把 JSON 输出导入 artifact 索引。",
+        source="analysis_artifacts.run_external_analyzer",
+        input_schema=_tool_input_schema(
+            properties={
+                "name": _string_schema("外部分析器配置名。"),
+                "input_path": _string_schema("输入文件或目录路径。"),
+                "output_path": _string_schema("可选。外部分析器 JSON 输出路径；为空时写入运行时目录。"),
+                "timeout_sec": _integer_schema("可选。覆盖配置中的超时时间。", minimum=1),
+            },
+            required=("name", "input_path"),
+        ),
+        handler=lambda arguments: run_external_analyzer(
+            external_analyzers,
+            name=_require_string(arguments, "name"),
+            input_path=_require_string(arguments, "input_path"),
+            output_path=_string_or_default(arguments, "output_path", ""),
+            timeout_sec=_int_or_default(arguments, "timeout_sec", 0) or None,
+        ),
+        input_example={"name": "custom-vm", "input_path": "<输入文件>", "output_path": "", "timeout_sec": 120},
+    )
+    register_plain_tool(
+        name="import_analysis_artifact",
+        description="导入外部 JSON 分析 artifact，供后续与当前 IDB 关联。",
+        source="analysis_artifacts.import_analysis_artifact",
+        input_schema=_tool_input_schema(
+            properties={
+                "path": _string_schema("JSON artifact 文件路径。"),
+                "artifact_id": _string_schema("可选。自定义 artifact ID。"),
+            },
+            required=("path",),
+        ),
+        handler=lambda arguments: import_analysis_artifact(
+            _require_string(arguments, "path"),
+            artifact_id=_string_or_default(arguments, "artifact_id", ""),
+        ),
+        input_example={"path": "<分析结果.json>", "artifact_id": ""},
+    )
+    register_plain_tool(
+        name="list_analysis_artifacts",
+        description="列出已导入的外部分析 artifact。",
+        source="analysis_artifacts.list_analysis_artifacts",
+        input_schema=_tool_input_schema(),
+        handler=lambda arguments: list_analysis_artifacts(),
+        input_example={},
+    )
+    _tool(
+        registry,
+        name="scan_dispatchers",
+        description="扫描通用间接分发器候选，包括 hash 常量、switch 元数据、跳转表和间接调用。",
+        source="core.scan_dispatchers",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "max_functions": _integer_schema("最多扫描多少个函数。", minimum=1),
+                "max_candidates": _integer_schema("最多返回多少个候选。", minimum=1),
+            },
+            include_session=True,
+        ),
+        handler=lambda core, arguments: core.scan_dispatchers(
+            max_functions=_int_or_default(arguments, "max_functions", 300),
+            max_candidates=_int_or_default(arguments, "max_candidates", 100),
+        ),
+        input_example={"session_id": "sess-001", "max_functions": 300, "max_candidates": 100},
+    )
+    _tool(
+        registry,
+        name="correlate_analysis_artifact",
+        description="把外部 JSON artifact 与当前 IDB 的字符串、函数、地址、hash 常量和路径线索关联。",
+        source="core.correlate_analysis_artifact",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "artifact_id": _string_schema("已导入 artifact ID；与 path 二选一。"),
+                "path": _string_schema("JSON artifact 文件路径；与 artifact_id 二选一，未导入时自动导入。"),
+                "max_items": _integer_schema("最多使用多少个实体做关联。", minimum=1),
+            },
+            include_session=True,
+            any_of=(("artifact_id",), ("path",)),
+        ),
+        handler=lambda core, arguments: core.correlate_analysis_artifact(
+            artifact_id=_string_or_default(arguments, "artifact_id", ""),
+            path=_string_or_default(arguments, "path", ""),
+            max_items=_int_or_default(arguments, "max_items", 100),
+        ),
+        input_example={"session_id": "sess-001", "artifact_id": "<artifact_id>", "max_items": 100},
     )
 
 
 def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
     """注册 IDA 调试器相关工具。"""
+    def debug_registers_handler(core: IdaCore, arguments: JsonObject) -> object:
+        """按统一入口读取当前线程、指定线程或全部线程寄存器。"""
+        names = _string_list(arguments, "names") if isinstance(arguments.get("names"), list) else None
+        group = _string_or_default(arguments, "group", "all")
+        if group == "general" and names is None:
+            names = GENERAL_REGISTER_NAMES
+
+        scope = _string_or_default(arguments, "scope", "current")
+        if scope == "all_threads":
+            return core.debug_register_snapshots(names=names)
+        if scope == "thread":
+            if not isinstance(arguments.get("thread_id"), int) or isinstance(arguments.get("thread_id"), bool):
+                raise ValueError("scope=thread 时必须提供整数 thread_id")
+            return core.debug_registers(thread_id=_int_or_default(arguments, "thread_id", 0), names=names)
+        if isinstance(arguments.get("thread_id"), int) and not isinstance(arguments.get("thread_id"), bool):
+            return core.debug_registers(thread_id=_int_or_default(arguments, "thread_id", 0), names=names)
+        return core.debug_registers(names=names)
+
     _tool(
         registry,
         name="debug_start",
         description="启动调试会话。",
         source="core.debug_start",
         runtime=runtime,
-        input_schema=_tool_input_schema(properties={"path": _string_schema("可选。要调试的目标程序路径；为空时尝试复用当前输入文件。")}),
-        handler=lambda core, arguments: core.debug_start(_string_or_default(arguments, "path", "")),
+        input_schema=_tool_input_schema(
+            properties={
+                "path": _string_schema("可选。要调试的目标程序路径；为空时尝试复用当前输入文件。"),
+                "args": _string_schema("可选。传给调试目标的命令行参数字符串。"),
+                "cwd": _string_schema("可选。调试目标启动目录；为空时使用目标程序所在目录。"),
+            }
+        ),
+        handler=lambda core, arguments: core.debug_start(
+            _string_or_default(arguments, "path", ""),
+            args=_string_or_default(arguments, "args", ""),
+            cwd=_string_or_default(arguments, "cwd", ""),
+        ),
+        input_example={"path": "<输入文件>", "args": "", "cwd": "<输入目录>"},
+        session_required=False,
+    )
+    _tool(
+        registry,
+        name="debug_launch",
+        description="启动调试目标；可选择通过 IDA request 队列提交启动请求。",
+        source="core.debug_launch",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "path": _string_schema("可选。要调试的目标程序路径；为空时尝试复用当前输入文件。"),
+                "args": _string_schema("可选。传给调试目标的命令行参数字符串。"),
+                "cwd": _string_schema("可选。调试目标启动目录；为空时使用目标程序所在目录。"),
+                "use_request": _boolean_schema("是否通过 IDA request 队列提交启动请求。", default=False),
+            }
+        ),
+        handler=lambda core, arguments: core.debug_launch(
+            _string_or_default(arguments, "path", ""),
+            args=_string_or_default(arguments, "args", ""),
+            cwd=_string_or_default(arguments, "cwd", ""),
+            use_request=_bool_or_default(arguments, "use_request", False),
+        ),
+        input_example={"path": "<输入文件>", "args": "", "cwd": "<输入目录>", "use_request": False},
+        session_required=False,
+    )
+    _tool(
+        registry,
+        name="debug_attach",
+        description="附加到正在运行的进程。",
+        source="core.debug_attach",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "pid": _integer_schema("目标进程 PID。", minimum=1),
+                "event_id": _integer_schema("IDA attach event_id；默认 -1。"),
+                "use_request": _boolean_schema("是否通过 IDA request 队列提交 attach 请求。", default=False),
+            },
+            required=("pid",),
+        ),
+        handler=lambda core, arguments: core.debug_attach(
+            _int_or_default(arguments, "pid", 0),
+            event_id=_int_or_default(arguments, "event_id", -1),
+            use_request=_bool_or_default(arguments, "use_request", False),
+        ),
+        input_example={"pid": 1234, "event_id": -1, "use_request": False},
         session_required=False,
     )
     _tool(
@@ -1911,6 +2161,19 @@ def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> N
     )
     _tool(
         registry,
+        name="debug_step",
+        description="统一单步入口：into 进入、over 越过、out 运行到当前函数返回。",
+        source="core.debug_step",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={"action": _string_schema("单步动作。", enum=["into", "over", "out"])},
+        ),
+        handler=lambda core, arguments: core.debug_step(action=_string_or_default(arguments, "action", "into")),
+        input_example={"action": "into"},
+        session_required=False,
+    )
+    _tool(
+        registry,
         name="debug_list_breakpoints",
         description="列出断点。",
         source="core.debug_list_breakpoints",
@@ -1961,90 +2224,19 @@ def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> N
     _tool(
         registry,
         name="debug_registers",
-        description="读取当前线程全部寄存器。",
+        description="读取调试寄存器；可按当前线程、指定线程、全部线程、寄存器名或通用寄存器组筛选。",
         source="core.debug_registers",
-        runtime=runtime,
-        input_schema=_tool_input_schema(),
-        handler=lambda core, arguments: core.debug_registers(),
-        session_required=False,
-    )
-    _tool(
-        registry,
-        name="debug_registers_all_threads",
-        description="读取所有线程寄存器。",
-        source="core.debug_registers_all_threads",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
-            properties={"names": _array_schema("只读取指定寄存器名集合。", _string_schema("寄存器名。"), min_items=1)}
-        ),
-        handler=lambda core, arguments: core.debug_registers_all_threads(
-            names=_string_list(arguments, "names") if isinstance(arguments.get("names"), list) else None
-        ),
-        session_required=False,
-    )
-    _tool(
-        registry,
-        name="debug_registers_thread",
-        description="读取指定线程寄存器。",
-        source="core.debug_registers_thread",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
-            properties={"thread_id": _integer_schema("线程 ID。", minimum=0)},
-            required=("thread_id",),
-        ),
-        handler=lambda core, arguments: core.debug_registers(thread_id=_int_or_default(arguments, "thread_id", 0)),
-        session_required=False,
-    )
-    _tool(
-        registry,
-        name="debug_general_registers",
-        description="读取当前线程通用寄存器。",
-        source="core.debug_general_registers",
-        runtime=runtime,
-        input_schema=_tool_input_schema(),
-        handler=lambda core, arguments: core.debug_registers(names=["eax", "ebx", "ecx", "edx", "esi", "edi", "esp", "ebp", "rip", "rsp", "rbp"]),
-        session_required=False,
-    )
-    _tool(
-        registry,
-        name="debug_general_registers_thread",
-        description="读取指定线程通用寄存器。",
-        source="core.debug_general_registers_thread",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
-            properties={"thread_id": _integer_schema("线程 ID。", minimum=0)},
-            required=("thread_id",),
-        ),
-        handler=lambda core, arguments: core.debug_registers(thread_id=_int_or_default(arguments, "thread_id", 0), names=["eax", "ebx", "ecx", "edx", "esi", "edi", "esp", "ebp", "rip", "rsp", "rbp"]),
-        session_required=False,
-    )
-    _tool(
-        registry,
-        name="debug_named_registers",
-        description="读取指定寄存器集合。",
-        source="core.debug_named_registers",
-        runtime=runtime,
-        input_schema=_tool_input_schema(
-            properties={"names": _array_schema("要读取的寄存器名列表。", _string_schema("寄存器名。"), min_items=1)},
-            required=("names",),
-        ),
-        handler=lambda core, arguments: core.debug_registers(names=_string_list(arguments, "names")),
-        session_required=False,
-    )
-    _tool(
-        registry,
-        name="debug_named_registers_thread",
-        description="读取指定线程的指定寄存器集合。",
-        source="core.debug_named_registers_thread",
         runtime=runtime,
         input_schema=_tool_input_schema(
             properties={
+                "scope": _string_schema("读取范围。current=当前线程，thread=指定线程，all_threads=所有线程。", enum=["current", "thread", "all_threads"]),
                 "thread_id": _integer_schema("线程 ID。", minimum=0),
                 "names": _array_schema("要读取的寄存器名列表。", _string_schema("寄存器名。"), min_items=1),
+                "group": _string_schema("寄存器组筛选。all=不按组筛选，general=常用通用寄存器。", enum=["all", "general"]),
             },
-            required=("thread_id", "names"),
         ),
-        handler=lambda core, arguments: core.debug_registers(thread_id=_int_or_default(arguments, "thread_id", 0), names=_string_list(arguments, "names")),
+        handler=debug_registers_handler,
+        input_example={"scope": "all_threads", "group": "general"},
         session_required=False,
     )
     _tool(
@@ -2055,6 +2247,19 @@ def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> N
         runtime=runtime,
         input_schema=_tool_input_schema(),
         handler=lambda core, arguments: core.debug_stacktrace(),
+        session_required=False,
+    )
+    _tool(
+        registry,
+        name="debug_stack",
+        description="读取当前线程栈顶内存。",
+        source="core.debug_stack",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={"size": _integer_schema("读取栈顶字节数。", minimum=1)},
+        ),
+        handler=lambda core, arguments: core.debug_stack(size=_int_or_default(arguments, "size", 128)),
+        input_example={"size": 128},
         session_required=False,
     )
     _tool(
@@ -2083,15 +2288,58 @@ def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> N
         handler=lambda core, arguments: core.debug_write_memory(_require_string(arguments, "addr"), _require_string(arguments, "hex")),
         session_required=False,
     )
+    _tool(
+        registry,
+        name="debug_capture_calls",
+        description="配置基于断点命中的通用调用捕获，并把命中事件写入调试时间线。",
+        source="core.debug_capture_calls",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "action": _string_schema("操作。enable=启用，disable=停用，list=列出，clear=清空。", enum=["enable", "disable", "list", "clear"]),
+                "addrs": _array_schema("调用入口地址列表。", _string_schema("地址或符号名。"), min_items=1),
+                "include_registers": _boolean_schema("命中时是否采样寄存器。", default=True),
+                "stack_bytes": _integer_schema("命中时采样的栈顶字节数。", minimum=0),
+                "register_names": _array_schema("命中时采样的寄存器名列表。", _string_schema("寄存器名。"), min_items=1),
+            },
+        ),
+        handler=lambda core, arguments: core.debug_capture_calls(
+            action=_string_or_default(arguments, "action", "list"),
+            addrs=_string_list(arguments, "addrs") if isinstance(arguments.get("addrs"), list) else None,
+            include_registers=_bool_or_default(arguments, "include_registers", True),
+            stack_bytes=_int_or_default(arguments, "stack_bytes", 64),
+            register_names=_string_list(arguments, "register_names") if isinstance(arguments.get("register_names"), list) else None,
+        ),
+        input_example={"action": "enable", "addrs": ["main"], "include_registers": True, "stack_bytes": 64},
+        session_required=False,
+    )
+    _tool(
+        registry,
+        name="debug_export_timeline",
+        description="导出调试事件时间线，包含 MCP 事件和可选 IDA trace buffer 摘要。",
+        source="core.debug_export_timeline",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "limit": _integer_schema("最多导出的事件数量。", minimum=1),
+                "include_ida_trace": _boolean_schema("是否同时读取 IDA trace buffer。", default=True),
+                "path": _string_schema("可选。输出 JSON 文件路径；为空时写入运行时目录。"),
+            },
+        ),
+        handler=lambda core, arguments: core.debug_export_timeline(
+            limit=_int_or_default(arguments, "limit", 500),
+            include_ida_trace=_bool_or_default(arguments, "include_ida_trace", True),
+            path=_string_or_default(arguments, "path", ""),
+        ),
+        input_example={"limit": 500, "include_ida_trace": True, "path": ""},
+        session_required=False,
+    )
 
 
 def _register_resources(
     resources: ResourceRegistry,
     runtime: HeadlessRuntime,
     tools: ToolRegistry,
-    *,
-    allow_unsafe: bool,
-    allow_debugger: bool,
 ) -> None:
     """注册 MCP resources 与 resource templates。"""
     session_requires_context = runtime.isolated_contexts
@@ -2295,11 +2543,7 @@ def _register_resources(
                 "headless_only": True,
                 "stdio_only": True,
                 "multi_session": True,
-                "feature_gates": {
-                    "unsafe": allow_unsafe,
-                    "debugger": allow_debugger,
-                    "isolated_contexts": runtime.isolated_contexts,
-                },
+                "runtime_modes": {"isolated_contexts": runtime.isolated_contexts},
             },
             "resource_scopes": resource_scopes,
             "context_requirements": {
@@ -2536,10 +2780,9 @@ def _register_resources(
 def build_service(
     runtime: HeadlessRuntime,
     *,
-    allow_unsafe: bool,
-    allow_debugger: bool,
-    tool_surface: ToolSurface = "slim",
+    tool_surface: ToolSurface | str = "all",
     profile_path: Path | None = None,
+    external_analyzers: tuple[ExternalAnalyzerConfig, ...] = (),
 ) -> ServiceBundle:
     """构建完整纯实现 headless 服务。"""
     tools = ToolRegistry()
@@ -2547,161 +2790,32 @@ def build_service(
     prompts = build_prompt_registry()
     _management_tools(tools, runtime)
     _register_read_tools(tools, runtime)
-    if allow_unsafe:
-        _register_unsafe_tools(tools, runtime)
-    if allow_debugger:
-        _register_debug_tools(tools, runtime)
+    _register_write_script_tools(tools, runtime)
+    _register_artifact_tools(tools, runtime, external_analyzers=external_analyzers)
+    _register_debug_tools(tools, runtime)
     _apply_tool_surface(tools, tool_surface)
     if profile_path is not None:
         whitelist = load_profile(profile_path)
         tools.apply_whitelist(whitelist)
-    _register_resources(resources, runtime, tools, allow_unsafe=allow_unsafe, allow_debugger=allow_debugger)
+    _register_resources(resources, runtime, tools)
     return ServiceBundle(tools=tools, resources=resources, prompts=prompts)
 
 
-def _apply_tool_surface(tools: ToolRegistry, tool_surface: ToolSurface) -> None:
+def _apply_tool_surface(tools: ToolRegistry, tool_surface: ToolSurface | str) -> None:
     """按工具面裁剪注册表。"""
-    if tool_surface == "slim":
-        tools.apply_whitelist(SLIM_TOOL_NAMES)
+    if tool_surface in {"workflow", "slim"}:
+        tools.apply_whitelist(WORKFLOW_TOOL_NAMES)
         return
-    if tool_surface == "full":
-        registered = {
-            str(item["name"])
-            for item in tools.list_tools()
-            if isinstance(item.get("name"), str)
-        }
-        tools.apply_whitelist(registered - EXPERT_ONLY_TOOL_NAMES)
-        return
+    if tool_surface in {"full", "expert"}:
+        raise ValueError(f"工具面 {tool_surface} 已移除，请使用 all 或 workflow")
+    if tool_surface != "all":
+        raise ValueError(f"未知工具面：{tool_surface}")
     registered = {
         str(item["name"])
         for item in tools.list_tools()
         if isinstance(item.get("name"), str)
     }
     tools.apply_whitelist(registered)
-
-
-def _require_string(arguments: JsonObject, key: str) -> str:
-    """读取必填字符串参数。"""
-    value = arguments.get(key)
-    if not isinstance(value, str):
-        raise ValueError(f"{key} 必须是字符串")
-    return value
-
-
-def _string_or_default(arguments: JsonObject, key: str, default: str = "") -> str:
-    """读取可选字符串，不合法时立即报错。"""
-    value = arguments.get(key)
-    if value is None:
-        return default
-    if not isinstance(value, str):
-        raise ValueError(f"{key} 必须是字符串")
-    return value
-
-
-def _int_or_default(arguments: JsonObject, key: str, default: int) -> int:
-    """读取可选整数，不接受隐式字符串或复合对象。"""
-    value = arguments.get(key)
-    if value is None:
-        return default
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{key} 必须是整数")
-    return value
-
-
-def _bool_or_default(arguments: JsonObject, key: str, default: bool = False) -> bool:
-    """读取可选布尔值。"""
-    value = arguments.get(key)
-    if value is None:
-        return default
-    if not isinstance(value, bool):
-        raise ValueError(f"{key} 必须是布尔值")
-    return value
-
-
-def _string_list(arguments: JsonObject, key: str) -> list[str]:
-    """读取字符串列表参数。"""
-    value = arguments.get(key)
-    if not isinstance(value, list):
-        raise ValueError(f"{key} 必须是字符串列表")
-    result = [str(item) for item in value]
-    return result
-
-
-def _optional_query_list(arguments: JsonObject) -> list[str] | None:
-    """读取可选批量查询列表或单个 query/addr。"""
-    raw_queries = arguments.get("items")
-    if isinstance(raw_queries, list):
-        return [str(item) for item in raw_queries]
-    for key in ("query", "addr"):
-        value = arguments.get(key)
-        if isinstance(value, str):
-            return [value]
-    return None
-
-
-def _json_object_list(arguments: JsonObject, key: str) -> list[JsonObject]:
-    """读取 JSON 对象列表参数。"""
-    value = arguments.get(key)
-    if not isinstance(value, list):
-        raise ValueError(f"{key} 必须是对象列表")
-    result: list[JsonObject] = []
-    for item in value:
-        if not isinstance(item, dict):
-            raise ValueError(f"{key} 内部元素必须是对象")
-        result.append(item)
-    return result
-
-
-def _query_filter(arguments: JsonObject) -> str:
-    """读取函数或符号筛选文本。"""
-    return _string_or_default(arguments, "filter", "")
-
-
-def _search_text(arguments: JsonObject) -> str:
-    """读取必填搜索文本 pattern。"""
-    value = arguments.get("pattern")
-    if isinstance(value, str):
-        return value
-    raise ValueError("必须提供 pattern")
-
-
-def _addr_list(arguments: JsonObject, key: str) -> list[str]:
-    """读取地址列表，支持单个 addr 作为快捷输入。"""
-    value = arguments.get(key)
-    if isinstance(value, list):
-        return [str(item) for item in value]
-    single = arguments.get("addr")
-    if isinstance(single, str):
-        return [single]
-    raise ValueError(f"{key} 必须是地址列表，或提供单个 addr")
-
-
-def _root_queries(arguments: JsonObject) -> list[str]:
-    """读取调用图根函数列表。"""
-    raw_roots = arguments.get("items")
-    if isinstance(raw_roots, list):
-        return [str(item) for item in raw_roots]
-    for key in ("query", "addr"):
-        value = arguments.get(key)
-        if isinstance(value, str):
-            return [value]
-    raise ValueError("必须提供 items，或提供 query/addr")
-
-
-def _addr_or_query(arguments: JsonObject) -> str:
-    """读取地址或名称查询参数。"""
-    for key in ("addr", "query"):
-        value = arguments.get(key)
-        if isinstance(value, str):
-            return value
-    raise ValueError("必须提供 addr 或 query")
-
-
-def _int_value(value: JsonValue) -> str | int:
-    """读取可作为整数写入值的字符串或整数。"""
-    if isinstance(value, (str, int)):
-        return value
-    raise ValueError("value 必须是字符串或整数")
 
 
 def _tool_doc_payload(tools: ToolRegistry, name: str) -> JsonObject:

@@ -30,14 +30,6 @@ class ServerConfig:
     server_name: str
     server_version: str
     default_input_path: str
-
-
-@dataclass(slots=True, frozen=True)
-class FeatureGateConfig:
-    """功能门控默认值。"""
-
-    allow_unsafe: bool
-    allow_debugger: bool
     isolated_contexts: bool
 
 
@@ -60,38 +52,59 @@ class LimitConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class ExternalAnalyzerConfig:
+    """外部分析器配置。"""
+
+    name: str
+    command: tuple[str, ...]
+    timeout_sec: int
+
+
+@dataclass(slots=True, frozen=True)
 class AppConfig:
     """应用总配置。"""
 
     logging: LoggingConfig
     server: ServerConfig
-    feature_gates: FeatureGateConfig
     runtime_workspace: RuntimeWorkspaceConfig
     limits: LimitConfig
+    external_analyzers: tuple[ExternalAnalyzerConfig, ...]
     root: Path
 
 
 def _as_str(value: TomlValue, *, default: str) -> str:
-    """把 TOML 标量安全转换成字符串。"""
+    """把 TOML 标量可靠转换成字符串。"""
     if isinstance(value, str):
         return value
     return default
 
 
 def _as_bool(value: TomlValue, *, default: bool) -> bool:
-    """把 TOML 标量安全转换成布尔值。"""
+    """把 TOML 标量可靠转换成布尔值。"""
     if isinstance(value, bool):
         return value
     return default
 
 
 def _as_int(value: TomlValue, *, default: int) -> int:
-    """把 TOML 标量安全转换成整数。"""
+    """把 TOML 标量可靠转换成整数。"""
     if isinstance(value, bool):
         return default
     if isinstance(value, int):
         return value
     return default
+
+
+def _as_str_tuple(value: TomlValue) -> tuple[str, ...]:
+    """把 TOML 字符串数组收窄成字符串元组。"""
+    if not isinstance(value, list):
+        return ()
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            return ()
+        result.append(item)
+    return tuple(result)
 
 
 def _require_table(raw: TomlTable, key: str) -> TomlTable:
@@ -111,6 +124,33 @@ def _resolve_path(root: Path, value: TomlValue, *, default: str) -> Path:
     return path.resolve()
 
 
+def _external_analyzers(raw: TomlTable) -> tuple[ExternalAnalyzerConfig, ...]:
+    """读取外部分析器配置。"""
+    value = raw.get("external_analyzers")
+    if value is None:
+        return ()
+    if not isinstance(value, dict):
+        raise ConfigurationError("external_analyzers 必须是 TOML 表")
+    analyzers: list[ExternalAnalyzerConfig] = []
+    for name, raw_item in sorted(value.items()):
+        if not name.strip():
+            raise ConfigurationError("external_analyzers 的名称不能为空")
+        if not isinstance(raw_item, dict):
+            raise ConfigurationError(f"external_analyzers.{name} 必须是 TOML 表")
+        item = cast(TomlTable, raw_item)
+        command = _as_str_tuple(item.get("command"))
+        if not command:
+            raise ConfigurationError(f"external_analyzers.{name}.command 必须是非空字符串数组")
+        analyzers.append(
+            ExternalAnalyzerConfig(
+                name=name,
+                command=command,
+                timeout_sec=max(1, _as_int(item.get("timeout_sec", 120), default=120)),
+            )
+        )
+    return tuple(analyzers)
+
+
 def load_config(config_path: Path) -> AppConfig:
     """加载 `setting.toml`。"""
     if not config_path.exists():
@@ -121,7 +161,6 @@ def load_config(config_path: Path) -> AppConfig:
     root = config_path.parent.resolve()
     logging_raw = _require_table(raw, "logging")
     server_raw = _require_table(raw, "server")
-    gates_raw = _require_table(raw, "feature_gates")
     runtime_workspace_raw = _require_table(raw, "runtime_workspace")
     limits_raw = _require_table(raw, "limits")
 
@@ -135,11 +174,7 @@ def load_config(config_path: Path) -> AppConfig:
             server_name=_as_str(server_raw.get("server_name", "ida-stdio-mcp"), default="ida-stdio-mcp"),
             server_version=_as_str(server_raw.get("server_version", "0.3.0"), default="0.3.0"),
             default_input_path=_as_str(server_raw.get("default_input_path", ""), default=""),
-        ),
-        feature_gates=FeatureGateConfig(
-            allow_unsafe=_as_bool(gates_raw.get("allow_unsafe", False), default=False),
-            allow_debugger=_as_bool(gates_raw.get("allow_debugger", False), default=False),
-            isolated_contexts=_as_bool(gates_raw.get("isolated_contexts", False), default=False),
+            isolated_contexts=_as_bool(server_raw.get("isolated_contexts", False), default=False),
         ),
         runtime_workspace=RuntimeWorkspaceConfig(
             directory=_resolve_path(root, runtime_workspace_raw.get("directory", ".runtime"), default=".runtime"),
@@ -155,5 +190,6 @@ def load_config(config_path: Path) -> AppConfig:
             max_search_hits=_as_int(limits_raw.get("max_search_hits", 1000), default=1000),
             max_callgraph_depth=_as_int(limits_raw.get("max_callgraph_depth", 4), default=4),
         ),
+        external_analyzers=_external_analyzers(raw),
         root=root,
     )

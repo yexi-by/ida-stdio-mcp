@@ -45,13 +45,13 @@ class RealWorldRegressionTests(unittest.TestCase):
         cls.real_native_fixture = Path(
             os.environ.get(
                 "IDA_STDIO_MCP_REAL_NATIVE_BINARY",
-                r"D:\h-game\サキュバスデュエル\SuccubusDuel.exe",
+                str(cls.repo_root / "tests" / "fixtures" / "__missing_real_native__.exe"),
             )
         ).resolve()
         cls.real_managed_fixture = Path(
             os.environ.get(
                 "IDA_STDIO_MCP_REAL_MANAGED_BINARY",
-                r"D:\h-game\サキュバスデュエル\SuccubusDuel_Data\Managed\Assembly-CSharp.dll",
+                str(cls.repo_root / "tests" / "fixtures" / "__missing_real_managed__.dll"),
             )
         ).resolve()
 
@@ -61,10 +61,8 @@ class RealWorldRegressionTests(unittest.TestCase):
         self.runtime = HeadlessRuntime()
         self.service = build_service(
             self.runtime,
-            allow_unsafe=True,
-            allow_debugger=True,
             profile_path=None,
-            tool_surface="expert",
+            tool_surface="all",
         )
         self.server = StdioMcpServer(
             tools=self.service.tools,

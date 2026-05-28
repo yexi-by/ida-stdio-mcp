@@ -3,8 +3,8 @@
 ## 目录
 
 - 输出 envelope
-- slim 工具
-- full 工具使用时机
+- workflow 工具
+- all 工具使用时机
 - 字符串缓存
 - 会话参数
 - MCP prompts 与 resources
@@ -26,9 +26,9 @@ status, source, warnings, error, data
 
 不要只看 `data`，也不要忽略 `warnings`。
 
-## slim 工具
+## workflow 工具
 
-默认只用这些工具完成主流程：
+优先用这些高层工具完成主流程：
 
 | 工具 | 用途 |
 | --- | --- |
@@ -43,13 +43,18 @@ status, source, warnings, error, data
 | `save_workspace` | 保存 working IDB |
 | `close_target` | 关闭 session |
 
-## full 工具使用时机
+## all 工具使用时机
 
-只有 slim 结果指向具体问题时再使用 full 工具：
+只有 workflow 结果指向具体问题时再使用底层工具：
 
 - 需要枚举候选：`list_functions`、`list_imports`、`list_strings`。
 - 需要交叉引用：xref、callgraph、caller/callee 相关工具。
 - 需要字节或补丁前验证：`read_bytes`、`find_bytes`、反汇编工具。
+- 需要补丁便利流程：`patch_diff`、`patch_history`、`rollback_patch`；直接写入仍使用 `patch_bytes` 或 `patch_assembly`。
+- 需要运行时验证：`debug_launch`、`debug_attach`、断点工具、`debug_continue`、`debug_run_to`、`debug_step`、`debug_registers`、`debug_stack`、`debug_read_memory`。
+- 需要调用捕获和日志交付：`debug_capture_calls` 与 `debug_export_timeline`。
+- 需要定位间接分发器：`scan_dispatchers`，再用 `decompile_function` 或 `explain_function` 深挖候选。
+- 需要接入外部字节码、封包或资源扫描结果：`run_external_analyzer`、`import_analysis_artifact`、`list_analysis_artifacts`、`correlate_analysis_artifact`。
 - 需要类型恢复：类型、结构体、枚举、栈帧相关工具。
 - 需要导入地址语义：`get_import_at`。
 

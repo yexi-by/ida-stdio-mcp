@@ -1,12 +1,12 @@
 # ida-stdio-mcp
 
-ida-stdio-mcp 是面向 AI Agent 的 IDA Pro 9.3+ stdio MCP 逆向分析服务。服务通过 IDA headless runtime 打开样本、维护隔离工作 IDB，并提供二进制概览、函数解释、字符串牵引、托管程序集反编译、轻量数据流追踪、结构化报告、调试与受控写回能力。
+ida-stdio-mcp 是面向 AI Agent 的 IDA Pro 9.3+ stdio MCP 逆向分析服务。服务通过 IDA headless runtime 打开样本、维护隔离工作 IDB，并提供二进制概览、函数解释、字符串牵引、托管程序集反编译、轻量数据流追踪、结构化报告、调试、脚本执行与写回能力。
 
 ## 能力概览
 
 - IDA 9.3+ runtime 校验：启动时使用 `idapro.get_library_version()` 检查版本，低于 9.3 直接失败。
-- AI 工作流工具面：默认 `slim` 只暴露高层逆向入口，降低工具选择成本。
-- 完整专家工具面：`expert` 可暴露 IDAPython、补丁、调试、microcode 实验能力。
+- 默认完整工具面：`all` 暴露读、写回、补丁、IDAPython、调试、microcode 等全部已注册能力。
+- 工作流工具面：`workflow` 只展示高层逆向入口，用于降低工具选择成本。
 - 会话级工作 IDB：每个样本使用 `.runtime/sessions/<session_id>/working.i64`，原始样本保持只读输入角色。
 - Native 与 Unity/.NET 双场景：native 优先 Hex-Rays，托管程序集优先 `ilspycmd` C# 反编译。
 - MCP prompts：内置 native triage、managed triage、字符串牵引、microcode 调查模板。
@@ -60,11 +60,7 @@ args = [
     "python",
     "-m",
     "ida_stdio_mcp",
-    "--unsafe",
-    "--debugger",
     "--isolated-contexts",
-    "--tool-surface",
-    "expert",
 ]
 startup_timeout_sec = 240
 tool_timeout_sec = 21600
@@ -88,11 +84,7 @@ JSON 示例：
         "python",
         "-m",
         "ida_stdio_mcp",
-        "--unsafe",
-        "--debugger",
         "--isolated-contexts",
-        "--tool-surface",
-        "expert"
       ],
       "env": {
         "IDADIR": "<IDA_INSTALL_DIR>"
@@ -104,7 +96,7 @@ JSON 示例：
 }
 ```
 
-本地可信环境可使用 `expert` 最大工具面。普通分析建议使用默认 `slim` 工具面：
+需要减少工具列表时可使用 `workflow` 工具面：
 
 ```toml
 args = [
@@ -116,7 +108,7 @@ args = [
     "-m",
     "ida_stdio_mcp",
     "--tool-surface",
-    "slim",
+    "workflow",
 ]
 tool_timeout_sec = 3600
 ```
@@ -134,7 +126,7 @@ skills/ida-stdio-mcp
 支持本地 skill 的客户端应配置或复制整个 `skills/ida-stdio-mcp` 目录。该目录包含：
 
 - `SKILL.md`：最小入口说明。
-- `references/`：按需加载的工作流、工具面、专家能力和排障指南。
+- `references/`：按需加载的工作流、工具面、底层能力和排障指南。
 - `agents/openai.yaml`：可选 UI 元数据。
 
 TOML 示例：
@@ -162,19 +154,14 @@ JSON 示例：
 
 | 工具面 | 适用场景 | 能力范围 |
 | --- | --- | --- |
-| `slim` | 默认自主逆向工作流 | 高层工作区、打开样本、triage、字符串牵引、函数解释、数据流、报告、保存、关闭 |
-| `full` | 精细分析与结构化查询 | 暴露函数、字符串、导入、xref、类型、结构体、字节、调用图等底层工具 |
-| `expert` | 高级本地 Agent 与实验分析 | 在 full 基础上暴露 IDAPython、调试、补丁与 microcode 实验能力 |
+| `all` | 默认完整分析 | 暴露读、写回、补丁、IDAPython、调试、microcode、函数、字符串、导入、xref、类型、结构体、字节、调用图等工具 |
+| `workflow` | 自主逆向主流程 | 只展示高层工作区、打开样本、triage、字符串牵引、函数解释、数据流、报告、保存、关闭 |
 
-危险能力由硬门控控制：
+工具面只影响 `tools/list` 的展示范围。参数 schema、会话归属、输出大小限制、错误 envelope 和 backend unsupported 仍作为可靠性契约保留。调试与 microcode 能力是否真正可用取决于当前 IDA/Hex-Rays 后端状态。
 
-| 参数 | 启用能力 |
-| --- | --- |
-| `--unsafe` | 写回、补丁、IDAPython、执行脚本、microcode mutation |
-| `--debugger` | 断点、单步、继续、寄存器、调试内存读写 |
-| `--tool-surface expert` | 实验性 expert 工具 |
+调试目标可通过 `debug_launch` 传入 `path`、`args` 和 `cwd`，也可用 `debug_attach` 附加已有进程；`debug_start` 保留为启动快捷入口。未显式传入 `cwd` 时，服务使用目标程序所在目录作为启动目录，便于调试依赖相邻资源文件的 PE/游戏客户端样本。运行时验证可组合 `debug_add_breakpoints`、`debug_continue`、`debug_run_to`、`debug_step`、`debug_registers`、`debug_stack`、`debug_read_memory`、`debug_capture_calls` 与 `debug_export_timeline`。
 
-microcode mutation 需要同时启用 `--unsafe --tool-surface expert`。
+外部脚本、VM 字节码或封包分析通过配置型 analyzer 接入：在 `setting.toml` 的 `external_analyzers` 中配置命令后，用 `run_external_analyzer` 执行并导入 JSON 输出；已有 JSON 可用 `import_analysis_artifact` 导入，随后用 `correlate_analysis_artifact` 与当前 IDB 的字符串、函数、地址、hash 常量和路径线索关联。`scan_dispatchers` 会做通用 hash/switch/table/indirect-call 候选扫描，不绑定特定游戏引擎或脚本格式。
 
 ## 推荐工作流
 
@@ -203,7 +190,7 @@ get_workspace_state -> open_target -> triage_binary -> investigate_string / expl
 
 `list_strings`、`find_strings`、`search_regex` 与 `investigate_string` 会为当前 working IDB 构建并复用会话级字符串缓存。首次字符串查询可能触发 IDA 字符串枚举；后续同一工作库内的字符串搜索直接复用缓存。返回结构统一包含 `data`、`next_offset`、`statistics`、`cache` 与 `recommended_next_tools`。`limit` / `count` 只控制返回行数，`cache.truncated_by_scan_limit=true` 表示当前缓存是受控样本，未命中不能视为全库不存在。
 
-`evaluate_python` 与 `execute_python_file` 只在 `--unsafe` 下暴露，并作用于当前或指定 session 的 working IDB。脚本结果返回受控大小的 `stdout`、`stderr`、`result`、`local_keys` 与可选 `locals_summary`；服务不会回传完整局部变量表。自定义脚本应把小型结构化摘要赋给 `result`。
+`evaluate_python` 与 `execute_python_file` 作用于当前或指定 session 的 working IDB。脚本结果返回受控大小的 `stdout`、`stderr`、`result`、`local_keys` 与可选 `locals_summary`；服务不会回传完整局部变量表。自定义脚本应把小型结构化摘要赋给 `result`。当 `stdout`、`stderr` 或 `result` 超过返回阈值时，服务会把完整内容写入运行时目录，并在 `artifacts` 中返回 `path`、`sha256`、`size` 与 `schema`。
 
 ## Native 分析
 
@@ -235,7 +222,7 @@ Hex-Rays 可用时，`decompile_function` 与 `explain_function` 返回 C 伪代
 .runtime/sessions/<session_id>/working.i64
 ```
 
-后续分析、注释、类型、补丁和脚本操作作用于 working IDB。默认 `save_workspace` 保存当前工作库。传入 `path` 时，服务会导出到用户指定位置。
+后续分析、注释、类型、补丁和脚本操作作用于 working IDB。`patch_bytes` 与 `patch_assembly` 直接写入；`patch_diff` 用于预览字节差异，`patch_history` 读取当前工作库补丁记录，`rollback_patch` 按补丁 ID 恢复写入前字节。默认 `save_workspace` 保存当前工作库。传入 `path` 时，服务会导出到用户指定位置。
 
 ## MCP Prompts
 

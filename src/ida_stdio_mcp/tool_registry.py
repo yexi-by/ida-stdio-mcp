@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Callable, cast
 
 from .errors import ToolInputValidationError
-from .models import GateName
 from .models import JsonObject, JsonValue, ResourceContent, ToolResult
 from .result import build_error_info
 from .schema_validation import validate_arguments
@@ -29,7 +28,6 @@ class ToolSpec:
     validation_schema: JsonObject | None = None
     requires_session: bool = False
     requires_context: bool = False
-    feature_gate: GateName = "public"
     preconditions: tuple[str, ...] = ()
     empty_state_behavior: str = ""
     input_example: JsonValue | None = None
@@ -98,7 +96,6 @@ class ToolRegistry:
                 "inputExample": tool.input_example if tool.input_example is not None else self._input_example(tool.validation_schema or tool.input_schema),
                 "requiresSession": tool.requires_session,
                 "requiresContext": tool.requires_context,
-                "featureGate": tool.feature_gate,
                 "preconditions": list(tool.preconditions),
                 "emptyStateBehavior": tool.empty_state_behavior,
             }
@@ -212,7 +209,7 @@ class ToolRegistry:
     def _string_example(field_name: str | None) -> str:
         """按字段名生成字符串参数示例。"""
         examples = {
-            "path": "D:/samples/sample.exe",
+            "path": "<输入文件>",
             "session_id": "sess-001",
             "context_id": "agent-001",
             "addr": "main",

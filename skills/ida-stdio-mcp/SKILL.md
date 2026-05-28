@@ -7,7 +7,7 @@ description: 使用 ida-stdio-mcp 分析 IDA Pro 9.3+ 样本时调用。适用�
 
 ## 核心规则
 
-优先使用 `slim` 工作流完成主流程；当前目标需要底层枚举、写回、调试或实验能力时，再进入 `full` 或 `expert` 工具面。
+优先按 `workflow` 入口完成主流程；当前目标需要底层枚举、写回、调试、脚本或实验能力时，直接使用 `all` 工具面中的对应工具。
 
 固定入口：
 
@@ -34,9 +34,8 @@ get_workspace_state -> open_target -> triage_binary -> investigate_string / expl
 
 ## 工具选择
 
-- **slim**：默认使用 `get_workspace_state`、`open_target`、`triage_binary`、`investigate_string`、`explain_function`、`trace_input_to_check`、`decompile_function`、`export_report`、`save_workspace`、`close_target`。
-- **full**：需要枚举函数、字符串、导入、xref、类型、结构体、字节、调用图时使用。先读 [工具面与契约](references/tool-surfaces.md)。
-- **expert**：需要 IDAPython、调试器、补丁、microcode 实验时使用。先读 [专家能力](references/expert.md)。
+- **workflow**：优先使用 `get_workspace_state`、`open_target`、`triage_binary`、`investigate_string`、`explain_function`、`trace_input_to_check`、`decompile_function`、`export_report`、`save_workspace`、`close_target`。
+- **all**：需要枚举函数、字符串、导入、xref、类型、结构体、字节、调用图、IDAPython、调试器、补丁或 microcode 实验时使用。先读 [工具面与契约](references/tool-surfaces.md) 与 [底层能力](references/expert.md)。
 
 ## 常见决策
 
@@ -45,14 +44,17 @@ get_workspace_state -> open_target -> triage_binary -> investigate_string / expl
 - 只需要伪代码：用 `decompile_function`。需要上下文、字符串、调用关系、建议：用 `explain_function`。
 - UE、Chrome、游戏客户端、大 PDB 样本：保持 `run_auto_analysis=false` 做轻量打开；用户明确要全库自动分析时再用 `run_auto_analysis=true`，并提醒客户端超时设为 1 到 6 小时。
 - 字符串工具首次查询会构建会话级缓存。未命中且 `cache.truncated_by_scan_limit=true` 时，不得断言全库不存在。
-- IDAPython 需要 `--unsafe`，且默认 `slim` 工具面不暴露脚本工具。脚本只返回小型摘要，必须把结果赋给 `result`。
-- microcode mutation 只能在 `--unsafe --tool-surface expert` 下使用，结论标记为 `experimental`。
+- IDAPython 脚本把结果赋给 `result`；大 `stdout`、`stderr` 或 `result` 会写入 artifact，按 `path`、`sha256`、`size`、`schema` 校验。
+- 补丁可直接用 `patch_bytes` 或 `patch_assembly` 写入；需要预览或撤回时用 `patch_diff`、`patch_history`、`rollback_patch`。
+- 动态验证用 `debug_launch` 或 `debug_attach` 建立调试会话，再组合断点、`debug_step`、`debug_registers`、`debug_stack`、`debug_read_memory`、`debug_capture_calls` 和 `debug_export_timeline`。
+- 间接分发先用 `scan_dispatchers` 做通用候选扫描；外部 VM/字节码/封包分析用 `run_external_analyzer` 或 `import_analysis_artifact` 导入 JSON，再用 `correlate_analysis_artifact` 与 IDB 证据关联。
+- microcode mutation 只能用 `microcode_experiment`，结论标记为 `experimental`，并用伪代码或函数解释复核。
 
 ## 按需读取
 
 - Native、managed、字符串、函数、报告的完整流程：读 [工作流](references/workflows.md)。
-- full/expert 工具面、输出 envelope、字符串缓存契约：读 [工具面与契约](references/tool-surfaces.md)。
-- IDAPython、microcode、调试器、写回与补丁：读 [专家能力](references/expert.md)。
+- all/workflow 工具面、输出 envelope、字符串缓存契约：读 [工具面与契约](references/tool-surfaces.md)。
+- IDAPython、microcode、调试器、写回与补丁：读 [底层能力](references/expert.md)。
 - 大样本耗时、卡住、超时、坏结果、客户端等待问题：读 [排障](references/troubleshooting.md)。
 
 MCP prompts 是服务端提供的可选模板；本 skill 是客户端侧操作指南。客户端支持 prompts 时可以读取模板辅助组织任务，工作流检查仍以工具返回结果为准。

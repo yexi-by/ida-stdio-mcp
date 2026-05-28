@@ -37,14 +37,14 @@ UE、Chrome、游戏客户端、大 PDB native 样本可能耗时很长。
 常见原因：
 
 - 工具响应过大，客户端还在处理或上传 tool output。
-- `evaluate_python` 按契约只返回 `stdout`、`stderr`、`result` 和局部变量名等受控摘要。
+- `evaluate_python` 按契约只返回受控摘要；大 `stdout`、`stderr` 或 `result` 会写入 artifact。
 - 客户端侧工具状态未同步，服务端日志可能已经显示完成。
 
 处理：
 
 1. 看 MCP 日志里的 `tool_call_start` / `tool_call_complete`、`request_id`、`duration`。
 2. 看客户端 tool output 文件大小。
-3. 避免 IDAPython 返回巨大对象；只让脚本返回小型 `result`。
+3. 查看 `artifacts` 中的 `path`、`sha256`、`size` 与 `schema`，必要时读取落盘结果。
 4. 字符串工具连续调用时确认 `cache.cache_hit=true`。
 
 ## 字符串结果差
@@ -81,5 +81,5 @@ UE、Chrome、游戏客户端、大 PDB native 样本可能耗时很长。
 - `session_required`：先 `open_target` 或 `get_workspace_state`。
 - `session_not_found`：确认 `session_id` 属于当前上下文。
 - `runtime_not_ready`：检查 IDA 9.3+ runtime、`idapro`、`IDADIR`。
-- `unsupported`：当前环境缺少 Hex-Rays、调试后端或工具门控，换静态分析路径。
+- `unsupported`：当前环境缺少 Hex-Rays 或调试后端，换静态分析路径。
 - `degraded`：继续分析，但在报告中写明降级原因。

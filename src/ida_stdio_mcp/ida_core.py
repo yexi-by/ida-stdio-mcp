@@ -8,20 +8,19 @@
 from __future__ import annotations
 
 import re
-from contextlib import redirect_stderr, redirect_stdout
 from collections import defaultdict, deque
 from dataclasses import dataclass
-from io import StringIO
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, Iterable, Protocol, TypeAlias, cast
 
+from .core.artifacts import ArtifactCoreMixin
+from .core.debug import DebugCoreMixin
+from .core.managed import ManagedCoreMixin
+from .core.microcode import MicrocodeCoreMixin
+from .core.patches import decode_patch_record_bytes, ensure_rollback_matches_current
+from .core.script import ScriptCoreMixin
 from .ida_bootstrap import ensure_ida_environment
-from .managed_decompiler import (
-    decompile_managed_method,
-    managed_decompiler_available,
-    managed_decompiler_command,
-)
 
 ensure_ida_environment()
 
@@ -60,14 +59,6 @@ ELF_SUFFIXES = {".elf", ".so"}
 MACHO_SUFFIXES = {".dylib", ".macho"}
 STRING_LITERAL_PATTERN = re.compile(r'"([^"\\\\]*(?:\\\\.[^"\\\\]*)*)"')
 STRING_CACHE_SCAN_LIMIT = 10_000
-SCRIPT_TEXT_LIMIT_DEFAULT = 120_000
-SCRIPT_TEXT_LIMIT_HARD = 1_000_000
-SCRIPT_VALUE_ITEM_LIMIT = 80
-SCRIPT_VALUE_DEPTH_LIMIT = 4
-SCRIPT_LOCALS_SUMMARY_LIMIT = 48
-SCRIPT_LOCALS_SAMPLE_LIMIT = 8
-
-
 ToolEnvelope: TypeAlias = JsonObject
 
 
@@ -82,6 +73,8 @@ class _StringCacheEntry:
 
 
 _STRING_CACHE_BY_IDB: dict[str, _StringCacheEntry] = {}
+_PATCH_HISTORY_BY_IDB: dict[str, list[JsonObject]] = {}
+_PATCH_SEQUENCE_BY_IDB: dict[str, int] = {}
 
 
 GET_IDB_PATH = cast(Callable[[int], str], ida_loader.get_path)
@@ -142,6 +135,8 @@ CONTINUE_PROCESS = cast(Callable[[], None], ida_dbg.continue_process)
 STEP_INTO = cast(Callable[[], None], ida_dbg.step_into)
 STEP_OVER = cast(Callable[[], None], ida_dbg.step_over)
 REQUEST_RUN_TO = cast(Callable[[int], bool], ida_dbg.request_run_to)
+RUN_REQUESTS_RAW = getattr(ida_dbg, "run_requests", None)
+RUN_REQUESTS = cast(Callable[[], bool] | None, RUN_REQUESTS_RAW if callable(RUN_REQUESTS_RAW) else None)
 GET_PROCESS_STATE = ida_dbg.get_process_state
 GET_BPT_QTY = ida_dbg.get_bpt_qty
 GET_NTH_BPT = cast(Callable[[int, ida_dbg.bpt_t], bool], ida_dbg.getn_bpt)
@@ -194,7 +189,7 @@ class _StringItem(Protocol):
         ...
 
 
-class IdaCore:
+class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMixin, ArtifactCoreMixin):
     """纯 headless 的 IDA 访问层。"""
 
     def wait_auto_analysis(self) -> JsonObject:
@@ -1520,7 +1515,7 @@ class IdaCore:
 
         return [self._json_object({"format": "json", "functions": exported})]
 
-    def export_full_analysis(
+    def build_analysis_report(
         self,
         *,
         function_limit: int = 200,
@@ -1532,7 +1527,7 @@ class IdaCore:
         include_decompile: bool = True,
         include_asm: bool = False,
     ) -> JsonObject:
-        """导出当前 IDB 的结构化分析总包。"""
+        """构建当前 IDB 的结构化分析报告。"""
         summary = self.triage_binary_snapshot(
             function_limit=min(function_limit, 12),
             string_limit=min(string_limit, 12),
@@ -1786,153 +1781,28 @@ class IdaCore:
             },
         })
 
-    def microcode_summary(self, query: str, *, max_instructions: int = 80) -> ToolEnvelope:
-        """返回只读 microcode 摘要。"""
-        if not self.hexrays_available():
-            return self._json_object(
-                {
-                    "status": "unsupported",
-                    "warnings": ["当前环境不可用 Hex-Rays，无法生成 microcode。"],
-                    "data": None,
-                }
-            )
-        match = self.lookup_function(query)
-        func = self.require_function(self._match_ea(match))
-        try:
-            cfunc = ida_hexrays.decompile(func.start_ea)
-            mba = getattr(cfunc, "mba", None)
-            if mba is None:
-                return self._json_object(
-                    {
-                        "status": "unsupported",
-                        "warnings": ["Hex-Rays 未返回 mba_t，当前反编译结果无法读取 microcode。"],
-                        "data": None,
-                    }
-                )
-            blocks = self._microcode_blocks(mba, max_instructions=max_instructions)
-            instruction_count = 0
-            for block in blocks:
-                raw_count = block.get("instruction_count")
-                if isinstance(raw_count, int):
-                    instruction_count += raw_count
-            return self._json_object(
-                {
-                    "status": "ok",
-                    "warnings": [],
-                    "data": {
-                        "addr": hex(func.start_ea),
-                        "name": self._match_name(match),
-                        "experimental": True,
-                        "read_only": True,
-                        "block_count": len(blocks),
-                        "instruction_count": instruction_count,
-                        "blocks": blocks,
-                    },
-                }
-            )
-        except Exception as exc:
-            return self._json_object(
-                {
-                    "status": "degraded",
-                    "warnings": [f"microcode 读取失败，已降级：{exc}"],
-                    "data": None,
-                }
-            )
-
-    def microcode_def_use(self, query: str, *, max_instructions: int = 120) -> ToolEnvelope:
-        """返回 microcode def-use 线索。"""
-        summary = self.microcode_summary(query, max_instructions=max_instructions)
-        if summary.get("status") != "ok":
-            return summary
-        data = summary.get("data")
-        if not isinstance(data, dict):
-            return summary
-        rows: list[JsonObject] = []
-        blocks = data.get("blocks")
-        if isinstance(blocks, list):
-            for block in blocks:
-                if not isinstance(block, dict):
-                    continue
-                instructions = block.get("instructions")
-                if not isinstance(instructions, list):
-                    continue
-                for instruction in instructions:
-                    if not isinstance(instruction, dict):
-                        continue
-                    defs = instruction.get("defs")
-                    uses = instruction.get("uses")
-                    if defs or uses:
-                        rows.append(
-                            self._json_object(
-                                {
-                                    "block": block.get("serial"),
-                                    "addr": instruction.get("addr"),
-                                    "opcode": instruction.get("opcode"),
-                                    "defs": defs,
-                                    "uses": uses,
-                                    "text": instruction.get("text"),
-                                }
-                            )
-                        )
-        return self._json_object(
-            {
-                "status": "ok",
-                "warnings": ["def-use 来自 Hex-Rays microcode，只作为辅助线索。"],
-                "data": {
-                    "addr": data.get("addr"),
-                    "name": data.get("name"),
-                    "experimental": True,
-                    "rows": rows,
-                },
-            }
-        )
-
-    def microcode_experiment(self, query: str, *, action: str = "mark_chains_dirty") -> ToolEnvelope:
-        """执行实验性 microcode mutation。"""
-        if action not in {"mark_chains_dirty"}:
-            raise ValueError("microcode_experiment 当前仅支持 mark_chains_dirty")
-        if not self.hexrays_available():
-            return self._json_object(
-                {
-                    "status": "unsupported",
-                    "warnings": ["当前环境不可用 Hex-Rays，无法执行 microcode 实验。"],
-                    "data": None,
-                }
-            )
-        match = self.lookup_function(query)
-        func = self.require_function(self._match_ea(match))
-        cfunc = ida_hexrays.decompile(func.start_ea)
-        mba = getattr(cfunc, "mba", None)
-        if mba is None:
-            return self._json_object(
-                {
-                    "status": "unsupported",
-                    "warnings": ["Hex-Rays 未返回 mba_t，无法执行 microcode 实验。"],
-                    "data": None,
-                }
-            )
-        mark_chains_dirty = getattr(mba, "mark_chains_dirty", None)
-        if not callable(mark_chains_dirty):
-            return self._json_object(
-                {
-                    "status": "unsupported",
-                    "warnings": ["当前 IDA 运行时未暴露 mba_t.mark_chains_dirty。"],
-                    "data": None,
-                }
-            )
-        mark_chains_dirty()
-        return self._json_object(
-            {
-                "status": "ok",
-                "warnings": ["这是 experimental microcode mutation；只在 --unsafe 与 --tool-surface expert 下暴露。"],
-                "data": {
-                    "addr": hex(func.start_ea),
-                    "name": self._match_name(match),
-                    "experimental": True,
-                    "action": action,
-                    "mutated": True,
-                },
-            }
+    def export_full_analysis(
+        self,
+        *,
+        function_limit: int = 200,
+        string_limit: int = 500,
+        global_limit: int = 200,
+        import_limit: int = 500,
+        type_limit: int = 200,
+        struct_limit: int = 100,
+        include_decompile: bool = True,
+        include_asm: bool = False,
+    ) -> JsonObject:
+        """导出当前 IDB 的结构化分析总包。"""
+        return self.build_analysis_report(
+            function_limit=function_limit,
+            string_limit=string_limit,
+            global_limit=global_limit,
+            import_limit=import_limit,
+            type_limit=type_limit,
+            struct_limit=struct_limit,
+            include_decompile=include_decompile,
+            include_asm=include_asm,
         )
 
     def convert_integer(self, value: str | int, *, width: int = 8, signed: bool = False) -> JsonObject:
@@ -1992,6 +1862,85 @@ class IdaCore:
             results.append({"addr": hex(ea), "name": name_text})
         return results
 
+    def _patch_history_key(self) -> str:
+        """返回当前工作 IDB 的补丁历史键。"""
+        idb_path = GET_IDB_PATH(ida_loader.PATH_TYPE_IDB) or ""
+        input_path = ida_nalt.get_input_file_path() or ""
+        if idb_path or input_path:
+            return f"idb:{idb_path}|input:{input_path}"
+        return "<unnamed-idb>"
+
+    def _patch_records(self) -> list[JsonObject]:
+        """返回当前工作 IDB 的补丁历史记录列表。"""
+        return _PATCH_HISTORY_BY_IDB.setdefault(self._patch_history_key(), [])
+
+    def _next_patch_id(self) -> int:
+        """生成当前工作 IDB 内单调递增的补丁 ID。"""
+        key = self._patch_history_key()
+        next_id = _PATCH_SEQUENCE_BY_IDB.get(key, 0) + 1
+        _PATCH_SEQUENCE_BY_IDB[key] = next_id
+        return next_id
+
+    def _read_patch_bytes(self, ea: int, size: int) -> bytes:
+        """读取补丁范围内的原始字节。"""
+        if size <= 0:
+            raise ValueError("补丁字节数必须大于 0")
+        data = GET_BYTES(ea, size, 0)
+        if data is None or len(data) != size:
+            raise RuntimeError(f"读取补丁范围失败：{hex(ea)} size={size}")
+        return data
+
+    def _byte_diff_rows(self, before: bytes, after: bytes) -> list[JsonObject]:
+        """生成逐字节差异行。"""
+        rows: list[JsonObject] = []
+        for offset, (before_byte, after_byte) in enumerate(zip(before, after, strict=False)):
+            if before_byte == after_byte:
+                continue
+            rows.append({"offset": offset, "before": f"{before_byte:02x}", "after": f"{after_byte:02x}"})
+        return rows
+
+    def _record_patch(self, *, kind: str, ea: int, before: bytes, after: bytes, metadata: JsonObject | None = None) -> JsonObject:
+        """记录一次补丁或回滚操作。"""
+        record: dict[str, object] = {
+            "id": self._next_patch_id(),
+            "kind": kind,
+            "addr": hex(ea),
+            "size": len(after),
+            "before_hex": before.hex(),
+            "after_hex": after.hex(),
+            "changed_offsets": self._byte_diff_rows(before, after),
+        }
+        if metadata is not None:
+            record["metadata"] = metadata
+        normalized = self._json_object(record)
+        self._patch_records().append(normalized)
+        return normalized
+
+    def patch_diff(self, items: list[JsonObject]) -> list[JsonObject]:
+        """预览字节补丁差异，不写入 IDB。"""
+        results: list[JsonObject] = []
+        for item in items:
+            addr_text = item.get("addr")
+            hex_text = item.get("hex")
+            if not isinstance(addr_text, str) or not isinstance(hex_text, str):
+                raise ValueError("patch_diff 的 addr/hex 必须为字符串")
+            ea = self.parse_address(addr_text)
+            after = bytes.fromhex(hex_text)
+            before = self._read_patch_bytes(ea, len(after))
+            results.append(
+                self._json_object(
+                    {
+                        "addr": hex(ea),
+                        "size": len(after),
+                        "before_hex": before.hex(),
+                        "after_hex": after.hex(),
+                        "changed": before != after,
+                        "changed_offsets": self._byte_diff_rows(before, after),
+                    }
+                )
+            )
+        return results
+
     def patch_bytes(self, items: list[JsonObject]) -> list[JsonObject]:
         """直接写入字节。"""
         results: list[JsonObject] = []
@@ -2002,12 +1951,68 @@ class IdaCore:
                 raise ValueError("patch_bytes 的 addr/hex 必须为字符串")
             ea = self.parse_address(addr_text)
             blob = bytes.fromhex(hex_text)
+            before = self._read_patch_bytes(ea, len(blob))
             PATCH_BYTES(ea, blob)
             written = GET_BYTES(ea, len(blob), 0) or b""
             if written != blob:
                 raise RuntimeError(f"写入字节失败：{addr_text}")
             self._refresh_analysis_range(ea, len(blob))
-            results.append({"addr": hex(ea), "size": len(blob)})
+            record = self._record_patch(kind="patch_bytes", ea=ea, before=before, after=written)
+            results.append({"addr": hex(ea), "size": len(blob), "patch_id": record["id"]})
+        return results
+
+    def patch_history(self, *, limit: int = 50) -> JsonObject:
+        """返回当前工作 IDB 的补丁历史。"""
+        records = self._patch_records()
+        bounded_limit = max(1, min(limit, 500))
+        return self._json_object(
+            {
+                "history_key": self._patch_history_key(),
+                "count": len(records),
+                "limit": bounded_limit,
+                "items": records[-bounded_limit:],
+            }
+        )
+
+    def rollback_patch(self, ids: list[int]) -> list[JsonObject]:
+        """按补丁 ID 回滚历史记录。"""
+        if not ids:
+            raise ValueError("rollback_patch 必须提供至少一个补丁 ID")
+        records = self._patch_records()
+        by_id = {record.get("id"): record for record in records if isinstance(record.get("id"), int)}
+        results: list[JsonObject] = []
+        for patch_id in reversed(ids):
+            record = by_id.get(patch_id)
+            if record is None:
+                raise ValueError(f"找不到补丁记录：{patch_id}")
+            addr_text = record.get("addr")
+            if not isinstance(addr_text, str):
+                raise ValueError(f"补丁记录不可回滚：{patch_id}")
+            ea = self.parse_address(addr_text)
+            restore, expected_after = decode_patch_record_bytes(record, patch_id=patch_id)
+            current = self._read_patch_bytes(ea, len(expected_after))
+            ensure_rollback_matches_current(patch_id=patch_id, current=current, expected_after=expected_after)
+            PATCH_BYTES(ea, restore)
+            written = GET_BYTES(ea, len(restore), 0) or b""
+            if written != restore:
+                raise RuntimeError(f"补丁回滚失败：{patch_id}")
+            self._refresh_analysis_range(ea, len(restore))
+            rollback_record = self._record_patch(
+                kind="rollback_patch",
+                ea=ea,
+                before=current,
+                after=written,
+                metadata={"rolled_back_patch_id": patch_id},
+            )
+            results.append(
+                {
+                    "patch_id": patch_id,
+                    "rollback_id": rollback_record["id"],
+                    "addr": hex(ea),
+                    "size": len(restore),
+                    "restored_hex": written.hex(),
+                }
+            )
         return results
 
     def write_ints(self, items: list[JsonObject]) -> list[JsonObject]:
@@ -2122,10 +2127,6 @@ class IdaCore:
                 raise RuntimeError(f"设置类型失败：{addr_text}")
             results.append({"addr": hex(ea), "type": type_text})
         return results
-
-    def apply_types(self, items: list[JsonObject]) -> list[JsonObject]:
-        """批量应用类型。"""
-        return self.set_types(items)
 
     def infer_types(self, items: list[str]) -> list[JsonObject]:
         """推断地址上的可能类型并尽量写回。"""
@@ -2275,6 +2276,7 @@ class IdaCore:
                 raise ValueError("patch_assembly 的 addr/asm 必须为字符串")
             ea = self.parse_address(addr_text)
             current_ea = ea
+            assembled_blobs: list[bytes] = []
             for asm_line in [segment.strip() for segment in asm_text.split(";") if segment.strip()]:
                 assembled = ASSEMBLE(current_ea, asm_line)
                 if not isinstance(assembled, tuple):
@@ -2287,368 +2289,25 @@ class IdaCore:
                 if not assembled_ok or not isinstance(blob, (bytes, bytearray)):
                     raise RuntimeError(f"汇编失败：{asm_line}")
                 patch_blob = bytes(blob)
+                assembled_blobs.append(patch_blob)
+                current_ea += len(patch_blob)
+
+            full_patch = b"".join(assembled_blobs)
+            if not full_patch:
+                raise ValueError("patch_assembly 至少需要一条汇编指令")
+            before = self._read_patch_bytes(ea, len(full_patch))
+            current_ea = ea
+            for patch_blob in assembled_blobs:
                 PATCH_BYTES(current_ea, patch_blob)
                 written = GET_BYTES(current_ea, len(patch_blob), 0) or b""
                 if written != patch_blob:
                     raise RuntimeError(f"补丁写入失败：{hex(current_ea)}")
                 self._refresh_analysis_range(current_ea, len(patch_blob))
-                current_ea += len(blob)
-            results.append({"addr": hex(ea), "size": current_ea - ea, "asm": asm_text})
+                current_ea += len(patch_blob)
+            after = self._read_patch_bytes(ea, len(full_patch))
+            record = self._record_patch(kind="patch_assembly", ea=ea, before=before, after=after, metadata={"asm": asm_text})
+            results.append({"addr": hex(ea), "size": current_ea - ea, "asm": asm_text, "patch_id": record["id"]})
         return results
-
-    def _clip_text(self, text: str, *, limit: int) -> tuple[str, bool]:
-        """按字符数裁剪文本，并返回是否发生截断。"""
-        if len(text) <= limit:
-            return text, False
-        return text[:limit], True
-
-    def _tool_safe_value(self, value: object, *, max_items: int = SCRIPT_VALUE_ITEM_LIMIT, depth: int = SCRIPT_VALUE_DEPTH_LIMIT) -> JsonValue:
-        """把脚本结果压缩成不会淹没 MCP 客户端的 JSON 值。"""
-        if value is None or isinstance(value, (int, float, bool)):
-            return value
-        if isinstance(value, str):
-            clipped, truncated = self._clip_text(value, limit=SCRIPT_TEXT_LIMIT_DEFAULT)
-            if truncated:
-                return self._json_object({"type": "str", "text": clipped, "truncated": True, "original_length": len(value)})
-            return clipped
-        if depth <= 0:
-            return self._json_object({"type": type(value).__name__, "repr": str(type(value))})
-        if isinstance(value, list):
-            list_value = cast(list[object], value)
-            return self._tool_safe_sequence("list", list_value, max_items=max_items, depth=depth)
-        if isinstance(value, tuple):
-            tuple_value = cast(tuple[object, ...], value)
-            return self._tool_safe_sequence("tuple", tuple_value, max_items=max_items, depth=depth)
-        if isinstance(value, set):
-            set_value = cast(set[object], value)
-            return self._tool_safe_sequence("set", set_value, max_items=max_items, depth=depth)
-        if isinstance(value, dict):
-            dict_value = cast(dict[object, object], value)
-            return self._tool_safe_mapping(dict_value, max_items=max_items, depth=depth)
-        text = str(value)
-        clipped, truncated = self._clip_text(text, limit=SCRIPT_TEXT_LIMIT_DEFAULT)
-        payload: JsonObject = {"type": type(value).__name__, "repr": clipped}
-        if truncated:
-            payload["truncated"] = True
-            payload["original_length"] = len(text)
-        return self._json_object(payload)
-
-    def _tool_safe_sequence(self, kind: str, values: Iterable[object], *, max_items: int, depth: int) -> JsonValue:
-        """压缩脚本返回的序列，避免返回全量巨大列表。"""
-        samples: list[JsonValue] = []
-        total = 0
-        for total, item in enumerate(values, start=1):
-            if len(samples) < max_items:
-                samples.append(self._tool_safe_value(item, max_items=max_items, depth=depth - 1))
-        if total <= max_items:
-            return samples
-        return self._json_object({"type": kind, "count": total, "sample": samples, "truncated": True})
-
-    def _tool_safe_mapping(self, value: dict[object, object], *, max_items: int, depth: int) -> JsonValue:
-        """压缩脚本返回的映射，保留少量键值样本。"""
-        sample: JsonObject = {}
-        total = 0
-        for total, (key, item) in enumerate(value.items(), start=1):
-            if len(sample) < max_items:
-                sample[str(key)] = self._tool_safe_value(item, max_items=max_items, depth=depth - 1)
-        if total <= max_items:
-            return sample
-        return self._json_object({"type": "dict", "count": total, "sample": sample, "truncated": True})
-
-    def _script_local_keys(self, scope: dict[str, object]) -> list[str]:
-        """列出脚本产生的公开局部变量名。"""
-        return [key for key in scope if not key.startswith("__")][:SCRIPT_LOCALS_SUMMARY_LIMIT]
-
-    def _script_locals_summary(self, scope: dict[str, object]) -> list[JsonObject]:
-        """返回脚本局部变量的安全摘要，不返回完整大对象。"""
-        summaries: list[JsonObject] = []
-        for key, value in scope.items():
-            if key.startswith("__"):
-                continue
-            summaries.append(
-                self._json_object(
-                    {
-                        "name": key,
-                        "type": type(value).__name__,
-                        "preview": self._tool_safe_value(value, max_items=SCRIPT_LOCALS_SAMPLE_LIMIT, depth=2),
-                    }
-                )
-            )
-            if len(summaries) >= SCRIPT_LOCALS_SUMMARY_LIMIT:
-                break
-        return summaries
-
-    def evaluate_python(self, code: str, *, include_locals: bool = False, max_output_chars: int = SCRIPT_TEXT_LIMIT_DEFAULT) -> JsonObject:
-        """执行 Python 代码，并返回受控大小的 stdout/result。"""
-        output_limit = max(1_000, min(max_output_chars, SCRIPT_TEXT_LIMIT_HARD))
-        scope: dict[str, object] = {}
-        stdout_buffer = StringIO()
-        stderr_buffer = StringIO()
-        started_at = perf_counter()
-        mode = "exec"
-        result_present = False
-        result_value: object | None = None
-
-        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
-            try:
-                result_value = eval(code, scope, scope)
-                result_present = True
-                mode = "eval"
-            except SyntaxError:
-                exec(code, scope, scope)
-                result_present = "result" in scope
-                if result_present:
-                    result_value = scope["result"]
-
-        stdout_text, stdout_truncated = self._clip_text(stdout_buffer.getvalue(), limit=output_limit)
-        stderr_text, stderr_truncated = self._clip_text(stderr_buffer.getvalue(), limit=output_limit)
-        payload: dict[str, object] = {
-            "mode": mode,
-            "duration_ms": round((perf_counter() - started_at) * 1000.0, 3),
-            "stdout": stdout_text,
-            "stderr": stderr_text,
-            "stdout_truncated": stdout_truncated,
-            "stderr_truncated": stderr_truncated,
-            "result_present": result_present,
-            "result": self._tool_safe_value(result_value) if result_present else None,
-            "local_keys": self._script_local_keys(scope),
-            "locals_returned": include_locals,
-            "output_contract": "exec 默认只返回 stdout/stderr/result 与局部变量名；如需结构化结果，请把小型摘要赋给 result。include_locals 也只返回安全摘要。",
-            "recommended_next_tools": ["explain_function", "decompile_function", "find_strings", "search_regex"],
-        }
-        if include_locals:
-            payload["locals_summary"] = self._script_locals_summary(scope)
-        return self._json_object(payload)
-
-    def execute_python_file(self, path: str) -> JsonObject:
-        """执行 Python 文件。"""
-        return self.evaluate_python(Path(path).read_text(encoding="utf-8"))
-
-    def debug_start(self, path: str = "") -> ToolEnvelope:
-        """启动调试会话。"""
-        target = path or (ida_nalt.get_input_file_path() or "")
-        if not target:
-            return {"status": "unsupported", "data": {"reason": "当前没有可调试目标"}, "warnings": ["请显式提供 path"]}
-        ok = bool(START_PROCESS(target, "", ""))
-        ida_idd.get_dbg()
-        backend_ready = True
-        session_active = GET_PROCESS_STATE() != -1
-        if ok and backend_ready and session_active:
-            return self._json_object({
-                "status": "ok",
-                "data": {"started": True, "path": target, "backend_available": True, "session_active": True},
-                "warnings": [],
-            })
-        return self._json_object({
-            "status": "unsupported",
-            "data": {"started": bool(ok), "path": target, "backend_available": backend_ready, "session_active": session_active},
-            "warnings": ["当前环境未形成可用调试链路，后续寄存器/栈回溯/内存接口不可继续调用"],
-        })
-
-    def debug_exit(self) -> ToolEnvelope:
-        """退出调试。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        EXIT_PROCESS()
-        return self._json_object({"status": "ok", "data": {"exited": True}, "warnings": []})
-
-    def debug_continue(self) -> ToolEnvelope:
-        """继续执行。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        CONTINUE_PROCESS()
-        return self._json_object({"status": "ok", "data": {"continued": True}, "warnings": []})
-
-    def debug_run_to(self, addr: str) -> ToolEnvelope:
-        """运行到指定地址。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        ok = bool(REQUEST_RUN_TO(self.parse_address(addr)))
-        return self._json_object({"status": "ok" if ok else "unsupported", "data": {"requested": ok, "addr": addr}, "warnings": [] if ok else ["request_run_to 失败"]})
-
-    def debug_step_into(self) -> ToolEnvelope:
-        """单步进入。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        STEP_INTO()
-        return self._json_object({"status": "ok", "data": {"step": "into"}, "warnings": []})
-
-    def debug_step_over(self) -> ToolEnvelope:
-        """单步越过。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        STEP_OVER()
-        return self._json_object({"status": "ok", "data": {"step": "over"}, "warnings": []})
-
-    def debug_breakpoints(self) -> list[JsonObject]:
-        """列出断点。"""
-        results: list[JsonObject] = []
-        for index in range(GET_BPT_QTY()):
-            bpt = NEW_BPT()
-            if GET_NTH_BPT(index, bpt):
-                results.append({"addr": hex(bpt.ea), "enabled": bool(bpt.enabled), "size": bpt.size})
-        return results
-
-    def debug_add_breakpoints(self, addrs: list[str]) -> list[JsonObject]:
-        """添加断点。"""
-        results: list[JsonObject] = []
-        for addr_text in addrs:
-            ea = self.parse_address(addr_text)
-            if not ADD_BPT(ea):
-                raise RuntimeError(f"添加断点失败：{addr_text}")
-            results.append({"addr": hex(ea)})
-        return results
-
-    def debug_delete_breakpoints(self, addrs: list[str]) -> list[JsonObject]:
-        """删除断点。"""
-        results: list[JsonObject] = []
-        for addr_text in addrs:
-            ea = self.parse_address(addr_text)
-            if not DEL_BPT(ea):
-                raise RuntimeError(f"删除断点失败：{addr_text}")
-            results.append({"addr": hex(ea)})
-        return results
-
-    def debug_toggle_breakpoints(self, items: list[JsonObject]) -> list[JsonObject]:
-        """启停断点。"""
-        results: list[JsonObject] = []
-        for item in items:
-            addr_text = item.get("addr")
-            enabled = bool(item.get("enabled", True))
-            if not isinstance(addr_text, str):
-                raise ValueError("debug_toggle_breakpoints 的 addr 必须为字符串")
-            ea = self.parse_address(addr_text)
-            if not EXIST_BPT(ea):
-                raise RuntimeError(f"找不到断点：{addr_text}")
-            if not ENABLE_BPT(ea, enabled):
-                raise RuntimeError(f"更新断点失败：{addr_text}")
-            results.append({"addr": hex(ea), "enabled": enabled})
-        return results
-
-    def debug_registers(self, *, thread_id: int | None = None, names: list[str] | None = None) -> JsonObject:
-        """读取寄存器。"""
-        if GET_PROCESS_STATE() == -1:
-            raise RuntimeError("当前没有活动调试会话")
-        current_thread = thread_id if thread_id is not None else int(GET_CURRENT_THREAD())
-        debugger = ida_idd.get_dbg()
-        regvals = self._iter_objects(GET_REG_VALS(current_thread, -1))
-        selected = {item.lower() for item in names} if names is not None else None
-        registers: dict[str, JsonValue] = {}
-        for reg_index, regval in enumerate(regvals):
-            reg_info = cast(object, debugger.regs(reg_index))
-            reg_name = str(getattr(reg_info, "name"))
-            if selected is not None and reg_name.lower() not in selected:
-                continue
-            try:
-                pyval_fn = cast(Callable[[object], object], getattr(regval, "pyval"))
-                registers[reg_name] = self.jsonify(pyval_fn(getattr(reg_info, "dtype")))
-            except Exception:
-                registers[reg_name] = str(regval)
-        return self._json_object({"thread_id": current_thread, "registers": registers})
-
-    def debug_registers_all_threads(self, *, names: list[str] | None = None) -> ToolEnvelope:
-        """读取所有线程的寄存器快照。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-
-        current_thread = int(GET_CURRENT_THREAD())
-        thread_count = int(GET_THREAD_QTY())
-        threads: list[JsonObject] = []
-        warnings: list[str] = []
-
-        for index in range(thread_count):
-            thread_id = int(GET_NTH_THREAD(index))
-            if thread_id in (BADADDR, -1):
-                warnings.append(f"第 {index} 个线程句柄无效，已跳过")
-                continue
-            thread_name = GET_NTH_THREAD_NAME(index)
-            try:
-                snapshot = self.debug_registers(thread_id=thread_id, names=names)
-                threads.append(
-                    {
-                        "index": index,
-                        "thread_id": thread_id,
-                        "thread_name": thread_name or "",
-                        "is_current": thread_id == current_thread,
-                        "registers": snapshot["registers"],
-                    }
-                )
-            except Exception as exc:
-                warnings.append(f"线程 {thread_id} 寄存器读取失败：{exc}")
-
-        if not threads:
-            return self._json_object({
-                "status": "unsupported",
-                "data": {"reason": "没有可读取的线程寄存器", "thread_count": thread_count},
-                "warnings": warnings or ["调试器未返回可用线程"],
-            })
-
-        return self._json_object({
-            "status": "ok",
-            "data": {"current_thread": current_thread, "thread_count": thread_count, "threads": threads},
-            "warnings": warnings,
-        })
-
-    def debug_stacktrace(self) -> ToolEnvelope:
-        """读取当前线程调用栈。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-
-        thread_id = int(GET_CURRENT_THREAD())
-        trace = NEW_CALL_STACK()
-        if not COLLECT_STACK_TRACE(thread_id, trace):
-            return self._json_object({"status": "unsupported", "data": {"reason": "读取调用栈失败", "thread_id": thread_id}, "warnings": ["collect_stack_trace 失败"]})
-
-        frames: list[JsonObject] = []
-        for index, frame in enumerate(trace):
-            call_ea = int(frame.callea)
-            function_ea = int(frame.funcea) if int(frame.funcea) != BADADDR else call_ea
-            module_name = "<unknown>"
-            module_info = NEW_MODINFO()
-            if GET_MODULE_INFO(call_ea, module_info):
-                raw_module_name = module_info.name
-                if isinstance(raw_module_name, str) and raw_module_name:
-                    module_name = Path(raw_module_name).name
-
-            symbol_name = GET_NICE_COLORED_NAME(
-                function_ea,
-                ida_name.GNCN_NOCOLOR
-                | ida_name.GNCN_NOLABEL
-                | ida_name.GNCN_NOSEG
-                | ida_name.GNCN_PREFDBG,
-            )
-            frames.append(
-                {
-                    "index": index,
-                    "call_addr": hex(call_ea),
-                    "function_addr": hex(function_ea),
-                    "frame_pointer": hex(int(frame.fp)),
-                    "function_ok": bool(frame.funcok),
-                    "module": module_name,
-                    "symbol": symbol_name or self.best_name(function_ea),
-                }
-            )
-
-        return self._json_object({"status": "ok", "data": {"thread_id": thread_id, "frames": frames}, "warnings": []})
-
-    def debug_read_memory(self, addr: str, size: int) -> ToolEnvelope:
-        """读取调试内存。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        data = READ_DBG_MEMORY(self.parse_address(addr), size)
-        if data is None:
-            return self._json_object({"status": "unsupported", "data": {"reason": "读取调试内存失败", "addr": addr}, "warnings": ["read_dbg_memory 返回 None"]})
-        return self._json_object({"status": "ok", "data": {"addr": addr, "size": len(data), "hex": data.hex()}, "warnings": []})
-
-    def debug_write_memory(self, addr: str, hex_data: str) -> ToolEnvelope:
-        """写入调试内存。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        blob = bytes.fromhex(hex_data)
-        written = WRITE_DBG_MEMORY(self.parse_address(addr), blob)
-        if written != len(blob):
-            return self._json_object({"status": "unsupported", "data": {"reason": "写入调试内存失败", "written": written, "expected": len(blob)}, "warnings": ["write_dbg_memory 未完整写入"]})
-        return self._json_object({"status": "ok", "data": {"addr": addr, "size": len(blob)}, "warnings": []})
 
     def _refresh_analysis_range(self, start_ea: int, size: int) -> None:
         """在写回后主动触发局部重分析。"""
@@ -2873,182 +2532,6 @@ class IdaCore:
                 comments[hex(item_ea)] = self._json_object(payload)
         return comments
 
-    def managed_csharp_available(self) -> bool:
-        """判断当前托管样本是否具备 C# 反编译能力。"""
-        return self.get_analysis_domain() == "managed" and managed_decompiler_available()
-
-    def _managed_csharp_decompile(self, start_ea: int) -> JsonObject | None:
-        """尝试把托管方法反编译成 C#。"""
-        identity = self.managed_method_identity(start_ea)
-        if identity is None:
-            return None
-        full_type_value = identity.get("full_type")
-        method_value = identity.get("method")
-        if not isinstance(full_type_value, str) or not isinstance(method_value, str):
-            return None
-
-        assembly_path = Path(ida_nalt.get_input_file_path() or "")
-        if not assembly_path.exists():
-            return None
-
-        result = decompile_managed_method(assembly_path, full_type_value, method_value)
-        if result is None:
-            return None
-
-        warnings: list[str] = []
-        if not result.extracted_exact:
-            warnings.append("未能精确截取单方法，已返回所属类型的 C# 源码。")
-        return self._json_object(
-            {
-                "text": result.method_source,
-                "backend": result.command,
-                "source": "ilspycmd",
-                "exact": result.extracted_exact,
-                "warnings": warnings,
-            }
-        )
-
-    def managed_summary(self) -> JsonObject:
-        """返回托管/.NET 目标的能力与类型摘要。"""
-        analysis_domain = self.get_analysis_domain()
-        if analysis_domain != "managed":
-            return self._json_object({
-                "analysis_domain": analysis_domain,
-                "available": False,
-                "support_level": "not_managed",
-                "external_decompiler": managed_decompiler_command() or "",
-                "type_count": 0,
-                "namespace_count": 0,
-                "top_namespaces": [],
-                "sample_types": [],
-                "sample_methods": [],
-            })
-        managed_rows = self.managed_types()
-        namespace_histogram: dict[str, int] = defaultdict(int)
-        sample_methods: list[JsonObject] = []
-        for row in managed_rows:
-            namespace = row.get("namespace")
-            if isinstance(namespace, str) and namespace:
-                namespace_histogram[namespace] += 1
-            members = row.get("members")
-            if isinstance(members, list):
-                for member in members[:3]:
-                    if isinstance(member, dict):
-                        sample_methods.append(member)
-                        if len(sample_methods) >= 10:
-                            break
-            if len(sample_methods) >= 10:
-                break
-        top_namespaces: list[JsonObject] = [
-            self._json_object({"namespace": namespace, "count": count})
-            for namespace, count in sorted(namespace_histogram.items(), key=lambda item: item[1], reverse=True)[:20]
-        ]
-        support_level = "csharp_external" if self.managed_csharp_available() else "symbolic_il"
-        return self._json_object({
-            "analysis_domain": analysis_domain,
-            "available": True,
-            "support_level": support_level,
-            "external_decompiler": managed_decompiler_command() or "",
-            "type_count": len(managed_rows),
-            "namespace_count": len(namespace_histogram),
-            "top_namespaces": top_namespaces,
-            "sample_types": managed_rows[:20],
-            "sample_methods": sample_methods,
-        })
-
-    def managed_types(self, filter_text: str = "", *, limit: int = 2000) -> list[JsonObject]:
-        """基于符号名推断托管类型目录。
-
-        本函数以 IDA 已识别的函数名和符号名为输入，提取
-        `命名空间.类型.方法` 结构，给 headless 模式提供可消费的托管类型视图。
-        精确签名以托管反编译器或后续函数解释结果为准。
-        """
-        lowered = filter_text.lower()
-        rows: dict[str, JsonObject] = {}
-        for ea in idautils.Functions():
-            if len(rows) >= limit:
-                break
-            identity = self.managed_method_identity(ea)
-            if identity is None:
-                continue
-            full_type_value = identity.get("full_type")
-            method_value = identity.get("method")
-            type_name_value = identity.get("type_name")
-            namespace_value = identity.get("namespace")
-            full_name_value = identity.get("full_name")
-            if not isinstance(full_type_value, str):
-                continue
-            if not isinstance(method_value, str):
-                continue
-            if not isinstance(type_name_value, str):
-                continue
-            if not isinstance(namespace_value, str):
-                continue
-            if not isinstance(full_name_value, str):
-                continue
-            full_type = full_type_value
-            method_name = method_value
-            type_name = type_name_value
-            namespace = namespace_value
-            full_name = full_name_value
-            if lowered and lowered not in full_type.lower() and lowered not in method_name.lower():
-                continue
-            row = rows.setdefault(
-                full_type,
-                {
-                    "catalog": "managed_types",
-                    "kind": "managed_type",
-                    "name": type_name,
-                    "namespace": namespace,
-                    "declaration_or_signature": full_type,
-                    "members": [],
-                    "source": "symbolic_names",
-                },
-            )
-            members = row.get("members")
-            if not isinstance(members, list):
-                continue
-            if any(isinstance(member, dict) and member.get("name") == identity["method"] for member in members):
-                continue
-            members.append(
-                {
-                    "name": method_name,
-                    "kind": "method",
-                    "addr": hex(ea),
-                    "signature": self.function_signature(ea),
-                    "full_name": full_name,
-                }
-            )
-        return list(rows.values())
-
-    def managed_method_identity(self, ea: int) -> JsonObject | None:
-        """解析托管方法的“命名空间 / 类型 / 方法”身份。"""
-        raw_name = self.best_name(ea)
-        parts = self._managed_symbol_parts(raw_name)
-        if parts is None:
-            return None
-        namespace, type_name, full_type, method_name = parts
-        return {
-            "namespace": namespace,
-            "type_name": type_name,
-            "full_type": full_type,
-            "method": method_name,
-            "full_name": f"{full_type}.{method_name}" if full_type else method_name,
-        }
-
-    def render_managed_method_view(self, start_ea: int) -> str:
-        """渲染托管方法的 headless 视图。"""
-        identity = self.managed_method_identity(start_ea)
-        signature = self.function_signature(start_ea)
-        lines: list[str] = []
-        if identity is not None:
-            lines.append(f"// Managed method: {identity['full_name']}")
-        if signature:
-            lines.append(f"// Signature: {signature}")
-        lines.append("// Body:")
-        lines.extend(f"{item['addr']}: {item['text']}" for item in self.disassembly_lines(start_ea))
-        return "\n".join(lines)
-
     def _function_data_refs(self, start_ea: int, *, max_refs: int = 128) -> list[JsonObject]:
         """收集函数体里指向的数据引用。
 
@@ -3106,16 +2589,9 @@ class IdaCore:
     def debugger_health(self) -> JsonObject:
         """返回当前调试器后端与会话状态。
 
-        这里单独暴露真实状态，避免上层仅凭 feature gate 误判“工具注册了就一定能调”。
+        这里单独暴露真实状态，避免上层仅凭工具注册状态误判“工具注册了就一定能调”。
         """
-        process_state = int(GET_PROCESS_STATE())
-        current_thread = int(GET_CURRENT_THREAD())
-        return {
-            "backend_available": True,
-            "session_active": process_state != -1,
-            "process_state": process_state,
-            "current_thread": current_thread if current_thread not in (-1, BADADDR) else None,
-        }
+        return self._debug_state_snapshot()
 
     def _string_index_quality(self) -> str:
         """返回字符串索引质量的非阻塞声明。"""
@@ -3282,86 +2758,6 @@ class IdaCore:
             return first
         return None
 
-    def _microcode_blocks(self, mba: object, *, max_instructions: int) -> list[JsonObject]:
-        """把 mba_t 收窄为块与指令摘要。"""
-        qty_value = getattr(mba, "qty", 0)
-        qty = int(qty_value) if isinstance(qty_value, int) else 0
-        get_mblock = getattr(mba, "get_mblock", None)
-        if not callable(get_mblock):
-            return []
-        blocks: list[JsonObject] = []
-        remaining = max(1, max_instructions)
-        for index in range(qty):
-            block = get_mblock(index)
-            if block is None:
-                continue
-            instructions: list[JsonObject] = []
-            current = getattr(block, "head", None)
-            while current is not None and remaining > 0:
-                instruction_ea = self._runtime_attr_int(current, ("ea",))
-                opcode_value = self._runtime_attr_int(current, ("opcode",))
-                instructions.append(
-                    {
-                        "addr": hex(instruction_ea) if instruction_ea is not None and instruction_ea != BADADDR else "",
-                        "opcode": self._micro_opcode_name(opcode_value),
-                        "defs": self._micro_operand_text(getattr(current, "d", None)),
-                        "uses": [
-                            item
-                            for item in (
-                                self._micro_operand_text(getattr(current, "l", None)),
-                                self._micro_operand_text(getattr(current, "r", None)),
-                            )
-                            if item
-                        ],
-                        "text": self._micro_insn_text(current),
-                    }
-                )
-                remaining -= 1
-                current = getattr(current, "next", None)
-            serial = self._runtime_attr_int(block, ("serial",))
-            start = self._runtime_attr_int(block, ("start",))
-            end = self._runtime_attr_int(block, ("end",))
-            blocks.append(
-                self._json_object(
-                    {
-                        "serial": serial if serial is not None else index,
-                        "start": hex(start) if start is not None and start != BADADDR else "",
-                        "end": hex(end) if end is not None and end != BADADDR else "",
-                        "instruction_count": len(instructions),
-                        "instructions": instructions,
-                    }
-                )
-            )
-            if remaining <= 0:
-                break
-        return blocks
-
-    @staticmethod
-    def _micro_opcode_name(opcode: int | None) -> str:
-        """把 microcode opcode 转为尽量可读的名字。"""
-        if opcode is None:
-            return ""
-        return str(opcode)
-
-    @staticmethod
-    def _micro_operand_text(operand: object | None) -> str:
-        """把 microcode 操作数转为短文本。"""
-        if operand is None:
-            return ""
-        text = str(operand).strip()
-        if text.startswith("<") and text.endswith(">"):
-            return ""
-        return text
-
-    @staticmethod
-    def _micro_insn_text(instruction: object) -> str:
-        """把 microcode 指令转为短文本。"""
-        dstr = getattr(instruction, "dstr", None)
-        if callable(dstr):
-            rendered = dstr()
-            return str(rendered).strip()
-        return str(instruction).strip()
-
     def xref_type_name(self, value: int) -> str:
         """把 xref 常量转换为可读名字。"""
         mapping = {
@@ -3418,7 +2814,7 @@ class IdaCore:
         return int(getattr(value, name))
 
     def _json_int_or_default(self, value: JsonValue | None, default: int = 0) -> int:
-        """把 JSON 数值安全收窄为整数。"""
+        """把 JSON 数值可靠收窄为整数。"""
         if isinstance(value, bool):
             return default
         if isinstance(value, int):
@@ -3907,63 +3303,6 @@ class IdaCore:
                 return type_info
 
         raise ValueError(f"无法解析类型：{type_text}")
-
-    def _managed_support_matrix(self) -> JsonObject:
-        """返回托管能力矩阵。"""
-        analysis_domain = self.get_analysis_domain()
-        if analysis_domain != "managed":
-            return self._json_object({
-                "available": False,
-                "type_catalog": "native_only",
-                "decompiler": "native_only",
-                "notes": ["当前样本不是托管/.NET 程序"],
-            })
-        return self._json_object({
-            "available": True,
-            "type_catalog": "symbolic_managed_types",
-            "decompiler": "external_csharp" if self.managed_csharp_available() else "il_symbolic_fallback",
-            "notes": [
-                "托管类型目录仍以 IDA 已识别符号和方法签名为主。",
-                "若系统存在 ilspycmd，则 decompile_function 会直接返回高层 C# 结果。",
-            ],
-        })
-
-    def _managed_symbol_parts(self, raw_name: str) -> tuple[str, str, str, str] | None:
-        """从符号名里拆出托管类型路径。
-
-        常见托管名字形态可能是：
-        - `Namespace.Type::Method`
-        - `Namespace.Type.Method`
-        - `Type::Method`
-        """
-        normalized = raw_name.strip()
-        if not normalized:
-            return None
-        normalized = normalized.split("(", 1)[0].strip()
-        normalized = normalized.replace("/", ".")
-
-        owner = ""
-        method_name = ""
-        if "::" in normalized:
-            owner, method_name = normalized.rsplit("::", 1)
-        elif "." in normalized:
-            owner, method_name = normalized.rsplit(".", 1)
-        if not owner or not method_name:
-            return None
-
-        owner = owner.strip(".")
-        method_name = method_name.strip(".")
-        if not owner or not method_name:
-            return None
-
-        if "." in owner:
-            namespace, type_name = owner.rsplit(".", 1)
-        else:
-            namespace = ""
-            type_name = owner
-        if not type_name:
-            return None
-        return namespace, type_name, owner, method_name
 
     def _string_literal_declaration(self, ea: int) -> str | None:
         """如果地址本身是字符串项，则返回对应声明。"""

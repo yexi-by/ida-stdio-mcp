@@ -1,4 +1,4 @@
-"""协议、工具面与门控单元测试。"""
+"""协议、工具面与服务能力单元测试。"""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import cast
 from loguru import logger
 
 from ida_stdio_mcp.config import load_config
-from ida_stdio_mcp.models import JsonObject, JsonValue, ToolSurface
+from ida_stdio_mcp.models import JsonObject, JsonValue
 from ida_stdio_mcp.runtime import HeadlessRuntime
 from ida_stdio_mcp.service import build_service
 from ida_stdio_mcp.stdio_server import ServerIdentity, StdioMcpServer
@@ -34,7 +34,7 @@ EXCLUDED_PROTOCOL_TOOLS = {
     "get_xrefs_to",
     "get_xrefs_to_field",
 }
-SLIM_TOOLS = {
+WORKFLOW_TOOLS = {
     "get_workspace_state",
     "open_target",
     "triage_binary",
@@ -45,6 +45,15 @@ SLIM_TOOLS = {
     "export_report",
     "save_workspace",
     "close_target",
+}
+REMOVED_PUBLIC_TOOLS = {
+    "apply_types",
+    "debug_registers_all_threads",
+    "debug_registers_thread",
+    "debug_general_registers",
+    "debug_general_registers_thread",
+    "debug_named_registers",
+    "debug_named_registers_thread",
 }
 
 
@@ -76,20 +85,18 @@ def schema_properties(tool: JsonObject, *, name: str) -> JsonObject:
 
 
 class ProtocolTests(unittest.TestCase):
-    """覆盖 initialize、tools/list、prompts、resources 与能力门控。"""
+    """覆盖 initialize、tools/list、prompts、resources 与工具面。"""
 
     @staticmethod
     def _repo_root() -> Path:
         """返回仓库根目录。"""
         return Path(__file__).resolve().parents[2]
 
-    def _service(self, *, tool_surface: ToolSurface = "slim", unsafe: bool = False, debugger: bool = False, isolated: bool = False) -> tuple[StdioMcpServer, list[JsonObject]]:
+    def _service(self, *, tool_surface: str = "all", isolated: bool = False) -> tuple[StdioMcpServer, list[JsonObject]]:
         """构造测试服务并返回工具列表。"""
         config = load_config(self._repo_root() / "setting.toml")
         service = build_service(
             HeadlessRuntime(isolated_contexts=isolated),
-            allow_unsafe=unsafe,
-            allow_debugger=debugger,
             tool_surface=tool_surface,
             profile_path=None,
         )
@@ -122,31 +129,60 @@ class ProtocolTests(unittest.TestCase):
             raise AssertionError("资源文本解码后不是对象")
         return cast(JsonObject, payload)
 
-    def test_default_surface_is_slim_workflow_tools(self) -> None:
-        """默认工具面只暴露高层工作流入口。"""
+    def test_default_surface_registers_all_core_capabilities(self) -> None:
+        """默认工具面暴露全部核心能力。"""
         _, tools = self._service()
         tool_names = self._tool_names(tools)
-        self.assertEqual(tool_names, SLIM_TOOLS)
+        self.assertFalse(tool_names & EXCLUDED_PROTOCOL_TOOLS)
+        self.assertGreater(len(tool_names), 40)
+        self.assertTrue(WORKFLOW_TOOLS <= tool_names)
+        self.assertIn("patch_bytes", tool_names)
+        self.assertIn("patch_assembly", tool_names)
+        self.assertIn("patch_diff", tool_names)
+        self.assertIn("patch_history", tool_names)
+        self.assertIn("rollback_patch", tool_names)
+        self.assertIn("scan_dispatchers", tool_names)
+        self.assertIn("run_external_analyzer", tool_names)
+        self.assertIn("import_analysis_artifact", tool_names)
+        self.assertIn("list_analysis_artifacts", tool_names)
+        self.assertIn("correlate_analysis_artifact", tool_names)
+        self.assertIn("evaluate_python", tool_names)
+        self.assertIn("execute_python_file", tool_names)
+        self.assertIn("export_full_analysis", tool_names)
+        self.assertIn("microcode_experiment", tool_names)
+        self.assertIn("debug_start", tool_names)
+        self.assertIn("debug_launch", tool_names)
+        self.assertIn("debug_attach", tool_names)
+        self.assertIn("debug_step", tool_names)
+        self.assertIn("debug_registers", tool_names)
+        self.assertIn("debug_stack", tool_names)
+        self.assertIn("debug_capture_calls", tool_names)
+        self.assertIn("debug_export_timeline", tool_names)
+        self.assertFalse(tool_names & REMOVED_PUBLIC_TOOLS)
+        for tool in tools:
+            self.assertNotIn("featureGate", tool)
+
+    def test_workflow_surface_is_noise_reduction_only(self) -> None:
+        """workflow 工具面只保留高层工作流入口。"""
+        _, tools = self._service(tool_surface="workflow")
+        tool_names = self._tool_names(tools)
+        self.assertEqual(tool_names, WORKFLOW_TOOLS)
         self.assertFalse(tool_names & EXCLUDED_PROTOCOL_TOOLS)
 
-    def test_full_and_expert_surfaces_keep_protocol_boundary(self) -> None:
-        """full/expert 工具面保持当前公开边界。"""
-        _, full_tools = self._service(tool_surface="full", unsafe=True, debugger=True)
-        full_names = self._tool_names(full_tools)
-        self.assertFalse(full_names & EXCLUDED_PROTOCOL_TOOLS)
-        self.assertIn("get_import_at", full_names)
-        self.assertIn("microcode_summary", full_names)
-        self.assertIn("microcode_def_use", full_names)
-        self.assertNotIn("microcode_experiment", full_names)
+    def test_tool_surface_alias_and_invalid_values_do_not_fail_open(self) -> None:
+        """工具面旧别名和非法值不得静默暴露全部工具。"""
+        _, tools = self._service(tool_surface="slim")
+        self.assertEqual(self._tool_names(tools), WORKFLOW_TOOLS)
 
-        _, expert_tools = self._service(tool_surface="expert", unsafe=True, debugger=True)
-        expert_names = self._tool_names(expert_tools)
-        self.assertFalse(expert_names & EXCLUDED_PROTOCOL_TOOLS)
-        self.assertIn("microcode_experiment", expert_names)
+        with self.assertRaises(ValueError):
+            self._service(tool_surface="typo")
+
+        with self.assertRaises(ValueError):
+            self._service(tool_surface="full")
 
     def test_initialize_and_prompts_are_real_capabilities(self) -> None:
         """initialize 声明 prompts 时必须能 list/get。"""
-        server, _ = self._service(tool_surface="full")
+        server, _ = self._service()
         initialize = server.dispatch_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         self.assertIsNotNone(initialize)
         assert initialize is not None
@@ -199,12 +235,13 @@ class ProtocolTests(unittest.TestCase):
 
     def test_tool_schema_is_explicit_and_workflow_entrypoints_have_expected_fields(self) -> None:
         """工具 schema 仍保持显式、稳定、无顶层组合关键字。"""
-        _, tools = self._service(tool_surface="full", unsafe=True, debugger=True)
+        _, tools = self._service()
         by_name = {str(item["name"]): item for item in tools if isinstance(item.get("name"), str)}
         self.assertGreater(len(by_name), 40)
         self.assertFalse(set(by_name) & EXCLUDED_PROTOCOL_TOOLS)
 
         for name, item in by_name.items():
+            self.assertNotIn("featureGate", item, msg=f"{name} 不应包含旧工具面元数据")
             schema = expect_object(item.get("inputSchema"), name=f"{name}.inputSchema")
             self._assert_schema_is_explicit(schema, tool_name=name)
             self.assertIn("inputExample", item, msg=f"{name} 缺少最小输入示例")
@@ -220,11 +257,46 @@ class ProtocolTests(unittest.TestCase):
             {"function_limit", "string_limit", "import_limit_per_category", "include_strings", "session_id"},
         )
         self.assertEqual(set(schema_properties(by_name["get_import_at"], name="get_import_at")), {"addr", "session_id"})
+        self.assertEqual(
+            set(schema_properties(by_name["export_full_analysis"], name="export_full_analysis")),
+            {
+                "function_limit",
+                "string_limit",
+                "global_limit",
+                "import_limit",
+                "type_limit",
+                "struct_limit",
+                "include_decompile",
+                "include_asm",
+                "session_id",
+            },
+        )
         self.assertEqual(set(schema_properties(by_name["microcode_summary"], name="microcode_summary")), {"addr", "query", "max_instructions", "session_id"})
+        self.assertEqual(set(schema_properties(by_name["debug_registers"], name="debug_registers")), {"scope", "thread_id", "names", "group"})
+        self.assertEqual(set(schema_properties(by_name["patch_diff"], name="patch_diff")), {"items", "session_id"})
+        self.assertEqual(set(schema_properties(by_name["patch_history"], name="patch_history")), {"limit", "session_id"})
+        self.assertEqual(set(schema_properties(by_name["rollback_patch"], name="rollback_patch")), {"ids", "session_id"})
+        self.assertEqual(set(schema_properties(by_name["scan_dispatchers"], name="scan_dispatchers")), {"max_functions", "max_candidates", "session_id"})
+        self.assertEqual(set(schema_properties(by_name["run_external_analyzer"], name="run_external_analyzer")), {"name", "input_path", "output_path", "timeout_sec"})
+        self.assertEqual(set(schema_properties(by_name["import_analysis_artifact"], name="import_analysis_artifact")), {"path", "artifact_id"})
+        self.assertEqual(set(schema_properties(by_name["list_analysis_artifacts"], name="list_analysis_artifacts")), set())
+        self.assertEqual(set(schema_properties(by_name["correlate_analysis_artifact"], name="correlate_analysis_artifact")), {"artifact_id", "path", "max_items", "session_id"})
+        self.assertEqual(set(schema_properties(by_name["debug_start"], name="debug_start")), {"path", "args", "cwd"})
+        self.assertEqual(set(schema_properties(by_name["debug_launch"], name="debug_launch")), {"path", "args", "cwd", "use_request"})
+        self.assertEqual(set(schema_properties(by_name["debug_attach"], name="debug_attach")), {"pid", "event_id", "use_request"})
+        self.assertEqual(set(schema_properties(by_name["debug_step"], name="debug_step")), {"action"})
+        self.assertEqual(set(schema_properties(by_name["debug_stack"], name="debug_stack")), {"size"})
+        self.assertEqual(
+            set(schema_properties(by_name["debug_capture_calls"], name="debug_capture_calls")),
+            {"action", "addrs", "include_registers", "stack_bytes", "register_names"},
+        )
+        self.assertEqual(set(schema_properties(by_name["debug_export_timeline"], name="debug_export_timeline")), {"limit", "include_ida_trace", "path"})
+        debug_start_example = expect_object(by_name["debug_start"]["inputExample"], name="debug_start.inputExample")
+        self.assertEqual(set(debug_start_example), {"path", "args", "cwd"})
 
     def test_invalid_arguments_return_machine_fixable_error(self) -> None:
         """底层工具参数错误仍返回统一机器可修复 envelope。"""
-        server, _ = self._service(tool_surface="full")
+        server, _ = self._service()
         response = server.dispatch_message(
             {
                 "jsonrpc": "2.0",
@@ -244,7 +316,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_resource_contract_is_uniform_and_global_resources_do_not_need_session(self) -> None:
         """资源 envelope 保持统一。"""
-        server, _ = self._service(tool_surface="full")
+        server, _ = self._service()
         capability = server.dispatch_message({"jsonrpc": "2.0", "id": 6, "method": "resources/read", "params": {"uri": "ida://capability-matrix"}})
         self.assertIsNotNone(capability)
         assert capability is not None
@@ -261,7 +333,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_isolated_context_schema_uses_v2_names(self) -> None:
         """隔离模式只在会话工具上暴露 context_id。"""
-        _, tools = self._service(tool_surface="full", isolated=True)
+        _, tools = self._service(isolated=True)
         by_name = {str(item["name"]): item for item in tools if isinstance(item.get("name"), str)}
         self.assertTrue(bool(by_name["open_target"]["requiresContext"]))
         self.assertTrue(bool(by_name["get_workspace_state"]["requiresContext"]))
@@ -296,7 +368,7 @@ class ProtocolTests(unittest.TestCase):
 
     def test_tool_and_resource_calls_are_written_to_debug_log(self) -> None:
         """日志测试使用当前工作流工具名。"""
-        server, _ = self._service(tool_surface="full")
+        server, _ = self._service()
         rendered_logs: list[str] = []
         sink_id = logger.add(
             rendered_logs.append,

@@ -10,8 +10,7 @@ JsonObject = dict[str, JsonValue]
 ToolStatus = Literal["ok", "degraded", "unsupported", "error"]
 BinaryKind = Literal["pe", "elf", "macho", "unknown"]
 AnalysisDomain = Literal["native", "managed", "unknown"]
-GateName = Literal["public", "unsafe", "debugger"]
-ToolSurface = Literal["slim", "full", "expert"]
+ToolSurface = Literal["all", "workflow"]
 
 
 class ToolResult(TypedDict):

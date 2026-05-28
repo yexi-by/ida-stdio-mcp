@@ -86,10 +86,10 @@ def build_prompt_registry() -> PromptRegistry:
             PromptSpec(
                 name="triage-native",
                 title="Native 样本开局分析",
-                description="按 slim 工作流完成原生样本开局分析。",
+                description="按 workflow 工具面完成原生样本开局分析。",
                 argument_names=("target_path",),
                 template="""
-请用 ida-stdio-mcp 的 slim 工作流分析原生样本。
+请用 ida-stdio-mcp 的 workflow 工具面分析原生样本。
 
 固定顺序：
 1. 调用 get_workspace_state，确认当前状态。
@@ -102,10 +102,10 @@ def build_prompt_registry() -> PromptRegistry:
             PromptSpec(
                 name="triage-managed",
                 title="托管/.NET 样本开局分析",
-                description="按 slim 工作流优先使用托管类型、字符串与 C# 反编译信息。",
+                description="按 workflow 工具面优先使用托管类型、字符串与 C# 反编译信息。",
                 argument_names=("target_path",),
                 template="""
-请用 ida-stdio-mcp 的 slim 工作流分析托管/.NET 样本。
+请用 ida-stdio-mcp 的 workflow 工具面分析托管/.NET 样本。
 
 固定顺序：
 1. get_workspace_state。
@@ -141,8 +141,8 @@ def build_prompt_registry() -> PromptRegistry:
 
 要求：
 1. 先用 explain_function 读取普通伪代码和调用关系。
-2. 在 full/expert 工具面下读取 microcode_summary 或 microcode_def_use。
-3. 只在同时启用 --tool-surface expert 与 --unsafe 时才尝试实验性 microcode mutation。
+2. 在 all 工具面下读取 microcode_summary 或 microcode_def_use。
+3. 需要局部 microcode 实验时调用 microcode_experiment，并把结果标成 experimental。
 4. export_report 时把 microcode 结论标成线索，不要把实验性结果当成确定事实。
 """,
             ),

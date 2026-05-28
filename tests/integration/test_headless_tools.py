@@ -44,7 +44,7 @@ def expect_optional_object(value: JsonValue, *, name: str) -> JsonObject:
 
 
 class HeadlessToolTests(unittest.TestCase):
-    """覆盖多会话、资源读取与危险工具。"""
+    """覆盖多会话、资源读取与写回工具。"""
 
     @staticmethod
     def _repo_root() -> Path:
@@ -69,10 +69,8 @@ class HeadlessToolTests(unittest.TestCase):
         self.runtime = HeadlessRuntime()
         self.service = build_service(
             self.runtime,
-            allow_unsafe=True,
-            allow_debugger=True,
             profile_path=None,
-            tool_surface="expert",
+            tool_surface="all",
         )
         self.server = StdioMcpServer(
             tools=self.service.tools,
@@ -155,7 +153,7 @@ class HeadlessToolTests(unittest.TestCase):
         close_pe = self._call_tool("close_target", {"session_id": "pe"})
         self.assertEqual(close_pe["status"], "ok")
 
-    def test_core_read_tools_and_unsafe_write_tool(self) -> None:
+    def test_core_read_tools_and_write_tool(self) -> None:
         """验证核心只读工具、字符串缓存和受控脚本输出。"""
         self._call_tool("open_target", {"path": str(self.elf_fixture), "session_id": "elf-main"})
 
@@ -369,17 +367,20 @@ class HeadlessToolTests(unittest.TestCase):
         self.assertIsInstance(proto_functions, list)
 
         full_export = self._call_tool(
-            "export_full_analysis",
+            "export_report",
             {"session_id": "elf-main", "function_limit": 5, "string_limit": 20, "include_asm": False},
         )
         self.assertEqual(full_export["status"], "ok")
         full_export_data = full_export["data"]
         self.assertIsInstance(full_export_data, dict)
         assert isinstance(full_export_data, dict)
-        self.assertEqual(full_export_data.get("bundle_format"), "analysis_report_v2")
-        self.assertIn("summary", full_export_data)
-        self.assertIn("functions", full_export_data)
-        self.assertIn("types", full_export_data)
+        report = full_export_data.get("report")
+        self.assertIsInstance(report, dict)
+        assert isinstance(report, dict)
+        self.assertEqual(report.get("bundle_format"), "analysis_report_v2")
+        self.assertIn("summary", report)
+        self.assertIn("functions", report)
+        self.assertIn("types", report)
 
     def test_extended_type_stack_patch_and_trace_tools(self) -> None:
         """验证类型、栈帧、补丁、追踪和调用图扩展工具。"""
@@ -598,9 +599,9 @@ class HeadlessToolTests(unittest.TestCase):
         )
         self.assertEqual(component["status"], "ok")
 
-    def test_debug_registers_all_threads_without_debuggee_is_cleanly_unsupported(self) -> None:
-        """验证未启动调试目标时线程寄存器工具返回清晰 unsupported。"""
-        result = self._call_tool("debug_registers_all_threads")
+    def test_debug_registers_all_threads_scope_without_debuggee_is_cleanly_unsupported(self) -> None:
+        """验证未启动调试目标时统一寄存器工具返回清晰 unsupported。"""
+        result = self._call_tool("debug_registers", {"scope": "all_threads"})
         self.assertEqual(result["status"], "unsupported")
         result_data = result["data"]
         self.assertIsInstance(result_data, dict)
@@ -646,10 +647,8 @@ class HeadlessToolTests(unittest.TestCase):
         isolated_runtime = HeadlessRuntime(isolated_contexts=True)
         isolated_service = build_service(
             isolated_runtime,
-            allow_unsafe=True,
-            allow_debugger=True,
             profile_path=None,
-            tool_surface="expert",
+            tool_surface="all",
         )
         isolated_server = StdioMcpServer(
             tools=isolated_service.tools,

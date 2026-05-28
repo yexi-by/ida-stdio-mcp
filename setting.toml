@@ -7,10 +7,6 @@ protocol_version = "2025-06-18"
 server_name = "ida-stdio-mcp"
 server_version = "0.2.0"
 default_input_path = ""
-
-[feature_gates]
-allow_unsafe = false
-allow_debugger = false
 isolated_contexts = false
 
 [runtime_workspace]
@@ -22,3 +18,5 @@ default_page_size = 100
 max_page_size = 1000
 max_search_hits = 1000
 max_callgraph_depth = 4
+
+[external_analyzers]

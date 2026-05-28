@@ -43,12 +43,12 @@ class LoggingTests(unittest.TestCase):
                 log_tool_call_started(
                     "open_target",
                     1,
-                    {"path": "D:/samples/sample.exe", "session_id": "sample"},
+                    {"path": "sample-input.exe", "session_id": "sample"},
                 )
                 log_tool_call_finished(
                     "open_target",
                     1,
-                    {"path": "D:/samples/sample.exe", "session_id": "sample"},
+                    {"path": "sample-input.exe", "session_id": "sample"},
                     build_result(status="ok", source="workflow.open_target", data={"session_id": "sample"}),
                     duration_ms=12.345,
                 )
@@ -74,7 +74,7 @@ class LoggingTests(unittest.TestCase):
                 log_tool_call_finished(
                     "open_target",
                     "req-1",
-                    {"path": "D:/missing.exe"},
+                    {"path": "missing-input.exe"},
                     build_result(status="error", source="workflow.open_target", data=None, error=error),
                     duration_ms=20.0,
                 )
