@@ -5,11 +5,14 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from importlib import import_module
+from importlib.util import find_spec
 from pathlib import Path
 from types import ModuleType
 from typing import cast
 
+from .capabilities import CapabilityState
 from .errors import RuntimeNotReadyError
+from .models import JsonObject
 
 MINIMUM_IDA_VERSION = (9, 3, 0)
 
@@ -35,6 +38,7 @@ class IdaRuntimeInfo:
 
 _idapro_module: ModuleType | None = None
 _runtime_info: IdaRuntimeInfo | None = None
+_runtime_probe: CapabilityState | None = None
 
 
 def ensure_ida_environment() -> ModuleType:
@@ -48,14 +52,15 @@ def ensure_ida_environment() -> ModuleType:
     if _idapro_module is not None:
         return _idapro_module
 
-    try:
-        module = import_module("idapro")
-    except ImportError as exc:
-        raise RuntimeNotReadyError(
-            "无法加载 IDA 运行时：请安装/激活 IDA 9.3+ 的 idapro 包，"
-            "或设置 IDADIR 指向有效的 IDA 9.3+ 安装目录"
-        ) from exc
+    state = probe_ida_runtime(refresh=True)
+    if state.status != "available":
+        fixes = "；".join(state.actionable_fix)
+        suffix = f"；修复建议：{fixes}" if fixes else ""
+        raise RuntimeNotReadyError(f"无法加载 IDA 运行时：{state.reason}{suffix}")
 
+    module = _idapro_module
+    if module is None:
+        raise RuntimeNotReadyError("无法加载 IDA 运行时：探测显示可用但未缓存 idapro 模块")
     info = _read_runtime_info(module)
     if info.version < MINIMUM_IDA_VERSION:
         version_text = ".".join(str(item) for item in info.version)
@@ -72,11 +77,129 @@ def get_ida_runtime_info() -> IdaRuntimeInfo:
     return _read_runtime_info(module)
 
 
+def probe_ida_runtime(*, refresh: bool = False) -> CapabilityState:
+    """分层探测 IDA headless runtime。"""
+    global _idapro_module, _runtime_probe
+    if _runtime_probe is not None and not refresh:
+        return _runtime_probe
+    if _idapro_module is not None:
+        try:
+            info = _read_runtime_info(_idapro_module)
+        except RuntimeNotReadyError as exc:
+            _runtime_probe = CapabilityState(
+                name="ida_runtime",
+                status="misconfigured",
+                reason=str(exc),
+                source="cached_idapro",
+                actionable_fix=("确认 IDA 安装完整且版本不低于 9.3。",),
+            )
+            return _runtime_probe
+        _runtime_probe = _available_runtime_state(info)
+        return _runtime_probe
+
+    spec = find_spec("idapro")
+    if spec is None:
+        _runtime_probe = CapabilityState(
+            name="ida_runtime",
+            status="misconfigured",
+            reason="当前 Python 环境找不到 idapro 包。",
+            source="python_import:idapro",
+            actionable_fix=(
+                "使用 IDA 9.3+ 附带的 Python 环境启动服务。",
+                "或安装/激活 Hex-Rays 官方 idapro 包。",
+                "必要时设置 IDADIR 指向有效 IDA 9.3+ 安装目录。",
+            ),
+        )
+        return _runtime_probe
+
+    try:
+        module = import_module("idapro")
+    except ImportError as exc:
+        _runtime_probe = CapabilityState(
+            name="ida_runtime",
+            status="misconfigured",
+            reason=f"idapro 包存在但导入失败：{exc}",
+            source=str(spec.origin or "python_import:idapro"),
+            actionable_fix=(
+                "确认当前 Python 与 IDA 位数/版本匹配。",
+                "确认 IDADIR 指向有效 IDA 9.3+ 安装目录。",
+                "确认 IDA 安装目录内存在 idalib.dll 或对应平台库文件。",
+            ),
+            details={"exception_type": type(exc).__name__},
+        )
+        return _runtime_probe
+    except Exception as exc:
+        _runtime_probe = CapabilityState(
+            name="ida_runtime",
+            status="misconfigured",
+            reason=f"idapro 包存在，但加载 IDA 动态库失败：{exc}",
+            source=str(spec.origin or "python_import:idapro"),
+            actionable_fix=(
+                "设置 IDADIR 指向有效 IDA 9.3+ 安装目录。",
+                "确认安装目录内存在 idalib.dll 或对应平台库文件。",
+                "确认当前进程能读取 IDA 安装目录和许可证相关文件。",
+            ),
+            details={"exception_type": type(exc).__name__},
+        )
+        return _runtime_probe
+
+    try:
+        info = _read_runtime_info(module)
+    except RuntimeNotReadyError as exc:
+        _runtime_probe = CapabilityState(
+            name="ida_runtime",
+            status="misconfigured",
+            reason=str(exc),
+            source=str(spec.origin or "python_import:idapro"),
+            actionable_fix=("确认 IDA 运行时暴露 get_library_version，并且安装完整。",),
+        )
+        return _runtime_probe
+    except Exception as exc:
+        _runtime_probe = CapabilityState(
+            name="ida_runtime",
+            status="misconfigured",
+            reason=f"读取 IDA 运行时信息失败：{exc}",
+            source=str(spec.origin or "python_import:idapro"),
+            actionable_fix=("确认 IDA 运行时安装完整，并查看文件日志中的异常上下文。",),
+            details={"exception_type": type(exc).__name__},
+        )
+        return _runtime_probe
+
+    if info.version < MINIMUM_IDA_VERSION:
+        version_text = ".".join(str(item) for item in info.version)
+        minimum_text = ".".join(str(item) for item in MINIMUM_IDA_VERSION)
+        _runtime_probe = CapabilityState(
+            name="ida_runtime",
+            status="unsupported",
+            reason=f"当前 IDA 版本为 {version_text}，低于项目要求的 {minimum_text}。",
+            source=info.source,
+            actionable_fix=(f"升级到 IDA {minimum_text}+。",),
+            details=cast(JsonObject, info.to_json()),
+        )
+        return _runtime_probe
+
+    _idapro_module = module
+    _runtime_probe = _available_runtime_state(info)
+    return _runtime_probe
+
+
 def reset_ida_runtime_cache_for_tests() -> None:
     """清理运行时缓存，仅供单元测试隔离不同启动路径。"""
-    global _idapro_module, _runtime_info
+    global _idapro_module, _runtime_info, _runtime_probe
     _idapro_module = None
     _runtime_info = None
+    _runtime_probe = None
+
+
+def _available_runtime_state(info: IdaRuntimeInfo) -> CapabilityState:
+    """构造可用运行时状态。"""
+    return CapabilityState(
+        name="ida_runtime",
+        status="available",
+        reason="IDA headless runtime 已加载并满足最低版本要求。",
+        source=info.source,
+        details=cast(JsonObject, info.to_json()),
+    )
 
 
 def _read_runtime_info(module: ModuleType) -> IdaRuntimeInfo:

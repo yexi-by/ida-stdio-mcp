@@ -4,7 +4,7 @@ ida-stdio-mcp 是面向 AI Agent 的 IDA Pro 9.3+ stdio MCP 逆向分析服务�
 
 ## 能力概览
 
-- IDA 9.3+ runtime 校验：启动时使用 `idapro.get_library_version()` 检查版本，低于 9.3 直接失败。
+- IDA 9.3+ runtime 分层诊断：启动可进入诊断模式，`runtime_health` 区分 `idapro` 包缺失、`idalib.dll` 加载失败、`IDADIR` 错误和版本不足。
 - 默认完整工具面：`all` 暴露读、写回、补丁、IDAPython、调试、microcode 等全部已注册能力。
 - 工作流工具面：`workflow` 只展示高层逆向入口，用于降低工具选择成本。
 - 会话级工作 IDB：每个样本使用 `.runtime/sessions/<session_id>/working.i64`，原始样本保持只读输入角色。
@@ -157,9 +157,11 @@ JSON 示例：
 | `all` | 默认完整分析 | 暴露读、写回、补丁、IDAPython、调试、microcode、函数、字符串、导入、xref、类型、结构体、字节、调用图等工具 |
 | `workflow` | 自主逆向主流程 | 只展示高层工作区、打开样本、triage、字符串牵引、函数解释、数据流、报告、保存、关闭 |
 
-工具面只影响 `tools/list` 的展示范围。参数 schema、会话归属、输出大小限制、错误 envelope 和 backend unsupported 仍作为可靠性契约保留。调试与 microcode 能力是否真正可用取决于当前 IDA/Hex-Rays 后端状态。
+工具面只影响 `tools/list` 的展示范围。参数 schema、会话归属、输出大小限制、错误 envelope 和 backend unsupported 仍作为可靠性契约保留。调试与 microcode 能力是否真正可用取决于当前 IDA/Hex-Rays 后端状态；本项目不依赖 IDA GUI，能力可用性通过 `runtime_health`、`get_capability_state` 与 `debug_health` 显式探测。
 
-调试目标可通过 `debug_launch` 传入 `path`、`args` 和 `cwd`，也可用 `debug_attach` 附加已有进程；`debug_start` 保留为启动快捷入口。未显式传入 `cwd` 时，服务使用目标程序所在目录作为启动目录，便于调试依赖相邻资源文件的 PE/游戏客户端样本。运行时验证可组合 `debug_add_breakpoints`、`debug_continue`、`debug_run_to`、`debug_step`、`debug_registers`、`debug_stack`、`debug_read_memory`、`debug_capture_calls` 与 `debug_export_timeline`。
+`open_target` 支持 `loader`、`processor` 与 `plugin_options`，分别映射到 IDA headless 打开参数 `-T`、`-p` 与 `-O`；默认值可在 `setting.toml` 的 `[open_target]` 中配置。
+
+调试目标可通过 `debug_launch` 传入 `path`、`args`、`cwd`、`backend`、`use_request` 和 `wait_for_suspend_ms`，也可用 `debug_attach` 附加已有进程；`debug_start` 保留为启动快捷入口。未显式传入 `cwd` 时，服务使用目标程序所在目录作为启动目录。启动或附加前会调用 IDA 的 headless 调试器加载接口，候选来源依次为工具参数 `backend`、`setting.toml` 的 `[debugger].backend_candidates`、环境变量 `IDA_STDIO_MCP_DEBUGGER`、平台默认 `win32` / `linux` / `mac`。寄存器、栈、内存、栈回溯只在调试进程处于 suspended 状态时执行；否则返回明确 `unsupported` 与下一步诊断。运行时验证可组合 `debug_add_breakpoints`、`debug_continue`、`debug_run_to`、`debug_step`、`debug_registers`、`debug_stack`、`debug_read_memory`、`debug_capture_calls` 与 `debug_export_timeline`。
 
 外部脚本、VM 字节码或封包分析通过配置型 analyzer 接入：在 `setting.toml` 的 `external_analyzers` 中配置命令后，用 `run_external_analyzer` 执行并导入 JSON 输出；已有 JSON 可用 `import_analysis_artifact` 导入，随后用 `correlate_analysis_artifact` 与当前 IDB 的字符串、函数、地址、hash 常量和路径线索关联。`scan_dispatchers` 会做通用 hash/switch/table/indirect-call 候选扫描，不绑定特定游戏引擎或脚本格式。
 

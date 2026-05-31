@@ -5,18 +5,22 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter, time_ns
 from typing import cast
 
+from .capabilities import CapabilityState
 from .config import ExternalAnalyzerConfig
 from .models import JsonObject, JsonValue
 from .runtime_workspace import get_runtime_workspace_paths
 
 ARTIFACT_ENTITY_LIMIT = 2_000
 ARTIFACT_TEXT_LIMIT = 2_000_000
+COMMAND_PLACEHOLDERS = ("{input}", "{input_name}", "{input_dir}", "{output}", "{workspace}")
 
 
 @dataclass(slots=True, frozen=True)
@@ -195,6 +199,91 @@ def _render_command(command: tuple[str, ...], *, input_path: Path, output_path: 
     return rendered
 
 
+def _command_health(command: Sequence[str]) -> JsonObject:
+    """检查外部分析器命令入口是否存在。"""
+    if not command:
+        return {"status": "misconfigured", "reason": "命令为空", "entry": "", "resolved": ""}
+    entry = command[0].strip()
+    if not entry:
+        return {"status": "misconfigured", "reason": "命令入口为空字符串", "entry": "", "resolved": ""}
+    if any(placeholder in entry for placeholder in COMMAND_PLACEHOLDERS):
+        return {"status": "uninitialized", "reason": "命令入口包含运行时占位符，需渲染后检查。", "entry": entry, "resolved": ""}
+    expanded = Path(entry).expanduser()
+    if expanded.is_absolute() or any(separator in entry for separator in ("\\", "/")):
+        if expanded.is_file():
+            return {"status": "available", "reason": "命令入口文件存在", "entry": entry, "resolved": str(expanded.resolve())}
+        return {"status": "misconfigured", "reason": "命令入口文件不存在", "entry": entry, "resolved": str(expanded)}
+    resolved = shutil.which(entry)
+    if resolved:
+        return {"status": "available", "reason": "命令入口可从 PATH 解析", "entry": entry, "resolved": resolved}
+    return {"status": "misconfigured", "reason": "命令入口不在 PATH 中", "entry": entry, "resolved": ""}
+
+
+def external_analyzer_health(analyzers: tuple[ExternalAnalyzerConfig, ...]) -> JsonObject:
+    """返回外部分析器配置的统一能力状态。"""
+    if not analyzers:
+        return CapabilityState(
+            name="external_analyzers",
+            status="unavailable",
+            reason="未配置 external analyzer。",
+            source="setting.toml:external_analyzers",
+            actionable_fix=("在 setting.toml 的 external_analyzers 中配置 name、command 和 timeout_sec。",),
+            details={"configured_count": 0, "analyzers": []},
+        ).to_json()
+
+    rows: list[JsonValue] = []
+    missing: list[str] = []
+    unresolved: list[str] = []
+    for spec in analyzers:
+        command_state = _command_health(spec.command)
+        status_value = command_state.get("status")
+        if status_value == "uninitialized":
+            unresolved.append(spec.name)
+        elif status_value != "available":
+            missing.append(spec.name)
+        rows.append(
+            {
+                "name": spec.name,
+                "status": status_value,
+                "reason": command_state.get("reason"),
+                "command_entry": command_state.get("entry"),
+                "resolved": command_state.get("resolved"),
+                "timeout_sec": spec.timeout_sec,
+            }
+        )
+
+    if missing:
+        missing_values: list[JsonValue] = [item for item in missing]
+        details: JsonObject = {"configured_count": len(analyzers), "misconfigured": missing_values, "analyzers": rows}
+        return CapabilityState(
+            name="external_analyzers",
+            status="misconfigured",
+            reason="部分 external analyzer 命令不可执行。",
+            source="setting.toml:external_analyzers",
+            actionable_fix=("修正缺失命令的绝对路径，或把命令入口加入 PATH。",),
+            details=details,
+        ).to_json()
+    if unresolved:
+        unresolved_values: list[JsonValue] = [item for item in unresolved]
+        details = {"configured_count": len(analyzers), "uninitialized": unresolved_values, "analyzers": rows}
+        return CapabilityState(
+            name="external_analyzers",
+            status="uninitialized",
+            reason="部分 external analyzer 命令入口包含运行时占位符，需执行时渲染后确认。",
+            source="setting.toml:external_analyzers",
+            actionable_fix=("调用 run_external_analyzer，让服务按 input/output/workspace 渲染命令后再检查。",),
+            details=details,
+        ).to_json()
+
+    return CapabilityState(
+        name="external_analyzers",
+        status="available",
+        reason="所有已配置 external analyzer 命令入口均可解析。",
+        source="setting.toml:external_analyzers",
+        details={"configured_count": len(analyzers), "analyzers": rows},
+    ).to_json()
+
+
 def run_external_analyzer(
     analyzers: tuple[ExternalAnalyzerConfig, ...],
     *,
@@ -212,6 +301,19 @@ def run_external_analyzer(
             "data": {"reason": "未配置该外部分析器", "requested": name, "available": sorted(by_name)},
             "warnings": ["请在 setting.toml 的 external_analyzers 中配置命令。"],
         })
+    raw_command_state = _command_health(spec.command)
+    if raw_command_state.get("status") not in {"available", "uninitialized"}:
+        return cast(JsonObject, {
+            "status": "unsupported",
+            "data": {
+                "reason": "外部分析器命令不可执行",
+                "analyzer": name,
+                "capability_status": raw_command_state.get("status"),
+                "command": list(spec.command),
+                "command_health": raw_command_state,
+            },
+            "warnings": [str(raw_command_state.get("reason") or "外部分析器命令不可执行。")],
+        })
     source_path = Path(input_path).expanduser().resolve()
     if not source_path.exists():
         raise FileNotFoundError(f"输入文件不存在：{source_path}")
@@ -219,17 +321,53 @@ def run_external_analyzer(
     output = Path(output_path).expanduser().resolve() if output_path.strip() else workspace / f"{time_ns()}-{_safe_name(name)}-analysis.json"
     output.parent.mkdir(parents=True, exist_ok=True)
     command = _render_command(spec.command, input_path=source_path, output_path=output, workspace=workspace)
+    command_state = _command_health(command)
+    if command_state.get("status") != "available":
+        return cast(JsonObject, {
+            "status": "unsupported",
+            "data": {
+                "reason": "外部分析器命令不可执行",
+                "analyzer": name,
+                "capability_status": command_state.get("status"),
+                "command": command,
+                "command_health": command_state,
+            },
+            "warnings": [str(command_state.get("reason") or "外部分析器命令不可执行。")],
+        })
     started_at = perf_counter()
-    completed = subprocess.run(
-        command,
-        cwd=workspace,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=timeout_sec if timeout_sec is not None else spec.timeout_sec,
-        check=False,
-    )
+    effective_timeout = timeout_sec if timeout_sec is not None else spec.timeout_sec
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=workspace,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=effective_timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        duration_ms = round((perf_counter() - started_at) * 1000.0, 3)
+        stdout_text = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr_text = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        stdout_artifact = _write_bytes_artifact(name=f"{name}-stdout-timeout", suffix="txt", data=stdout_text.encode("utf-8")) if stdout_text else None
+        stderr_artifact = _write_bytes_artifact(name=f"{name}-stderr-timeout", suffix="txt", data=stderr_text.encode("utf-8")) if stderr_text else None
+        return cast(JsonObject, {
+            "status": "error",
+            "data": {
+                "analyzer": name,
+                "input_path": str(source_path),
+                "output_path": str(output),
+                "command": command,
+                "duration_ms": duration_ms,
+                "timeout_sec": effective_timeout,
+                "reason": "timeout",
+                "stdout_artifact": stdout_artifact,
+                "stderr_artifact": stderr_artifact,
+            },
+            "warnings": [f"外部分析器执行超时：{effective_timeout}s"],
+        })
     duration_ms = round((perf_counter() - started_at) * 1000.0, 3)
     stdout_bytes = completed.stdout.encode("utf-8")
     stderr_bytes = completed.stderr.encode("utf-8")
@@ -240,11 +378,14 @@ def run_external_analyzer(
     json_artifact: JsonObject | None = None
     json_source = "none"
     if output.is_file() and output.stat().st_size > 0:
-        imported = import_analysis_artifact(output)
-        record = imported.get("record")
-        if isinstance(record, dict):
-            json_artifact = record
-            json_source = "output_path"
+        try:
+            imported = import_analysis_artifact(output)
+            record = imported.get("record")
+            if isinstance(record, dict):
+                json_artifact = record
+                json_source = "output_path"
+        except json.JSONDecodeError:
+            warnings.append("output_path 不是合法 JSON，未导入 analysis artifact。")
     elif completed.stdout.strip():
         try:
             payload = _json_value(json.loads(completed.stdout))

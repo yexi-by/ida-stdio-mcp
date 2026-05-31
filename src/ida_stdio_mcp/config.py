@@ -45,6 +45,48 @@ class RuntimeWorkspaceConfig:
 
 
 @dataclass(slots=True, frozen=True)
+class IdaRuntimeConfig:
+    """IDA runtime 探测配置。"""
+
+    install_dir: Path | None
+
+
+@dataclass(slots=True, frozen=True)
+class OpenTargetConfig:
+    """headless 打开样本配置。"""
+
+    loader: str
+    processor: str
+    plugin_options: tuple[str, ...]
+
+
+@dataclass(slots=True, frozen=True)
+class DebuggerConfig:
+    """IDA 调试器配置。"""
+
+    backend_candidates: tuple[str, ...]
+    wait_for_suspend_ms: int
+    launch_use_request_default: bool
+    remote_enabled: bool
+
+
+@dataclass(slots=True, frozen=True)
+class HexRaysConfig:
+    """Hex-Rays 能力配置。"""
+
+    enable_experimental_microcode: bool
+
+
+@dataclass(slots=True, frozen=True)
+class ManagedDecompilerConfig:
+    """托管反编译器配置。"""
+
+    enabled: bool
+    command: str
+    timeout_sec: int
+
+
+@dataclass(slots=True, frozen=True)
 class LimitConfig:
     """工具默认限制。"""
 
@@ -70,6 +112,11 @@ class AppConfig:
     logging: LoggingConfig
     server: ServerConfig
     runtime_workspace: RuntimeWorkspaceConfig
+    ida_runtime: IdaRuntimeConfig
+    open_target: OpenTargetConfig
+    debugger: DebuggerConfig
+    hexrays: HexRaysConfig
+    managed_decompiler: ManagedDecompilerConfig
     limits: LimitConfig
     external_analyzers: tuple[ExternalAnalyzerConfig, ...]
     root: Path
@@ -112,6 +159,16 @@ def _as_int(value: TomlValue, *, key: str, default: int) -> int:
     return value
 
 
+def _optional_table(raw: TomlTable, key: str) -> TomlTable:
+    """读取可选 TOML 表；缺失时返回空表。"""
+    value = raw.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ConfigurationError(f"{key} 必须是 TOML 表")
+    return cast(TomlTable, value)
+
+
 def _as_str_tuple(value: TomlValue) -> tuple[str, ...]:
     """把 TOML 字符串数组收窄成字符串元组。"""
     if not isinstance(value, list):
@@ -121,6 +178,21 @@ def _as_str_tuple(value: TomlValue) -> tuple[str, ...]:
         if not isinstance(item, str):
             return ()
         result.append(item)
+    return tuple(result)
+
+
+def _as_str_tuple_strict(value: TomlValue, *, key: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    """读取可选字符串数组；字段存在但类型错误时显式失败。"""
+    if value is None:
+        return default
+    if not isinstance(value, list):
+        raise ConfigurationError(f"{key} 必须是字符串数组")
+    result: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ConfigurationError(f"{key} 必须是字符串数组")
+        if item.strip():
+            result.append(item.strip())
     return tuple(result)
 
 
@@ -143,6 +215,17 @@ def _resolve_path(root: Path, value: TomlValue, *, key: str, default: str) -> Pa
     """把配置中的路径解析为绝对路径。"""
     raw_text = _as_str(value, key=key, default=default).strip()
     path = Path(raw_text) if raw_text else Path(default)
+    if not path.is_absolute():
+        path = root / path
+    return path.resolve()
+
+
+def _resolve_optional_path(root: Path, value: TomlValue, *, key: str) -> Path | None:
+    """解析可选路径；空字符串代表未配置。"""
+    text = _as_str(value, key=key, default="").strip()
+    if not text:
+        return None
+    path = Path(text)
     if not path.is_absolute():
         path = root / path
     return path.resolve()
@@ -186,6 +269,11 @@ def load_config(config_path: Path) -> AppConfig:
     logging_raw = _require_table(raw, "logging")
     server_raw = _require_table(raw, "server")
     runtime_workspace_raw = _require_table(raw, "runtime_workspace")
+    ida_runtime_raw = _optional_table(raw, "ida_runtime")
+    open_target_raw = _optional_table(raw, "open_target")
+    debugger_raw = _optional_table(raw, "debugger")
+    hexrays_raw = _optional_table(raw, "hexrays")
+    managed_decompiler_raw = _optional_table(raw, "managed_decompiler")
     limits_raw = _require_table(raw, "limits")
     _reject_deprecated_keys(server_raw, section="server", keys=("server_version",))
 
@@ -209,6 +297,32 @@ def load_config(config_path: Path) -> AppConfig:
                 key="runtime_workspace.symbol_cache_directory",
                 default=".runtime/symbol-cache",
             ),
+        ),
+        ida_runtime=IdaRuntimeConfig(
+            install_dir=_resolve_optional_path(root, ida_runtime_raw.get("install_dir"), key="ida_runtime.install_dir"),
+        ),
+        open_target=OpenTargetConfig(
+            loader=_as_str(open_target_raw.get("loader"), key="open_target.loader", default="").strip(),
+            processor=_as_str(open_target_raw.get("processor"), key="open_target.processor", default="").strip(),
+            plugin_options=_as_str_tuple_strict(open_target_raw.get("plugin_options"), key="open_target.plugin_options"),
+        ),
+        debugger=DebuggerConfig(
+            backend_candidates=_as_str_tuple_strict(debugger_raw.get("backend_candidates"), key="debugger.backend_candidates"),
+            wait_for_suspend_ms=max(0, _as_int(debugger_raw.get("wait_for_suspend_ms"), key="debugger.wait_for_suspend_ms", default=1500)),
+            launch_use_request_default=_as_bool(debugger_raw.get("launch_use_request_default"), key="debugger.launch_use_request_default", default=True),
+            remote_enabled=_as_bool(debugger_raw.get("remote_enabled"), key="debugger.remote_enabled", default=False),
+        ),
+        hexrays=HexRaysConfig(
+            enable_experimental_microcode=_as_bool(
+                hexrays_raw.get("enable_experimental_microcode"),
+                key="hexrays.enable_experimental_microcode",
+                default=False,
+            ),
+        ),
+        managed_decompiler=ManagedDecompilerConfig(
+            enabled=_as_bool(managed_decompiler_raw.get("enabled"), key="managed_decompiler.enabled", default=True),
+            command=_as_str(managed_decompiler_raw.get("command"), key="managed_decompiler.command", default="").strip(),
+            timeout_sec=max(1, _as_int(managed_decompiler_raw.get("timeout_sec"), key="managed_decompiler.timeout_sec", default=30)),
         ),
         limits=LimitConfig(
             default_page_size=_as_int(limits_raw.get("default_page_size"), key="limits.default_page_size", default=100),

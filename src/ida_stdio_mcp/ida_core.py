@@ -20,6 +20,7 @@ from .core.managed import ManagedCoreMixin
 from .core.microcode import MicrocodeCoreMixin
 from .core.patches import decode_patch_record_bytes, ensure_rollback_matches_current
 from .core.script import ScriptCoreMixin
+from .capabilities import CapabilityState
 from .ida_bootstrap import ensure_ida_environment
 
 ensure_ida_environment()
@@ -685,7 +686,8 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
                     "error": None,
                     "managed_identity": managed_identity,
                 })
-        if self.hexrays_available():
+        hexrays_state = self.hexrays_health()
+        if hexrays_state.get("status") == "available":
             try:
                 cfunc = ida_hexrays.decompile(func.start_ea)
                 cfunc_text = str(cfunc).strip()
@@ -712,6 +714,8 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
                 })
             except Exception as exc:
                 warnings.append(f"Hex-Rays 反编译失败，已降级：{exc}")
+        elif analysis_domain != "managed":
+            warnings.append(f"Hex-Rays 不可用，已降级：{hexrays_state.get('reason') or '未知原因'}")
         representation = "il" if analysis_domain == "managed" else "asm_fallback"
         if representation == "il":
             warnings.append("当前样本属于托管/IL 域，暂未提供真正托管高层反编译，已返回 IL/反汇编级表示")
@@ -2792,10 +2796,44 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
 
     def hexrays_available(self) -> bool:
         """判断 Hex-Rays 是否可用。"""
+        return self.hexrays_health().get("status") == "available"
+
+    def hexrays_health(self) -> JsonObject:
+        """返回 Hex-Rays 插件、license 与当前数据库域的可用性诊断。"""
+        details: JsonObject = {
+            "processor": GET_PROCNAME(),
+            "app_bitness": GET_APP_BITNESS(),
+            "binary_kind": self.get_binary_kind(),
+            "analysis_domain": self.get_analysis_domain(),
+        }
         try:
-            return bool(ida_hexrays.init_hexrays_plugin())
-        except Exception:
-            return False
+            initialized = bool(ida_hexrays.init_hexrays_plugin())
+        except Exception as exc:
+            details["error"] = str(exc)
+            return CapabilityState(
+                name="hexrays",
+                status="unavailable",
+                reason="Hex-Rays 插件初始化异常。",
+                source="ida_hexrays.init_hexrays_plugin",
+                actionable_fix=("在 headless IDA 环境中检查 Hex-Rays 插件、license 与当前处理器架构支持。",),
+                details=details,
+            ).to_json()
+        if initialized:
+            return CapabilityState(
+                name="hexrays",
+                status="available",
+                reason="Hex-Rays 插件已在当前 headless IDA 运行时初始化。",
+                source="ida_hexrays.init_hexrays_plugin",
+                details=details,
+            ).to_json()
+        return CapabilityState(
+            name="hexrays",
+            status="unavailable",
+            reason="Hex-Rays 插件未初始化；可能是 license 不可用、插件缺失或当前架构不支持。",
+            source="ida_hexrays.init_hexrays_plugin",
+            actionable_fix=("确认 IDA headless 运行时可加载 Hex-Rays 插件，且 license 覆盖当前架构；不要依赖 GUI 手动启用。",),
+            details=details,
+        ).to_json()
 
     def jsonify(self, value: object) -> JsonValue:
         """把运行时对象转换成 JSON 值。"""

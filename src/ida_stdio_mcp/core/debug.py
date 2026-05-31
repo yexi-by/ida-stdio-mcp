@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import sys
 from pathlib import Path
-from time import time_ns
+from time import monotonic, sleep, time_ns
 from typing import Callable, Iterable, cast
 
 from ..ida_bootstrap import ensure_ida_environment
@@ -34,6 +36,8 @@ STEP_UNTIL_RET = ida_dbg.step_until_ret
 REQUEST_RUN_TO = cast(Callable[[int], bool], ida_dbg.request_run_to)
 REQUEST_START_PROCESS = cast(Callable[[str, str, str], int], ida_dbg.request_start_process)
 REQUEST_ATTACH_PROCESS = cast(Callable[[int, int], int], ida_dbg.request_attach_process)
+LOAD_DEBUGGER_RAW = getattr(ida_dbg, "load_debugger", None)
+LOAD_DEBUGGER = cast(Callable[[str, bool], bool] | None, LOAD_DEBUGGER_RAW if callable(LOAD_DEBUGGER_RAW) else None)
 RUN_REQUESTS_RAW = getattr(ida_dbg, "run_requests", None)
 RUN_REQUESTS = cast(Callable[[], bool] | None, RUN_REQUESTS_RAW if callable(RUN_REQUESTS_RAW) else None)
 GET_PROCESS_STATE = ida_dbg.get_process_state
@@ -68,6 +72,7 @@ NEW_MODINFO = cast(Callable[[], ida_idd.modinfo_t], ida_idd.modinfo_t)
 DEBUG_TIMELINE_LIMIT = 5_000
 DEBUG_CAPTURE_STACK_BYTES_DEFAULT = 64
 DEBUG_CAPTURE_STACK_BYTES_MAX = 4096
+DEBUGGER_ENV_NAME = "IDA_STDIO_MCP_DEBUGGER"
 _DEBUG_TIMELINE: list[JsonObject] = []
 _DEBUG_CALL_CAPTURE_BY_ADDR: dict[int, JsonObject] = {}
 _debug_sequence = 0
@@ -119,6 +124,42 @@ def _debug_int_result(value: object) -> int:
     return int(str(value), 0)
 
 
+def _split_debugger_candidates(raw: str) -> tuple[str, ...]:
+    """解析用户指定的调试器模块候选。"""
+    candidates: list[str] = []
+    for item in raw.replace(";", ",").split(","):
+        candidate = item.strip()
+        if candidate:
+            candidates.append(candidate)
+    return tuple(candidates)
+
+
+def _local_debugger_candidates(backend: str = "", configured_candidates: tuple[str, ...] = ()) -> tuple[str, tuple[str, ...]]:
+    """返回 headless 本地调试器模块候选与来源。"""
+    if backend.strip():
+        return "tool_arg:backend", _split_debugger_candidates(backend)
+    if configured_candidates:
+        return "setting.toml:debugger.backend_candidates", configured_candidates
+    override = os.environ.get(DEBUGGER_ENV_NAME, "").strip()
+    if override:
+        return f"env:{DEBUGGER_ENV_NAME}", _split_debugger_candidates(override)
+    if sys.platform.startswith("win"):
+        return f"platform:{sys.platform}", ("win32",)
+    if sys.platform.startswith("linux"):
+        return f"platform:{sys.platform}", ("linux",)
+    if sys.platform == "darwin":
+        return f"platform:{sys.platform}", ("mac",)
+    return f"platform:{sys.platform}", ()
+
+
+def _json_string_list(items: tuple[str, ...]) -> list[JsonValue]:
+    """把字符串元组转换成 JSON 数组。"""
+    values: list[JsonValue] = []
+    for item in items:
+        values.append(item)
+    return values
+
+
 def _debug_command_accepted(value: object) -> bool:
     """判断 IDA 调试命令是否被接受；None 代表 void API 已返回。"""
     if value is None:
@@ -128,6 +169,31 @@ def _debug_command_accepted(value: object) -> bool:
     if isinstance(value, int):
         return value != 0
     return bool(value)
+
+
+def _debug_state_name(value: int) -> str:
+    """把 IDA DSTATE 常量转换为稳定名称。"""
+    mapping = {
+        int(getattr(ida_dbg, "DSTATE_NOTASK", -1)): "notask",
+        int(getattr(ida_dbg, "DSTATE_RUN", 0)): "running",
+        int(getattr(ida_dbg, "DSTATE_SUSP", 1)): "suspended",
+    }
+    return mapping.get(value, str(value))
+
+
+def _debug_state_is_suspended(value: int) -> bool:
+    """判断当前调试进程是否处于可读取寄存器/栈的挂起状态。"""
+    return value == int(getattr(ida_dbg, "DSTATE_SUSP", 1))
+
+
+def _debug_state_is_notask(value: int) -> bool:
+    """判断当前调试器是否没有活动任务。"""
+    return value == int(getattr(ida_dbg, "DSTATE_NOTASK", 0))
+
+
+def _debug_state_is_active(value: int) -> bool:
+    """判断当前调试器是否已经关联正在运行或挂起的任务。"""
+    return not _debug_state_is_notask(value)
 
 
 def _debug_register_value(name: str) -> JsonValue | None:
@@ -344,18 +410,193 @@ class DebugCoreMixin:
             _debug_hook = hook
         return {"installed": installed, "already_installed": False}
 
-    def debug_start(self, path: str = "", *, args: str = "", cwd: str = "") -> ToolEnvelope:
-        """启动调试会话。"""
-        return self.debug_launch(path, args=args, cwd=cwd)
+    def _ensure_debug_backend(self, *, backend: str = "", configured_candidates: tuple[str, ...] = ()) -> JsonObject:
+        """在 headless 环境中主动加载本地 IDA 调试器后端。"""
+        if ida_idd.get_dbg():
+            return {
+                "available": True,
+                "attempted": False,
+                "source": "existing",
+                "candidates": [],
+                "attempts": [],
+                "reason": "",
+            }
+        source, candidates = _local_debugger_candidates(backend=backend, configured_candidates=configured_candidates)
+        if LOAD_DEBUGGER is None:
+            return {
+                "available": False,
+                "attempted": False,
+                "source": "missing_api",
+                "candidates": [],
+                "attempts": [],
+                "reason": "当前 IDA Python 运行时未暴露 ida_dbg.load_debugger，无法在 headless 流程内加载调试器后端。",
+            }
+        if not candidates:
+            return {
+                "available": False,
+                "attempted": False,
+                "source": source,
+                "candidates": [],
+                "attempts": [],
+                "reason": f"当前平台 {sys.platform} 没有默认本地调试器模块；可通过 {DEBUGGER_ENV_NAME} 指定模块名。",
+            }
 
-    def debug_launch(self, path: str = "", *, args: str = "", cwd: str = "", use_request: bool = False) -> ToolEnvelope:
+        attempts: list[JsonValue] = []
+        for candidate in candidates:
+            try:
+                loaded = bool(LOAD_DEBUGGER(candidate, False))
+                available = bool(ida_idd.get_dbg())
+                attempt: JsonObject = {
+                    "name": candidate,
+                    "use_remote": False,
+                    "loaded": loaded,
+                    "backend_available": available,
+                }
+                attempts.append(attempt)
+            except Exception as exc:
+                available = bool(ida_idd.get_dbg())
+                attempt = {
+                    "name": candidate,
+                    "use_remote": False,
+                    "loaded": False,
+                    "backend_available": available,
+                    "error": str(exc),
+                }
+                attempts.append(attempt)
+            if available:
+                success_result: JsonObject = {
+                    "available": True,
+                    "attempted": True,
+                    "source": source,
+                    "candidates": _json_string_list(candidates),
+                    "attempts": attempts,
+                    "reason": "",
+                }
+                _append_debug_event("backend_load", success_result)
+                return success_result
+
+        failure_result: JsonObject = {
+            "available": False,
+            "attempted": True,
+            "source": source,
+            "candidates": _json_string_list(candidates),
+            "attempts": attempts,
+            "reason": f"headless 流程已尝试加载本地调试器后端但未成功；可通过 {DEBUGGER_ENV_NAME} 指定 IDA 调试器模块名。",
+        }
+        _append_debug_event("backend_load", failure_result)
+        return failure_result
+
+    def debug_health(self, *, backend: str = "", configured_candidates: tuple[str, ...] = (), load: bool = True) -> ToolEnvelope:
+        """返回调试器后端和进程状态健康检查。"""
+        before = self._debug_state_snapshot()
+        backend_state: JsonObject
+        if load:
+            backend_state = self._ensure_debug_backend(backend=backend, configured_candidates=configured_candidates)
+        else:
+            backend_state = {
+                "available": bool(before.get("backend_available")),
+                "attempted": False,
+                "source": "current_state",
+                "candidates": [],
+                "attempts": [],
+                "reason": "",
+            }
+        after = self._debug_state_snapshot()
+        available = bool(after.get("backend_available"))
+        status = "ok" if available else "unsupported"
+        warnings: list[str] = []
+        if not available:
+            reason = backend_state.get("reason")
+            warnings.append(str(reason) if isinstance(reason, str) and reason else "当前 IDA headless 调试器后端不可用。")
+        return self._json_object(
+            {
+                "status": status,
+                "data": {
+                    "backend_available": available,
+                    "backend": backend_state,
+                    "state_before": before,
+                    "state": after,
+                },
+                "warnings": warnings,
+            }
+        )
+
+    def debug_start(
+        self,
+        path: str = "",
+        *,
+        args: str = "",
+        cwd: str = "",
+        use_request: bool = True,
+        backend: str = "",
+        configured_candidates: tuple[str, ...] = (),
+        wait_for_suspend_ms: int = 1500,
+    ) -> ToolEnvelope:
+        """启动调试会话。"""
+        return self.debug_launch(
+            path,
+            args=args,
+            cwd=cwd,
+            use_request=use_request,
+            backend=backend,
+            configured_candidates=configured_candidates,
+            wait_for_suspend_ms=wait_for_suspend_ms,
+        )
+
+    def debug_launch(
+        self,
+        path: str = "",
+        *,
+        args: str = "",
+        cwd: str = "",
+        use_request: bool = True,
+        backend: str = "",
+        configured_candidates: tuple[str, ...] = (),
+        wait_for_suspend_ms: int = 1500,
+    ) -> ToolEnvelope:
         """启动调试目标。"""
         target = path or (ida_nalt.get_input_file_path() or "")
         if not target:
             return {"status": "unsupported", "data": {"reason": "当前没有可调试目标"}, "warnings": ["请显式提供 path"]}
-        hooks = self._ensure_debug_hooks()
+        state_before_backend_load = self._debug_state_snapshot()
+        backend_state = self._ensure_debug_backend(backend=backend, configured_candidates=configured_candidates)
         start_cwd = self._debug_start_cwd(target, cwd)
         cwd_source = "explicit" if cwd.strip() else "target_parent"
+        if not backend_state.get("available"):
+            state_after_backend_load = self._debug_state_snapshot()
+            warnings = ["当前环境未形成可用调试链路，后续寄存器/栈回溯/内存接口不可继续调用"]
+            backend_reason = backend_state.get("reason")
+            if isinstance(backend_reason, str) and backend_reason:
+                warnings.append(backend_reason)
+            return self._json_object({
+                "status": "unsupported",
+                "data": {
+                    "started": False,
+                    "path": target,
+                    "args": args,
+                    "cwd": start_cwd,
+                    "cwd_source": cwd_source,
+                    "backend_available": False,
+                    "session_active": bool(state_after_backend_load["session_active"]),
+                    "backend": backend_state,
+                    "hooks": {
+                        "installed": False,
+                        "skipped": True,
+                        "reason": "debugger_backend_unavailable",
+                    },
+                    "run_requests": {
+                        "available": RUN_REQUESTS is not None,
+                        "ran": False,
+                        "skipped": True,
+                        "reason": "debugger_backend_unavailable",
+                    },
+                    "state_before_backend_load": state_before_backend_load,
+                    "state_before": state_after_backend_load,
+                    "state": state_after_backend_load,
+                },
+                "warnings": warnings,
+            })
+        hooks = self._ensure_debug_hooks()
         state_before = self._debug_state_snapshot()
         ok = False
         if use_request:
@@ -366,6 +607,9 @@ class DebugCoreMixin:
             request_result = int(bool(START_PROCESS(target, args, start_cwd)))
             run_requests = {"available": RUN_REQUESTS is not None, "ran": False, "skipped": True}
         state = self._debug_state_snapshot()
+        wait_result = self._debug_wait_for_observable_state(wait_for_suspend_ms=wait_for_suspend_ms)
+        if bool(wait_result.get("observed")):
+            state = self._debug_state_snapshot()
         backend_ready = bool(state["backend_available"])
         session_active = bool(state["session_active"])
         _append_debug_event(
@@ -377,9 +621,14 @@ class DebugCoreMixin:
                 "use_request": use_request,
                 "request_result": request_result,
                 "session_active": session_active,
+                "backend": backend_state,
+                "wait_for_suspend": wait_result,
             },
         )
         if ok and backend_ready and session_active:
+            launch_warnings: list[str] = []
+            if not bool(wait_result.get("observed")):
+                launch_warnings.append("目标已启动但未进入 suspended 状态；寄存器、栈、内存和栈回溯读取需先命中断点、异常或单步挂起。")
             return self._json_object({
                 "status": "ok",
                 "data": {
@@ -390,13 +639,20 @@ class DebugCoreMixin:
                     "cwd_source": cwd_source,
                     "backend_available": backend_ready,
                     "session_active": session_active,
+                    "backend": backend_state,
                     "hooks": hooks,
                     "run_requests": run_requests,
+                    "wait_for_suspend": wait_result,
+                    "state_before_backend_load": state_before_backend_load,
                     "state_before": state_before,
                     "state": state,
                 },
-                "warnings": [],
+                "warnings": launch_warnings,
             })
+        warnings = ["当前环境未形成可用调试链路，后续寄存器/栈回溯/内存接口不可继续调用"]
+        backend_reason = backend_state.get("reason")
+        if isinstance(backend_reason, str) and backend_reason:
+            warnings.append(backend_reason)
         return self._json_object({
             "status": "unsupported",
             "data": {
@@ -407,18 +663,66 @@ class DebugCoreMixin:
                 "cwd_source": cwd_source,
                 "backend_available": backend_ready,
                 "session_active": session_active,
+                "backend": backend_state,
                 "hooks": hooks,
                 "run_requests": run_requests,
+                "wait_for_suspend": wait_result,
+                "state_before_backend_load": state_before_backend_load,
                 "state_before": state_before,
                 "state": state,
             },
-            "warnings": ["当前环境未形成可用调试链路，后续寄存器/栈回溯/内存接口不可继续调用"],
+            "warnings": warnings,
         })
 
-    def debug_attach(self, pid: int, *, event_id: int = -1, use_request: bool = False) -> ToolEnvelope:
+    def debug_attach(
+        self,
+        pid: int,
+        *,
+        event_id: int = -1,
+        use_request: bool = True,
+        backend: str = "",
+        configured_candidates: tuple[str, ...] = (),
+        wait_for_suspend_ms: int = 1500,
+    ) -> ToolEnvelope:
         """附加到正在运行的进程。"""
         if pid <= 0:
             raise ValueError("pid 必须是正整数")
+        state_before_backend_load = self._debug_state_snapshot()
+        backend_state = self._ensure_debug_backend(backend=backend, configured_candidates=configured_candidates)
+        if not backend_state.get("available"):
+            state_after_backend_load = self._debug_state_snapshot()
+            warnings = ["当前 IDA 调试后端未能附加到目标进程。"]
+            backend_reason = backend_state.get("reason")
+            if isinstance(backend_reason, str) and backend_reason:
+                warnings.append(backend_reason)
+            return self._json_object(
+                {
+                    "status": "unsupported",
+                    "data": {
+                        "pid": pid,
+                        "event_id": event_id,
+                        "attached": False,
+                        "attach_result": 0,
+                        "backend_available": False,
+                        "backend": backend_state,
+                        "hooks": {
+                            "installed": False,
+                            "skipped": True,
+                            "reason": "debugger_backend_unavailable",
+                        },
+                        "run_requests": {
+                            "available": RUN_REQUESTS is not None,
+                            "ran": False,
+                            "skipped": True,
+                            "reason": "debugger_backend_unavailable",
+                        },
+                        "state_before_backend_load": state_before_backend_load,
+                        "state_before": state_after_backend_load,
+                        "state_after": state_after_backend_load,
+                    },
+                    "warnings": warnings,
+                }
+            )
         hooks = self._ensure_debug_hooks()
         state_before = self._debug_state_snapshot()
         if use_request:
@@ -431,6 +735,9 @@ class DebugCoreMixin:
                 attach_result = _debug_int_result(ATTACH_PROCESS(pid))
             run_requests = {"available": RUN_REQUESTS is not None, "ran": False, "skipped": True}
         state_after = self._debug_state_snapshot()
+        wait_result = self._debug_wait_for_observable_state(wait_for_suspend_ms=wait_for_suspend_ms)
+        if bool(wait_result.get("observed")):
+            state_after = self._debug_state_snapshot()
         session_active = bool(state_after["session_active"])
         _append_debug_event(
             "attach",
@@ -440,12 +747,20 @@ class DebugCoreMixin:
                 "use_request": use_request,
                 "attach_result": attach_result,
                 "session_active": session_active,
+                "backend": backend_state,
+                "wait_for_suspend": wait_result,
             },
         )
-        status = "ok" if session_active or attach_result == 1 else "unsupported"
+        backend_ready = bool(state_after["backend_available"])
+        status = "ok" if backend_ready and (session_active or attach_result == 1) else "unsupported"
         warnings: list[str] = []
         if status != "ok":
             warnings.append("当前 IDA 调试后端未能附加到目标进程。")
+            backend_reason = backend_state.get("reason")
+            if isinstance(backend_reason, str) and backend_reason:
+                warnings.append(backend_reason)
+        elif not bool(wait_result.get("observed")):
+            warnings.append("目标已附加但未进入 suspended 状态；寄存器、栈、内存和栈回溯读取需先命中断点、异常或单步挂起。")
         return self._json_object(
             {
                 "status": status,
@@ -454,8 +769,12 @@ class DebugCoreMixin:
                     "event_id": event_id,
                     "attached": status == "ok",
                     "attach_result": attach_result,
+                    "backend_available": backend_ready,
+                    "backend": backend_state,
                     "hooks": hooks,
                     "run_requests": run_requests,
+                    "wait_for_suspend": wait_result,
+                    "state_before_backend_load": state_before_backend_load,
                     "state_before": state_before,
                     "state_after": state_after,
                 },
@@ -465,7 +784,7 @@ class DebugCoreMixin:
 
     def debug_exit(self) -> ToolEnvelope:
         """退出调试。"""
-        if GET_PROCESS_STATE() == -1:
+        if _debug_state_is_notask(int(GET_PROCESS_STATE())):
             return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
         result = EXIT_PROCESS()
         accepted = _debug_command_accepted(result)
@@ -482,7 +801,7 @@ class DebugCoreMixin:
 
     def debug_continue(self) -> ToolEnvelope:
         """继续执行。"""
-        if GET_PROCESS_STATE() == -1:
+        if _debug_state_is_notask(int(GET_PROCESS_STATE())):
             return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
         result = CONTINUE_PROCESS()
         accepted = _debug_command_accepted(result)
@@ -580,8 +899,9 @@ class DebugCoreMixin:
 
     def debug_step(self, *, action: str = "into") -> ToolEnvelope:
         """执行单步动作。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        unavailable = self._debug_unavailable_result(require_suspended=True)
+        if unavailable is not None:
+            return unavailable
         if action == "into":
             ok = bool(STEP_INTO())
         elif action == "over":
@@ -617,7 +937,8 @@ class DebugCoreMixin:
         current_thread: int | None = None
         thread_count = 0
 
-        if process_state != -1:
+        session_active = _debug_state_is_active(process_state)
+        if session_active:
             try:
                 raw_current_thread = int(GET_CURRENT_THREAD())
                 if raw_current_thread not in (-1, BADADDR):
@@ -632,14 +953,54 @@ class DebugCoreMixin:
 
         snapshot: JsonObject = {
             "backend_available": bool(ida_idd.get_dbg()),
-            "session_active": process_state != -1,
+            "session_active": session_active,
             "process_state": process_state,
+            "process_state_name": _debug_state_name(process_state),
+            "is_suspended": _debug_state_is_suspended(process_state),
             "current_thread": current_thread,
             "thread_count": thread_count,
         }
         if diagnostics:
             snapshot["diagnostics"] = diagnostics
         return snapshot
+
+    def _debug_wait_for_observable_state(self, *, wait_for_suspend_ms: int) -> JsonObject:
+        """等待调试器进入可观测状态。"""
+        bounded_ms = max(0, min(wait_for_suspend_ms, 30_000))
+        started = monotonic()
+        deadline = started + bounded_ms / 1000.0
+        last_state = self._debug_state_snapshot()
+        while bounded_ms > 0 and monotonic() < deadline:
+            raw_state_value = last_state.get("process_state")
+            state_value = raw_state_value if isinstance(raw_state_value, int) and not isinstance(raw_state_value, bool) else int(getattr(ida_dbg, "DSTATE_NOTASK", 0))
+            if _debug_state_is_suspended(state_value):
+                return {"waited_ms": round((monotonic() - started) * 1000.0, 3), "observed": True, "target": "suspended", "state": last_state}
+            sleep(0.05)
+            last_state = self._debug_state_snapshot()
+        raw_state_value = last_state.get("process_state")
+        state_value = raw_state_value if isinstance(raw_state_value, int) and not isinstance(raw_state_value, bool) else int(getattr(ida_dbg, "DSTATE_NOTASK", 0))
+        return {
+            "waited_ms": round((monotonic() - started) * 1000.0, 3),
+            "observed": _debug_state_is_suspended(state_value),
+            "process_active": _debug_state_is_active(state_value),
+            "target": "suspended",
+            "state": last_state,
+        }
+
+    def _debug_unavailable_result(self, *, require_suspended: bool = False) -> ToolEnvelope | None:
+        """统一调试读取类工具的状态门禁。"""
+        state = self._debug_state_snapshot()
+        if not bool(state.get("session_active")):
+            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话", "state": state}, "warnings": ["未附加调试器"]})
+        if require_suspended and not bool(state.get("is_suspended")):
+            return self._json_object(
+                {
+                    "status": "unsupported",
+                    "data": {"reason": "当前调试进程未挂起，无法读取寄存器、栈或同步内存快照。", "state": state},
+                    "warnings": ["请先让目标在断点、异常或单步后进入 suspended 状态。"],
+                }
+            )
+        return None
 
     def _debug_run_pending_requests(self) -> JsonObject:
         """调度 IDA request_* 队列，兼容未暴露 run_requests 的运行时。"""
@@ -773,8 +1134,9 @@ class DebugCoreMixin:
 
     def debug_registers(self, *, thread_id: int | None = None, names: list[str] | None = None) -> JsonObject:
         """读取寄存器。"""
-        if GET_PROCESS_STATE() == -1:
-            raise RuntimeError("当前没有活动调试会话")
+        unavailable = self._debug_unavailable_result(require_suspended=True)
+        if unavailable is not None:
+            return self._json_object(unavailable)
         current_thread = thread_id if thread_id is not None else int(GET_CURRENT_THREAD())
         debugger = ida_idd.get_dbg()
         regvals = self._iter_objects(GET_REG_VALS(current_thread, -1))
@@ -794,8 +1156,9 @@ class DebugCoreMixin:
 
     def debug_register_snapshots(self, *, names: list[str] | None = None) -> ToolEnvelope:
         """读取所有线程的寄存器快照。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        unavailable = self._debug_unavailable_result(require_suspended=True)
+        if unavailable is not None:
+            return unavailable
 
         current_thread = int(GET_CURRENT_THREAD())
         thread_count = int(GET_THREAD_QTY())
@@ -837,8 +1200,9 @@ class DebugCoreMixin:
 
     def debug_stacktrace(self) -> ToolEnvelope:
         """读取当前线程调用栈。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        unavailable = self._debug_unavailable_result(require_suspended=True)
+        if unavailable is not None:
+            return unavailable
 
         thread_id = int(GET_CURRENT_THREAD())
         trace = NEW_CALL_STACK()
@@ -879,8 +1243,9 @@ class DebugCoreMixin:
 
     def debug_read_memory(self, addr: str, size: int) -> ToolEnvelope:
         """读取调试内存。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        unavailable = self._debug_unavailable_result(require_suspended=True)
+        if unavailable is not None:
+            return unavailable
         data = READ_DBG_MEMORY(self.parse_address(addr), size)
         if data is None:
             return self._json_object({"status": "unsupported", "data": {"reason": "读取调试内存失败", "addr": addr}, "warnings": ["read_dbg_memory 返回 None"]})
@@ -888,8 +1253,9 @@ class DebugCoreMixin:
 
     def debug_write_memory(self, addr: str, hex_data: str) -> ToolEnvelope:
         """写入调试内存。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        unavailable = self._debug_unavailable_result(require_suspended=True)
+        if unavailable is not None:
+            return unavailable
         blob = bytes.fromhex(hex_data)
         written = WRITE_DBG_MEMORY(self.parse_address(addr), blob)
         if written != len(blob):
@@ -899,8 +1265,9 @@ class DebugCoreMixin:
 
     def debug_stack(self, *, size: int = 128) -> ToolEnvelope:
         """读取当前线程栈顶内存。"""
-        if GET_PROCESS_STATE() == -1:
-            return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
+        unavailable = self._debug_unavailable_result(require_suspended=True)
+        if unavailable is not None:
+            return unavailable
         bounded_size = max(1, min(size, DEBUG_CAPTURE_STACK_BYTES_MAX))
         stack_pointer = _debug_stack_pointer_value()
         if stack_pointer is None:

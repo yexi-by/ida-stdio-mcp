@@ -7,11 +7,16 @@ from typing import TYPE_CHECKING, cast
 
 from loguru import logger
 
+from .analysis_artifacts import external_analyzer_health
+from .capabilities import CapabilityState, capability_map, dependent_capability
 from .errors import RuntimeNotReadyError, SessionNotFoundError, SessionRequiredError
-from .ida_bootstrap import get_ida_runtime_info
+from .ida_bootstrap import get_ida_runtime_info, probe_ida_runtime
+from .managed_decompiler import configure_managed_decompiler, managed_decompiler_health
 from .models import BinarySummary, JsonObject, JsonValue
+from .open_options import HeadlessOpenOptions
 
 if TYPE_CHECKING:
+    from .config import AppConfig
     from .session_manager import SessionManager
 
 DEFAULT_CONTEXT_ID = "stdio:default"
@@ -20,10 +25,17 @@ DEFAULT_CONTEXT_ID = "stdio:default"
 class HeadlessRuntime:
     """封装 stdio-only 的多会话运行时。"""
 
-    def __init__(self, *, isolated_contexts: bool = False) -> None:
+    def __init__(self, *, isolated_contexts: bool = False, config: AppConfig | None = None) -> None:
         """创建运行时并记录是否启用上下文隔离。"""
         self._manager_instance: SessionManager | None = None
         self._isolated_contexts = isolated_contexts
+        self._config = config
+        if config is not None:
+            configure_managed_decompiler(
+                enabled=config.managed_decompiler.enabled,
+                command=config.managed_decompiler.command,
+                timeout_sec=config.managed_decompiler.timeout_sec,
+            )
 
     @property
     def isolated_contexts(self) -> bool:
@@ -64,6 +76,94 @@ class HeadlessRuntime:
         """返回已校验的 IDA 9.3+ 运行时信息。"""
         return cast(JsonObject, get_ida_runtime_info().to_json())
 
+    def runtime_health(self) -> JsonObject:
+        """返回 IDA runtime 的分层诊断。"""
+        return probe_ida_runtime().to_json()
+
+    def debugger_backend_candidates(self) -> tuple[str, ...]:
+        """返回配置中的调试器后端候选。"""
+        if self._config is None:
+            return ()
+        return self._config.debugger.backend_candidates
+
+    def debugger_wait_for_suspend_ms(self) -> int:
+        """返回调试启动后的默认可观测等待时间。"""
+        if self._config is None:
+            return 1500
+        return self._config.debugger.wait_for_suspend_ms
+
+    def debugger_launch_use_request_default(self) -> bool:
+        """返回 debug_launch 是否默认使用 request 队列。"""
+        if self._config is None:
+            return True
+        return self._config.debugger.launch_use_request_default
+
+    def capability_snapshot(self, *, context_id: str | None = None) -> JsonObject:
+        """返回当前 headless 能力初始化状态。"""
+        resolved_context_id = self._resolve_context_id(context_id)
+        runtime_state = probe_ida_runtime()
+        current_session: JsonValue = None
+        try:
+            current_session = cast(JsonValue, self.current_target(context_id=resolved_context_id))
+        except SessionRequiredError:
+            current_session = None
+
+        open_target_state = dependent_capability(
+            name="open_target",
+            dependency=runtime_state,
+            reason="等待按样本和 headless 参数打开工作 IDB。",
+            source="runtime.open_target",
+        )
+        if runtime_state.status == "available":
+            open_target_state = CapabilityState(
+                name="open_target",
+                status="available",
+                reason="IDA runtime 可用，open_target 可尝试打开样本。",
+                source="runtime.open_target",
+                details={"requires_file": True, "headless_only": True},
+            )
+
+        debug_state = dependent_capability(
+            name="debugger",
+            dependency=runtime_state,
+            reason="等待 debug_health 或 debug_launch 进行调试器后端实时探测。",
+            source="runtime.debugger",
+        )
+        if runtime_state.status == "available":
+            debug_state = CapabilityState(
+                name="debugger",
+                status="uninitialized",
+                reason="等待 debug_health 或 debug_launch 进行调试器后端实时探测。",
+                source="runtime.debugger",
+                actionable_fix=("先调用 debug_health；本机 launch 验证通过后再调用寄存器、栈、内存读取类工具。",),
+                details={
+                    "backend_candidates": [item for item in self.debugger_backend_candidates()],
+                    "wait_for_suspend_ms": self.debugger_wait_for_suspend_ms(),
+                    "launch_use_request_default": self.debugger_launch_use_request_default(),
+                    "remote_enabled": bool(self._config.debugger.remote_enabled) if self._config is not None else False,
+                    "remote_status": "unsupported_unless_configured_and_verified",
+                },
+            )
+        hexrays_state = dependent_capability(
+            name="hexrays",
+            dependency=runtime_state,
+            reason="等待活动 IDB 后探测 Hex-Rays 插件和 license 状态。",
+            source="runtime.hexrays",
+        )
+        managed_state = managed_decompiler_health()
+        analyzer_state = CapabilityState.from_json(
+            external_analyzer_health(self._config.external_analyzers if self._config is not None else ())
+        )
+
+        states = (runtime_state, open_target_state, debug_state, hexrays_state, managed_state, analyzer_state)
+        return cast(JsonObject, {
+            "runtime_ready": runtime_state.status == "available",
+            "headless_only": True,
+            "context_id": resolved_context_id,
+            "current_session": current_session,
+            "capabilities": capability_map(states),
+        })
+
     def workspace_state(self, *, context_id: str | None = None) -> JsonObject:
         """返回面向 AI 工作流的运行时状态摘要。"""
         resolved_context_id = self._resolve_context_id(context_id)
@@ -78,19 +178,17 @@ class HeadlessRuntime:
             recommended_next_tools = ["open_target"]
         else:
             recommended_next_tools = current["recommended_next_tools"]
-        runtime_ready = True
-        ida_runtime: JsonValue
-        try:
-            ida_runtime = self.ida_runtime_info()
-        except RuntimeNotReadyError as exc:
-            runtime_ready = False
-            ida_runtime = {
-                "error": str(exc),
-                "minimum_version": "9.3.0",
-            }
+        capability_snapshot = self.capability_snapshot(context_id=resolved_context_id)
+        runtime_capabilities = capability_snapshot.get("capabilities")
+        runtime_state: JsonValue = None
+        if isinstance(runtime_capabilities, dict):
+            runtime_state = runtime_capabilities.get("ida_runtime")
+        runtime_ready = bool(capability_snapshot.get("runtime_ready"))
+        ida_runtime: JsonValue = runtime_state if runtime_state is not None else self.runtime_health()
         return cast(JsonObject, {
             "runtime_ready": runtime_ready,
             "ida_runtime": ida_runtime,
+            "capabilities": capability_snapshot.get("capabilities", {}),
             "isolated_contexts": self._isolated_contexts,
             "context_id": resolved_context_id,
             "current_session": current,
@@ -111,6 +209,9 @@ class HeadlessRuntime:
         source_path: Path,
         *,
         run_auto_analysis: bool = False,
+        loader: str = "",
+        processor: str = "",
+        plugin_options: tuple[str, ...] | None = None,
         session_id: str | None = None,
         context_id: str | None = None,
     ) -> BinarySummary:
@@ -121,10 +222,17 @@ class HeadlessRuntime:
         大型 UE/Chrome/游戏样本的全库分析应由后续定点工具按需触发。
         """
         resolved_context_id = self._resolve_context_id(context_id)
+        default_options = self._config.open_target if self._config is not None else None
+        effective_options = HeadlessOpenOptions(
+            loader=loader.strip() or (default_options.loader if default_options is not None else ""),
+            processor=processor.strip() or (default_options.processor if default_options is not None else ""),
+            plugin_options=plugin_options if plugin_options is not None else (default_options.plugin_options if default_options is not None else ()),
+        )
         opened_session_id = self._manager.open_target(
             source_path=source_path,
             run_auto_analysis=run_auto_analysis,
             session_id=session_id,
+            open_options=effective_options,
             context_id=resolved_context_id,
             isolated_contexts=self._isolated_contexts,
         )

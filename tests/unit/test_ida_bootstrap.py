@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import unittest
+from importlib.machinery import ModuleSpec
 from types import ModuleType
 from unittest.mock import patch
 
@@ -19,25 +20,42 @@ class IdaBootstrapTests(unittest.TestCase):
 
     def test_missing_ida_runtime_fails_fast(self) -> None:
         """缺少 idapro 时应立即返回可修复错误。"""
-        with patch("ida_stdio_mcp.ida_bootstrap.import_module", side_effect=ImportError("missing")):
+        with patch("ida_stdio_mcp.ida_bootstrap.find_spec", return_value=None):
             with self.assertRaises(RuntimeNotReadyError):
                 ida_bootstrap.ensure_ida_environment()
 
     def test_low_version_fails_fast(self) -> None:
         """低于 9.3 的运行时应立即失败。"""
         module = self._fake_idapro((9, 2, 0))
-        with patch("ida_stdio_mcp.ida_bootstrap.import_module", return_value=module):
+        with (
+            patch("ida_stdio_mcp.ida_bootstrap.find_spec", return_value=ModuleSpec("idapro", loader=None)),
+            patch("ida_stdio_mcp.ida_bootstrap.import_module", return_value=module),
+        ):
             with self.assertRaises(RuntimeNotReadyError):
                 ida_bootstrap.ensure_ida_environment()
 
     def test_valid_93_runtime_is_accepted(self) -> None:
         """9.3+ 运行时可以通过校验。"""
         module = self._fake_idapro((9, 3, 1))
-        with patch("ida_stdio_mcp.ida_bootstrap.import_module", return_value=module):
+        with (
+            patch("ida_stdio_mcp.ida_bootstrap.find_spec", return_value=ModuleSpec("idapro", loader=None)),
+            patch("ida_stdio_mcp.ida_bootstrap.import_module", return_value=module),
+        ):
             loaded = ida_bootstrap.ensure_ida_environment()
             info = ida_bootstrap.get_ida_runtime_info()
         self.assertIs(loaded, module)
         self.assertEqual(info.version, (9, 3, 1))
+
+    def test_runtime_probe_reports_import_failure(self) -> None:
+        """包存在但动态库加载失败时应保留分层诊断。"""
+        with (
+            patch("ida_stdio_mcp.ida_bootstrap.find_spec", return_value=ModuleSpec("idapro", loader=None)),
+            patch("ida_stdio_mcp.ida_bootstrap.import_module", side_effect=RuntimeError("idalib load failed")),
+        ):
+            state = ida_bootstrap.probe_ida_runtime(refresh=True)
+
+        self.assertEqual(state.status, "misconfigured")
+        self.assertIn("idalib load failed", state.reason)
 
     @staticmethod
     def _fake_idapro(version: tuple[int, int, int]) -> ModuleType:

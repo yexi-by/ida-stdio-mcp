@@ -25,6 +25,10 @@ class MicrocodeCoreMixin:
         """由核心类提供 Hex-Rays 可用性判断。"""
         raise NotImplementedError
 
+    def hexrays_health(self) -> JsonObject:
+        """由核心类提供 Hex-Rays 能力状态。"""
+        raise NotImplementedError
+
     def lookup_function(self, query: str) -> JsonObject:
         """由核心类提供函数查询。"""
         raise NotImplementedError
@@ -52,12 +56,13 @@ class MicrocodeCoreMixin:
 
     def microcode_summary(self, query: str, *, max_instructions: int = 80) -> ToolEnvelope:
         """返回只读 microcode 摘要。"""
-        if not self.hexrays_available():
+        hexrays_state = self.hexrays_health()
+        if hexrays_state.get("status") != "available":
             return self._json_object(
                 {
                     "status": "unsupported",
-                    "warnings": ["当前环境不可用 Hex-Rays，无法生成 microcode。"],
-                    "data": None,
+                    "warnings": [f"当前环境不可用 Hex-Rays，无法生成 microcode：{hexrays_state.get('reason') or '未知原因'}"],
+                    "data": {"hexrays": hexrays_state},
                 }
             )
         match = self.lookup_function(query)
@@ -155,12 +160,13 @@ class MicrocodeCoreMixin:
         """执行实验性 microcode mutation。"""
         if action not in {"mark_chains_dirty"}:
             raise ValueError("microcode_experiment 当前仅支持 mark_chains_dirty")
-        if not self.hexrays_available():
+        hexrays_state = self.hexrays_health()
+        if hexrays_state.get("status") != "available":
             return self._json_object(
                 {
                     "status": "unsupported",
-                    "warnings": ["当前环境不可用 Hex-Rays，无法执行 microcode 实验。"],
-                    "data": None,
+                    "warnings": [f"当前环境不可用 Hex-Rays，无法执行 microcode 实验：{hexrays_state.get('reason') or '未知原因'}"],
+                    "data": {"hexrays": hexrays_state},
                 }
             )
         match = self.lookup_function(query)

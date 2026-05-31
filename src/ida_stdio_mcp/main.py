@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 
 from loguru import logger
 
 from .config import load_config
-from .ida_bootstrap import ensure_ida_environment, get_ida_runtime_info
+from .ida_bootstrap import ensure_ida_environment, probe_ida_runtime
 from .logging import configure_logging
+from .managed_decompiler import configure_managed_decompiler
 from .models import ToolSurface
 from .runtime import HeadlessRuntime
 from .runtime_workspace import configure_runtime_workspace
@@ -31,18 +33,28 @@ def main(argv: list[str] | None = None) -> int:
     """启动服务。"""
     args = _parse_args(argv)
     config = load_config(args.config.resolve())
+    if config.ida_runtime.install_dir is not None:
+        os.environ["IDADIR"] = str(config.ida_runtime.install_dir)
+    configure_managed_decompiler(
+        enabled=config.managed_decompiler.enabled,
+        command=config.managed_decompiler.command,
+        timeout_sec=config.managed_decompiler.timeout_sec,
+    )
     log_path = configure_logging(config.logging)
     workspace_paths = configure_runtime_workspace(config.runtime_workspace)
 
     isolated_contexts = config.server.isolated_contexts or args.isolated_contexts
     tool_surface: ToolSurface = args.tool_surface
-    runtime = HeadlessRuntime(isolated_contexts=isolated_contexts)
+    runtime = HeadlessRuntime(isolated_contexts=isolated_contexts, config=config)
 
-    # idapro 必须先于其它 ida_* 模块导入。
-    idapro_module = ensure_ida_environment()
-    enable_console_messages = getattr(idapro_module, "enable_console_messages", None)
-    if callable(enable_console_messages):
-        enable_console_messages(False)
+    runtime_state = probe_ida_runtime()
+    if runtime_state.status == "available":
+        idapro_module = ensure_ida_environment()
+        enable_console_messages = getattr(idapro_module, "enable_console_messages", None)
+        if callable(enable_console_messages):
+            enable_console_messages(False)
+    else:
+        logger.warning("IDA runtime 当前不可用，服务将以诊断模式启动：{}", runtime_state.to_json())
 
     from .service import build_service
 
@@ -52,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
         "启动参数：config={} log_path={} ida_runtime={} isolated_contexts={} tool_surface={} profile={}",
         args.config,
         log_path,
-        get_ida_runtime_info().to_json(),
+        runtime_state.to_json(),
         isolated_contexts,
         tool_surface,
         profile_path,

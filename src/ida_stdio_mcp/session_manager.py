@@ -12,6 +12,7 @@ from time import perf_counter
 from .errors import SessionNotFoundError, SessionRequiredError
 from .ida_bootstrap import ensure_ida_environment
 from .models import BinarySummary, JsonObject, JsonValue
+from .open_options import HeadlessOpenOptions
 from .runtime_workspace import get_runtime_workspace_paths, symbol_cache_scope
 
 ensure_ida_environment()
@@ -39,6 +40,7 @@ class IdaSession:
     persistent_after_save: bool = False
     saved_path: str = ""
     undo_supported: bool = False
+    open_options: HeadlessOpenOptions = field(default_factory=HeadlessOpenOptions)
     last_active_tool: str = ""
     recent_targets: list[str] = field(default_factory=list)
     recommended_next_tools: list[str] = field(default_factory=lambda: ["triage_binary"])
@@ -96,6 +98,7 @@ class SessionManager:
         *,
         run_auto_analysis: bool,
         session_id: str | None,
+        open_options: HeadlessOpenOptions | None = None,
         context_id: str | None = None,
         isolated_contexts: bool = False,
     ) -> str:
@@ -108,6 +111,7 @@ class SessionManager:
         resolved = source_path.resolve()
         if not resolved.exists():
             raise FileNotFoundError(f"样本不存在：{resolved}")
+        effective_open_options = open_options or HeadlessOpenOptions()
 
         with self._lock:
             visible_session_ids: list[str]
@@ -122,7 +126,7 @@ class SessionManager:
                 session = self._sessions.get(existing_id)
                 if session is None:
                     continue
-                if session.source_path == resolved:
+                if session.source_path == resolved and session.open_options == effective_open_options:
                     session.last_accessed = datetime.now()
                     self._activate_session_locked(existing_id)
                     return existing_id
@@ -132,20 +136,30 @@ class SessionManager:
                 raise ValueError(f"会话已存在：{created_id}")
 
             logger.info(
-                "准备创建会话：session_id={} source={} open_mode={}",
+                "准备创建会话：session_id={} source={} open_mode={} headless_args={}",
                 created_id,
                 resolved,
                 "full-auto-analysis" if run_auto_analysis else "light-open",
+                effective_open_options.to_ida_args(),
             )
-            source_open_duration_ms = self._open_database_locked(resolved, run_auto_analysis=run_auto_analysis)
+            source_open_duration_ms = self._open_database_locked(
+                resolved,
+                run_auto_analysis=run_auto_analysis,
+                open_options=effective_open_options,
+            )
             working_idb_path = self._working_idb_path(created_id)
             working_idb_path.parent.mkdir(parents=True, exist_ok=True)
             save_duration_ms = self._save_database_locked(working_idb_path)
             idapro.close_database(False)
-            working_open_duration_ms = self._open_database_locked(working_idb_path, run_auto_analysis=False)
+            working_open_duration_ms = self._open_database_locked(
+                working_idb_path,
+                run_auto_analysis=False,
+                open_options=HeadlessOpenOptions(),
+            )
             metadata = self._build_open_metadata_locked(
                 source_path=resolved,
                 working_idb_path=working_idb_path,
+                open_options=effective_open_options,
                 run_auto_analysis=run_auto_analysis,
                 source_open_duration_ms=source_open_duration_ms,
                 save_duration_ms=save_duration_ms,
@@ -157,6 +171,7 @@ class SessionManager:
                 working_idb_path=working_idb_path,
                 is_analyzing=run_auto_analysis,
                 saved_path=str(working_idb_path),
+                open_options=effective_open_options,
                 metadata=metadata,
             )
             self._sessions[created_id] = session
@@ -313,18 +328,23 @@ class SessionManager:
         session = self._require_session_locked(session_id)
         if not session.working_idb_path.exists():
             raise FileNotFoundError(f"工作 IDB 不存在：{session.working_idb_path}")
-        self._open_database_locked(session.working_idb_path, run_auto_analysis=False)
+        self._open_database_locked(
+            session.working_idb_path,
+            run_auto_analysis=False,
+            open_options=HeadlessOpenOptions(),
+        )
         self._active_session_id = session_id
 
-    def _open_database_locked(self, input_path: Path, *, run_auto_analysis: bool) -> float:
+    def _open_database_locked(self, input_path: Path, *, run_auto_analysis: bool, open_options: HeadlessOpenOptions) -> float:
         """在锁内打开 IDA 数据库并返回耗时毫秒。"""
         if self._active_session_id is not None:
             idapro.close_database(True)
             self._active_session_id = None
         started_at = perf_counter()
-        logger.info("开始打开 IDA 数据库：path={} run_auto_analysis={}", input_path, run_auto_analysis)
+        ida_args = open_options.to_ida_args()
+        logger.info("开始打开 IDA 数据库：path={} run_auto_analysis={} ida_args={}", input_path, run_auto_analysis, ida_args)
         with symbol_cache_scope():
-            if idapro.open_database(str(input_path), run_auto_analysis=run_auto_analysis):
+            if idapro.open_database(str(input_path), run_auto_analysis=run_auto_analysis, args=ida_args or None):
                 sidecars = self._existing_database_sidecars(input_path)
                 sidecar_hint = ""
                 if sidecars:
@@ -356,6 +376,7 @@ class SessionManager:
         *,
         source_path: Path,
         working_idb_path: Path,
+        open_options: HeadlessOpenOptions,
         run_auto_analysis: bool,
         source_open_duration_ms: float,
         save_duration_ms: float,
@@ -369,6 +390,7 @@ class SessionManager:
         sibling_pdb_files: list[JsonValue] = [name for name in self._sibling_pdb_names(source_path)]
         return {
             "open_mode": "full_auto_analysis" if run_auto_analysis else "light_open",
+            "headless_open_options": open_options.to_json(),
             "database_loaded": True,
             "working_idb_ready": working_idb_path.exists(),
             "auto_analysis_waited": run_auto_analysis,

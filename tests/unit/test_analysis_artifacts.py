@@ -9,7 +9,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import cast
 
-from ida_stdio_mcp.analysis_artifacts import import_analysis_artifact, run_external_analyzer
+from ida_stdio_mcp.analysis_artifacts import external_analyzer_health, import_analysis_artifact, run_external_analyzer
 from ida_stdio_mcp.config import ExternalAnalyzerConfig, RuntimeWorkspaceConfig
 from ida_stdio_mcp.core.artifacts import ArtifactCoreMixin
 from ida_stdio_mcp.models import JsonObject, JsonValue
@@ -141,6 +141,122 @@ class AnalysisArtifactTests(unittest.TestCase):
                 self.assertIsInstance(artifact, dict)
                 assert isinstance(artifact, dict)
                 self.assertIsInstance(artifact.get("artifact_id"), str)
+            finally:
+                configure_runtime_workspace(
+                    RuntimeWorkspaceConfig(
+                        directory=previous_paths.directory,
+                        symbol_cache_directory=previous_paths.symbol_cache_directory,
+                    )
+                )
+
+    def test_external_analyzer_placeholder_entry_is_checked_after_render(self) -> None:
+        """命令入口使用占位符时，应在运行时渲染后再检查可执行性。"""
+        previous_paths = get_runtime_workspace_paths()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            try:
+                configure_runtime_workspace(RuntimeWorkspaceConfig(directory=root / "runtime", symbol_cache_directory=root / "symbols"))
+                analyzer = ExternalAnalyzerConfig(
+                    name="placeholder-entry",
+                    command=(
+                        "{input}",
+                        "-c",
+                        "import json, pathlib, sys; pathlib.Path(sys.argv[1]).write_text(json.dumps({'ok': True}), encoding='utf-8')",
+                        "{output}",
+                    ),
+                    timeout_sec=10,
+                )
+
+                state = external_analyzer_health((analyzer,))
+                result = run_external_analyzer((analyzer,), name="placeholder-entry", input_path=sys.executable)
+
+                self.assertEqual(state["status"], "uninitialized")
+                self.assertEqual(result["status"], "ok")
+                data = result.get("data")
+                self.assertIsInstance(data, dict)
+                assert isinstance(data, dict)
+                command = data.get("command")
+                self.assertIsInstance(command, list)
+                assert isinstance(command, list)
+                self.assertEqual(command[0], sys.executable)
+            finally:
+                configure_runtime_workspace(
+                    RuntimeWorkspaceConfig(
+                        directory=previous_paths.directory,
+                        symbol_cache_directory=previous_paths.symbol_cache_directory,
+                    )
+                )
+
+    def test_external_analyzer_health_reports_missing_command(self) -> None:
+        """配置存在但命令不可执行时应进入 misconfigured。"""
+        analyzer = ExternalAnalyzerConfig(
+            name="missing",
+            command=("definitely-missing-external-analyzer-for-test",),
+            timeout_sec=10,
+        )
+
+        state = external_analyzer_health((analyzer,))
+        result = run_external_analyzer((analyzer,), name="missing", input_path="<输入文件>")
+
+        self.assertEqual(state["status"], "misconfigured")
+        self.assertEqual(result["status"], "unsupported")
+        data = result.get("data")
+        self.assertIsInstance(data, dict)
+        assert isinstance(data, dict)
+        self.assertEqual(data.get("capability_status"), "misconfigured")
+
+    def test_external_analyzer_timeout_is_explicit_error(self) -> None:
+        """外部分析器超时应和非 JSON、退出码失败区分开。"""
+        previous_paths = get_runtime_workspace_paths()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            try:
+                configure_runtime_workspace(RuntimeWorkspaceConfig(directory=root / "runtime", symbol_cache_directory=root / "symbols"))
+                input_path = root / "input.bin"
+                input_path.write_bytes(b"sample")
+                analyzer = ExternalAnalyzerConfig(
+                    name="slow",
+                    command=(sys.executable, "-c", "import time; time.sleep(2)"),
+                    timeout_sec=1,
+                )
+
+                result = run_external_analyzer((analyzer,), name="slow", input_path=str(input_path))
+
+                self.assertEqual(result["status"], "error")
+                data = result.get("data")
+                self.assertIsInstance(data, dict)
+                assert isinstance(data, dict)
+                self.assertEqual(data.get("reason"), "timeout")
+            finally:
+                configure_runtime_workspace(
+                    RuntimeWorkspaceConfig(
+                        directory=previous_paths.directory,
+                        symbol_cache_directory=previous_paths.symbol_cache_directory,
+                    )
+                )
+
+    def test_external_analyzer_invalid_json_is_degraded(self) -> None:
+        """产物不是 JSON 时不能假装已导入 artifact。"""
+        previous_paths = get_runtime_workspace_paths()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            try:
+                configure_runtime_workspace(RuntimeWorkspaceConfig(directory=root / "runtime", symbol_cache_directory=root / "symbols"))
+                input_path = root / "input.bin"
+                input_path.write_bytes(b"sample")
+                analyzer = ExternalAnalyzerConfig(
+                    name="bad-json",
+                    command=(sys.executable, "-c", "import sys; print('not json')"),
+                    timeout_sec=10,
+                )
+
+                result = run_external_analyzer((analyzer,), name="bad-json", input_path=str(input_path))
+
+                self.assertEqual(result["status"], "degraded")
+                warnings = result.get("warnings")
+                self.assertIsInstance(warnings, list)
+                assert isinstance(warnings, list)
+                self.assertIn("stdout 不是 JSON，未导入 analysis artifact。", warnings)
             finally:
                 configure_runtime_workspace(
                     RuntimeWorkspaceConfig(

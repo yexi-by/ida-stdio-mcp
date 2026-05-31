@@ -763,6 +763,28 @@ def _management_tools(
         except Exception as exc:
             return management_error_result("get_workspace_state", "workflow.get_workspace_state", exc, session_required=False, requires_context=context_required)
 
+    def runtime_health_handler(_arguments: JsonObject) -> ToolResult:
+        """处理 IDA runtime health 查询。"""
+        try:
+            return build_result(
+                status="ok",
+                source="health.runtime",
+                data=_normalize_tool_data(runtime.runtime_health()),
+            )
+        except Exception as exc:
+            return management_error_result("runtime_health", "health.runtime", exc, session_required=False, requires_context=False)
+
+    def get_capability_state_handler(arguments: JsonObject) -> ToolResult:
+        """处理统一能力状态查询。"""
+        try:
+            return build_result(
+                status="ok",
+                source="health.capabilities",
+                data=_normalize_tool_data(runtime.capability_snapshot(context_id=_context_id(arguments))),
+            )
+        except Exception as exc:
+            return management_error_result("get_capability_state", "health.capabilities", exc, session_required=False, requires_context=context_required)
+
     def open_target_handler(arguments: JsonObject) -> ToolResult:
         """处理样本打开请求并返回绑定会话摘要。"""
         try:
@@ -770,6 +792,9 @@ def _management_tools(
             summary = runtime.open_target(
                 Path(raw_path),
                 run_auto_analysis=_bool_or_default(arguments, "run_auto_analysis", False),
+                loader=_string_or_default(arguments, "loader", ""),
+                processor=_string_or_default(arguments, "processor", ""),
+                plugin_options=tuple(_string_list(arguments, "plugin_options")) if "plugin_options" in arguments else None,
                 session_id=_string_or_default(arguments, "session_id", "") or None,
                 context_id=_context_id(arguments),
             )
@@ -962,6 +987,25 @@ def _management_tools(
         input_example={},
     )
     register_management_tool(
+        name="runtime_health",
+        description="读取 IDA headless runtime 分层诊断，区分 idapro 包缺失、IDALIB 动态库加载失败、版本不足和可用状态。",
+        schema=_tool_input_schema(),
+        handler=runtime_health_handler,
+        requires_session=False,
+        requires_context=False,
+        empty_state_behavior="不需要活动会话；用于排查 IDA runtime 初始化。",
+        input_example={},
+    )
+    register_management_tool(
+        name="get_capability_state",
+        description="读取统一能力初始化快照，覆盖 IDA runtime、open_target、debugger、Hex-Rays、managed decompiler 和 external analyzer。",
+        schema=_tool_input_schema(),
+        handler=get_capability_state_handler,
+        requires_session=False,
+        empty_state_behavior="无会话时仍返回 runtime 与待初始化能力状态。",
+        input_example={},
+    )
+    register_management_tool(
         name="open_target",
         description="打开样本：加载原始文件并创建 .runtime/sessions/<session_id>/working.i64 工作库；后续分析、写回和保存都作用于工作 IDB。",
         schema=_tool_input_schema(
@@ -971,6 +1015,12 @@ def _management_tools(
                     "是否在打开后等待全库自动分析完成。默认 false；大型样本保持 false，后续工具按需做定点分析。",
                     default=False,
                 ),
+                "loader": _string_schema("可选。IDA loader 名称；映射为 headless -T 参数。"),
+                "processor": _string_schema("可选。IDA processor 名称；映射为 headless -p 参数。"),
+                "plugin_options": _array_schema(
+                    "可选。IDA 插件选项列表；每项映射为 headless -O<plugin>:<options> 参数。",
+                    _string_schema("单条插件选项，不含 -O 前缀。"),
+                ),
             },
             required=("path",),
             include_session=True,
@@ -978,7 +1028,14 @@ def _management_tools(
         handler=open_target_handler,
         requires_session=False,
         empty_state_behavior="无需现有会话；成功后返回绑定会话和工作 IDB 路径。",
-        input_example={"path": "<输入文件>", "run_auto_analysis": False, "session_id": "sess-001"},
+        input_example={
+            "path": "<输入文件>",
+            "run_auto_analysis": False,
+            "loader": "",
+            "processor": "",
+            "plugin_options": [],
+            "session_id": "sess-001",
+        },
     )
     register_management_tool(
         name="triage_binary",
@@ -2096,6 +2153,18 @@ def _register_artifact_tools(
 
 def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> None:
     """注册 IDA 调试器相关工具。"""
+    def debug_use_request(arguments: JsonObject) -> bool:
+        """读取调试 request 队列策略；未传时使用配置默认值。"""
+        return _bool_or_default(arguments, "use_request", runtime.debugger_launch_use_request_default())
+
+    def debug_wait_ms(arguments: JsonObject) -> int:
+        """读取调试启动/附加后的状态等待时间。"""
+        return _int_or_default(arguments, "wait_for_suspend_ms", runtime.debugger_wait_for_suspend_ms())
+
+    def debug_backend(arguments: JsonObject) -> str:
+        """读取显式调试器后端覆盖。"""
+        return _string_or_default(arguments, "backend", "")
+
     def debug_registers_handler(core: IdaCore, arguments: JsonObject) -> object:
         """按统一入口读取当前线程、指定线程或全部线程寄存器。"""
         names = _string_list(arguments, "names") if isinstance(arguments.get("names"), list) else None
@@ -2116,6 +2185,26 @@ def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> N
 
     _tool(
         registry,
+        name="debug_health",
+        description="检查 headless 调试器后端、加载候选、request 队列和当前进程状态。",
+        source="core.debug_health",
+        runtime=runtime,
+        input_schema=_tool_input_schema(
+            properties={
+                "backend": _string_schema("可选。显式调试器后端模块名；为空时使用配置、环境变量或平台默认值。"),
+                "load": _boolean_schema("是否主动尝试加载调试器后端。", default=True),
+            }
+        ),
+        handler=lambda core, arguments: core.debug_health(
+            backend=debug_backend(arguments),
+            configured_candidates=runtime.debugger_backend_candidates(),
+            load=_bool_or_default(arguments, "load", True),
+        ),
+        input_example={"backend": "", "load": True},
+        session_required=False,
+    )
+    _tool(
+        registry,
         name="debug_start",
         description="启动调试会话。",
         source="core.debug_start",
@@ -2125,14 +2214,21 @@ def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> N
                 "path": _string_schema("可选。要调试的目标程序路径；为空时尝试复用当前输入文件。"),
                 "args": _string_schema("可选。传给调试目标的命令行参数字符串。"),
                 "cwd": _string_schema("可选。调试目标启动目录；为空时使用目标程序所在目录。"),
+                "backend": _string_schema("可选。显式调试器后端模块名；为空时使用配置、环境变量或平台默认值。"),
+                "use_request": _boolean_schema("是否通过 IDA request 队列提交启动请求。默认来自 setting.toml。"),
+                "wait_for_suspend_ms": _integer_schema("启动后等待进入可观测挂起状态的毫秒数。", minimum=0),
             }
         ),
         handler=lambda core, arguments: core.debug_start(
             _string_or_default(arguments, "path", ""),
             args=_string_or_default(arguments, "args", ""),
             cwd=_string_or_default(arguments, "cwd", ""),
+            use_request=debug_use_request(arguments),
+            backend=debug_backend(arguments),
+            configured_candidates=runtime.debugger_backend_candidates(),
+            wait_for_suspend_ms=debug_wait_ms(arguments),
         ),
-        input_example={"path": "<输入文件>", "args": "", "cwd": "<输入目录>"},
+        input_example={"path": "<输入文件>", "args": "", "cwd": "<输入目录>", "backend": "", "use_request": True, "wait_for_suspend_ms": 1500},
         session_required=False,
     )
     _tool(
@@ -2146,16 +2242,21 @@ def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> N
                 "path": _string_schema("可选。要调试的目标程序路径；为空时尝试复用当前输入文件。"),
                 "args": _string_schema("可选。传给调试目标的命令行参数字符串。"),
                 "cwd": _string_schema("可选。调试目标启动目录；为空时使用目标程序所在目录。"),
-                "use_request": _boolean_schema("是否通过 IDA request 队列提交启动请求。", default=False),
+                "backend": _string_schema("可选。显式调试器后端模块名；为空时使用配置、环境变量或平台默认值。"),
+                "use_request": _boolean_schema("是否通过 IDA request 队列提交启动请求。默认来自 setting.toml。"),
+                "wait_for_suspend_ms": _integer_schema("启动后等待进入可观测挂起状态的毫秒数。", minimum=0),
             }
         ),
         handler=lambda core, arguments: core.debug_launch(
             _string_or_default(arguments, "path", ""),
             args=_string_or_default(arguments, "args", ""),
             cwd=_string_or_default(arguments, "cwd", ""),
-            use_request=_bool_or_default(arguments, "use_request", False),
+            use_request=debug_use_request(arguments),
+            backend=debug_backend(arguments),
+            configured_candidates=runtime.debugger_backend_candidates(),
+            wait_for_suspend_ms=debug_wait_ms(arguments),
         ),
-        input_example={"path": "<输入文件>", "args": "", "cwd": "<输入目录>", "use_request": False},
+        input_example={"path": "<输入文件>", "args": "", "cwd": "<输入目录>", "backend": "", "use_request": True, "wait_for_suspend_ms": 1500},
         session_required=False,
     )
     _tool(
@@ -2168,16 +2269,21 @@ def _register_debug_tools(registry: ToolRegistry, runtime: HeadlessRuntime) -> N
             properties={
                 "pid": _integer_schema("目标进程 PID。", minimum=1),
                 "event_id": _integer_schema("IDA attach event_id；默认 -1。"),
-                "use_request": _boolean_schema("是否通过 IDA request 队列提交 attach 请求。", default=False),
+                "backend": _string_schema("可选。显式调试器后端模块名；为空时使用配置、环境变量或平台默认值。"),
+                "use_request": _boolean_schema("是否通过 IDA request 队列提交 attach 请求。默认来自 setting.toml。"),
+                "wait_for_suspend_ms": _integer_schema("附加后等待进入可观测挂起状态的毫秒数。", minimum=0),
             },
             required=("pid",),
         ),
         handler=lambda core, arguments: core.debug_attach(
             _int_or_default(arguments, "pid", 0),
             event_id=_int_or_default(arguments, "event_id", -1),
-            use_request=_bool_or_default(arguments, "use_request", False),
+            use_request=debug_use_request(arguments),
+            backend=debug_backend(arguments),
+            configured_candidates=runtime.debugger_backend_candidates(),
+            wait_for_suspend_ms=debug_wait_ms(arguments),
         ),
-        input_example={"pid": 1234, "event_id": -1, "use_request": False},
+        input_example={"pid": 1234, "event_id": -1, "backend": "", "use_request": True, "wait_for_suspend_ms": 1500},
         session_required=False,
     )
     _tool(

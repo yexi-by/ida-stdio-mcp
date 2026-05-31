@@ -9,6 +9,17 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from .capabilities import CapabilityState
+
+
+@dataclass(slots=True, frozen=True)
+class ManagedDecompilerSettings:
+    """托管反编译器运行配置。"""
+
+    enabled: bool = True
+    command: str = ""
+    timeout_sec: int = 30
+
 
 @dataclass(slots=True, frozen=True)
 class ManagedDecompileResult:
@@ -20,20 +31,88 @@ class ManagedDecompileResult:
     extracted_exact: bool
 
 
+_settings = ManagedDecompilerSettings()
+
+
+def configure_managed_decompiler(*, enabled: bool, command: str, timeout_sec: int) -> None:
+    """配置托管反编译器。"""
+    global _settings
+    _settings = ManagedDecompilerSettings(enabled=enabled, command=command.strip(), timeout_sec=max(1, timeout_sec))
+    _decompile_type_source.cache_clear()
+
+
 def managed_decompiler_command() -> str | None:
     """定位可用的 `ilspycmd` 命令。"""
-    override = os.environ.get("IDA_STDIO_MCP_ILSPYCMD", "").strip()
-    if override:
-        return override
-    discovered = shutil.which("ilspycmd")
-    if discovered:
-        return discovered
-    return None
+    command, _source = _managed_decompiler_command_with_source()
+    return command
 
 
 def managed_decompiler_available() -> bool:
     """判断是否存在可用的托管反编译后端。"""
     return managed_decompiler_command() is not None
+
+
+def managed_decompiler_health() -> CapabilityState:
+    """返回托管反编译器能力状态。"""
+    if not _settings.enabled:
+        return CapabilityState(
+            name="managed_decompiler",
+            status="unavailable",
+            reason="配置已禁用 managed decompiler。",
+            source="setting.toml:managed_decompiler.enabled",
+        )
+    command, source = _managed_decompiler_command_with_source()
+    if command is None:
+        configured = _settings.command.strip()
+        reason = f"未找到托管反编译器命令：{configured}" if configured else "未找到 ilspycmd 托管反编译器。"
+        return CapabilityState(
+            name="managed_decompiler",
+            status="misconfigured",
+            reason=reason,
+            source=source,
+            actionable_fix=(
+                "安装 ilspycmd 并确保命令位于 PATH。",
+                "或在 setting.toml 的 managed_decompiler.command 中配置可执行文件路径。",
+                "或设置 IDA_STDIO_MCP_ILSPYCMD 作为临时覆盖。",
+            ),
+            details={"configured_command": configured, "timeout_sec": _settings.timeout_sec},
+        )
+    return CapabilityState(
+        name="managed_decompiler",
+        status="available",
+        reason="托管反编译器命令可解析。",
+        source=source,
+        details={"command": command, "timeout_sec": _settings.timeout_sec},
+    )
+
+
+def _managed_decompiler_command_with_source() -> tuple[str | None, str]:
+    """按配置、环境变量、PATH 顺序解析 ilspycmd。"""
+    if not _settings.enabled:
+        return None, "setting.toml:managed_decompiler.enabled"
+    override = os.environ.get("IDA_STDIO_MCP_ILSPYCMD", "").strip()
+    if override:
+        resolved = _resolve_command(override)
+        return resolved, "env:IDA_STDIO_MCP_ILSPYCMD"
+    configured = _settings.command.strip()
+    if configured:
+        resolved = _resolve_command(configured)
+        return resolved, "setting.toml:managed_decompiler.command"
+    discovered = shutil.which("ilspycmd")
+    if discovered:
+        return discovered, "PATH:ilspycmd"
+    return None, "PATH:ilspycmd"
+
+
+def _resolve_command(command: str) -> str | None:
+    """解析配置中的命令为可执行路径或可调用命令名。"""
+    path = Path(command)
+    if path.is_absolute() or path.parent != Path("."):
+        return str(path) if path.exists() else None
+    discovered = shutil.which(command)
+    if discovered:
+        return discovered
+    return None
 
 
 @lru_cache(maxsize=128)
@@ -61,7 +140,7 @@ def _decompile_type_source(assembly_path: str, full_type: str) -> tuple[str, str
         encoding="utf-8",
         errors="replace",
         check=False,
-        timeout=30,
+        timeout=_settings.timeout_sec,
     )
     stdout_text = completed.stdout.strip()
     if completed.returncode != 0 or not stdout_text:

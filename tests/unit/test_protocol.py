@@ -307,6 +307,8 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("rollback_patch", tool_names)
         self.assertIn("scan_dispatchers", tool_names)
         self.assertIn("run_external_analyzer", tool_names)
+        self.assertIn("runtime_health", tool_names)
+        self.assertIn("get_capability_state", tool_names)
         self.assertIn("import_analysis_artifact", tool_names)
         self.assertIn("list_analysis_artifacts", tool_names)
         self.assertIn("correlate_analysis_artifact", tool_names)
@@ -315,6 +317,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("export_full_analysis", tool_names)
         self.assertIn("microcode_experiment", tool_names)
         self.assertIn("debug_start", tool_names)
+        self.assertIn("debug_health", tool_names)
         self.assertIn("debug_launch", tool_names)
         self.assertIn("debug_attach", tool_names)
         self.assertIn("debug_step", tool_names)
@@ -410,12 +413,18 @@ class ProtocolTests(unittest.TestCase):
             self._assert_schema_is_explicit(schema, tool_name=name)
             self.assertIn("inputExample", item, msg=f"{name} 缺少最小输入示例")
 
-        self.assertEqual(set(schema_properties(by_name["open_target"], name="open_target")), {"path", "run_auto_analysis", "session_id"})
+        self.assertEqual(
+            set(schema_properties(by_name["open_target"], name="open_target")),
+            {"path", "run_auto_analysis", "loader", "processor", "plugin_options", "session_id"},
+        )
         open_target_properties = schema_properties(by_name["open_target"], name="open_target")
         run_auto_analysis_schema = expect_object(open_target_properties["run_auto_analysis"], name="open_target.run_auto_analysis")
         self.assertIs(run_auto_analysis_schema["default"], False)
         input_example = expect_object(by_name["open_target"]["inputExample"], name="open_target.inputExample")
         self.assertIs(input_example["run_auto_analysis"], False)
+        self.assertEqual(input_example["loader"], "")
+        self.assertEqual(input_example["processor"], "")
+        self.assertEqual(input_example["plugin_options"], [])
         self.assertEqual(
             set(schema_properties(by_name["triage_binary"], name="triage_binary")),
             {"function_limit", "string_limit", "import_limit_per_category", "include_strings", "session_id"},
@@ -445,9 +454,10 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(set(schema_properties(by_name["import_analysis_artifact"], name="import_analysis_artifact")), {"path", "artifact_id"})
         self.assertEqual(set(schema_properties(by_name["list_analysis_artifacts"], name="list_analysis_artifacts")), set())
         self.assertEqual(set(schema_properties(by_name["correlate_analysis_artifact"], name="correlate_analysis_artifact")), {"artifact_id", "path", "max_items", "session_id"})
-        self.assertEqual(set(schema_properties(by_name["debug_start"], name="debug_start")), {"path", "args", "cwd"})
-        self.assertEqual(set(schema_properties(by_name["debug_launch"], name="debug_launch")), {"path", "args", "cwd", "use_request"})
-        self.assertEqual(set(schema_properties(by_name["debug_attach"], name="debug_attach")), {"pid", "event_id", "use_request"})
+        self.assertEqual(set(schema_properties(by_name["debug_health"], name="debug_health")), {"backend", "load"})
+        self.assertEqual(set(schema_properties(by_name["debug_start"], name="debug_start")), {"path", "args", "cwd", "backend", "use_request", "wait_for_suspend_ms"})
+        self.assertEqual(set(schema_properties(by_name["debug_launch"], name="debug_launch")), {"path", "args", "cwd", "backend", "use_request", "wait_for_suspend_ms"})
+        self.assertEqual(set(schema_properties(by_name["debug_attach"], name="debug_attach")), {"pid", "event_id", "backend", "use_request", "wait_for_suspend_ms"})
         self.assertEqual(set(schema_properties(by_name["debug_step"], name="debug_step")), {"action"})
         self.assertEqual(set(schema_properties(by_name["debug_stack"], name="debug_stack")), {"size"})
         self.assertEqual(
@@ -456,7 +466,7 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertEqual(set(schema_properties(by_name["debug_export_timeline"], name="debug_export_timeline")), {"limit", "include_ida_trace", "path"})
         debug_start_example = expect_object(by_name["debug_start"]["inputExample"], name="debug_start.inputExample")
-        self.assertEqual(set(debug_start_example), {"path", "args", "cwd"})
+        self.assertEqual(set(debug_start_example), {"path", "args", "cwd", "backend", "use_request", "wait_for_suspend_ms"})
 
     def test_invalid_arguments_return_machine_fixable_error(self) -> None:
         """底层工具参数错误仍返回统一机器可修复 envelope。"""

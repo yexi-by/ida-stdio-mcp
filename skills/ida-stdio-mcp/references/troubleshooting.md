@@ -80,6 +80,6 @@ UE、Chrome、游戏客户端、大 PDB native 样本可能耗时很长。
 
 - `session_required`：先 `open_target` 或 `get_workspace_state`。
 - `session_not_found`：确认 `session_id` 属于当前上下文。
-- `runtime_not_ready`：检查 IDA 9.3+ runtime、`idapro`、`IDADIR`。
-- `unsupported`：当前环境缺少 Hex-Rays 或调试后端，换静态分析路径。
+- `runtime_not_ready`：先调用 `runtime_health`，按返回的 `reason` 和 `actionable_fix` 检查 `idapro`、`idalib.dll`、`IDADIR`、IDA 版本和安装目录。
+- `unsupported`：当前环境缺少 Hex-Rays、调试后端或目标未处于合法状态。调试场景先调用 `debug_health`，查看 `backend.attempts` 与 `process_state_name`；如默认模块加载失败，优先在 `setting.toml` 的 `[debugger].backend_candidates` 配置模块名，临时覆盖可用 `IDA_STDIO_MCP_DEBUGGER`。仍不可用时换静态分析路径。
 - `degraded`：继续分析，但在报告中写明降级原因。

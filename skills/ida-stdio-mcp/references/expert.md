@@ -67,15 +67,15 @@ mutation：
 
 ## 调试器
 
-调试器工具取决于 IDA 后端和当前样本环境。
+调试器工具取决于 IDA 后端和当前样本环境。项目标准路径是 headless，不能要求用户通过 IDA GUI 选择调试器。
 
 使用顺序：
 
-1. 先看工具是否暴露，并读取 backend 状态。
-2. `debug_launch` 启动目标，或 `debug_attach` 附加已有 PID；`debug_start` 是启动快捷入口。
+1. 先调用 `debug_health` 读取 backend 状态、加载候选、request 队列和 `DSTATE_*` 映射。
+2. `debug_launch` 启动目标，或 `debug_attach` 附加已有 PID；`debug_start` 是启动快捷入口。工具会先尝试通过 `ida_dbg.load_debugger` 加载本地后端，候选来源依次为工具参数 `backend`、`setting.toml`、`IDA_STDIO_MCP_DEBUGGER`、平台默认模块。
 3. 设置断点：`debug_add_breakpoints`、`debug_delete_breakpoints`、`debug_toggle_breakpoints`、`debug_list_breakpoints`。
 4. 运行控制：`debug_continue`、`debug_run_to`、`debug_step`。
-5. 读取运行时状态：`debug_registers`、`debug_stacktrace`、`debug_stack`、`debug_read_memory`。
+5. 读取运行时状态：`debug_registers`、`debug_stacktrace`、`debug_stack`、`debug_read_memory`。这些读取类工具要求目标处于 suspended 状态。
 6. 需要时间线时配置 `debug_capture_calls`，命中后用 `debug_export_timeline` 导出 JSON。
 7. 调试结束后 `debug_exit`。
 
