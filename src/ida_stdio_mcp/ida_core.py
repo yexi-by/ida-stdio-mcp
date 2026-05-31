@@ -404,6 +404,7 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
         segments = self.segments()
         string_index = self.string_index_status()
         interesting_functions: list[JsonObject] = []
+        warnings: list[str] = []
         for item in functions[:15]:
             addr_text = item.get("addr")
             if not isinstance(addr_text, str):
@@ -411,7 +412,8 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
             try:
                 callees = self.get_callees(addr_text)
                 xrefs = self.xrefs_to(addr_text)
-            except Exception:
+            except Exception as exc:
+                warnings.append(f"函数 {addr_text} 的调用关系摘要读取失败：{exc}")
                 callees = []
                 xrefs = []
             interesting_functions.append(
@@ -428,6 +430,8 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
         total_strings: JsonValue = len(strings) if include_strings else None
         string_count_status = "counted" if include_strings else "deferred"
         return self._json_object({
+            "status": "degraded" if warnings else "ok",
+            "warnings": warnings,
             "metadata": self.idb_metadata(),
             "statistics": {
                 "total_functions": len(functions),
@@ -474,6 +478,10 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
                 UE/PDB 数据库在摘要阶段卡进 `ida_strlist.build_strlist`。
         """
         survey = self.binary_survey_snapshot(include_strings=include_strings, string_limit=string_limit)
+        warnings: list[str] = []
+        survey_warnings = survey.get("warnings")
+        if isinstance(survey_warnings, list):
+            warnings.extend(str(item) for item in survey_warnings)
         metadata = self.idb_metadata()
         capabilities = self.capabilities()
         statistics_value = survey.get("statistics")
@@ -495,6 +503,10 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
 
         entrypoints = self.entrypoints()
         interesting_functions = self._interesting_function_rows(limit=function_limit)
+        for row in interesting_functions:
+            row_warnings = row.get("warnings")
+            if isinstance(row_warnings, list):
+                warnings.extend(str(item) for item in row_warnings)
         interesting_strings = self._interesting_string_rows(limit=string_limit) if include_strings else []
         import_summary = self._import_category_summary(limit_per_category=import_limit_per_category)
         recommended_queries = self._recommended_binary_queries(entrypoints, interesting_functions)
@@ -519,6 +531,8 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
             opening_moves.insert(0, "这是 native 样本，优先从入口点、导入分类和关键字符串切入，再决定是否继续看 Hex-Rays 伪代码或汇编。")
 
         return self._json_object({
+            "status": "degraded" if warnings else "ok",
+            "warnings": warnings,
             "summary": summary_text,
             "metadata": metadata,
             "statistics": statistics,
@@ -2106,12 +2120,15 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
                 raise RuntimeError(f"创建枚举失败：{name_text}")
             for member in members:
                 if not isinstance(member, dict):
-                    continue
+                    raise ValueError("upsert_enum 的 members 内部元素必须为对象")
                 member_name = member.get("name")
                 member_value = member.get("value")
-                if isinstance(member_name, str) and isinstance(member_value, int):
-                    idc.add_enum_member(enum_id, member_name, member_value, BADADDR)
-            results.append({"name": name_text})
+                if not isinstance(member_name, str) or isinstance(member_value, bool) or not isinstance(member_value, int):
+                    raise ValueError("upsert_enum 的成员 name 必须为字符串，value 必须为整数")
+                add_result = int(idc.add_enum_member(enum_id, member_name, member_value, BADADDR))
+                if add_result != 0:
+                    raise RuntimeError(f"添加枚举成员失败：{name_text}.{member_name}={member_value} error_code={add_result}")
+            results.append({"name": name_text, "member_count": len(members)})
         return results
 
     def set_types(self, items: list[JsonObject]) -> list[JsonObject]:
@@ -2942,10 +2959,12 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
                 xrefs = self.xrefs_to(addr_value)
                 callees = self.get_callees(addr_value)
                 func_type = self._classify_function(addr_value)
-            except Exception:
+                row_warnings: list[str] = []
+            except Exception as exc:
                 xrefs = []
                 callees = []
                 func_type = "unknown"
+                row_warnings = [f"函数 {addr_value} 的关键度详情读取失败：{exc}"]
 
             score = seed_score + min(len(xrefs), 6) * 2 + min(len(callees), 6)
             if func_type == "complex":
@@ -2966,6 +2985,7 @@ class IdaCore(ScriptCoreMixin, DebugCoreMixin, MicrocodeCoreMixin, ManagedCoreMi
                     "callee_count": len(callees),
                     "type": func_type,
                     "score": score,
+                    "warnings": row_warnings,
                 })
             )
 

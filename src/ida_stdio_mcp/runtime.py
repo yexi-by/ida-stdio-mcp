@@ -212,16 +212,17 @@ class HeadlessRuntime:
         if not save_path:
             raise RuntimeNotReadyError("无法解析当前 IDB 路径")
         ok = bool(ida_loader.save_database(save_path, 0))
-        if ok:
-            self._manager.mark_saved(summary["session_id"], saved_path=save_path)
-            self._manager.record_activity(summary["session_id"], tool_name="save_workspace", target=save_path)
+        if not ok:
+            raise RuntimeError(f"保存工作 IDB 失败：{save_path}")
+        self._manager.mark_saved(summary["session_id"], saved_path=save_path)
+        self._manager.record_activity(summary["session_id"], tool_name="save_workspace", target=save_path)
         refreshed = self.current_target(context_id=context_id)
         return {
-            "ok": ok,
+            "ok": True,
             "path": save_path,
             "source_path": refreshed["source_path"],
             "working_idb_path": refreshed["working_idb_path"],
-            "error": None if ok else "save_database returned false",
+            "error": None,
             "dirty": refreshed["dirty"],
             "writeback_kind": refreshed["writeback_kind"],
             "persistent_after_save": refreshed["persistent_after_save"],

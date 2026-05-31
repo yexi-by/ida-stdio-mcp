@@ -7,6 +7,7 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from typing import cast
+from unittest.mock import patch
 
 from loguru import logger
 
@@ -55,6 +56,169 @@ REMOVED_PUBLIC_TOOLS = {
     "debug_named_registers",
     "debug_named_registers_thread",
 }
+
+
+class _FalseSaveRuntime:
+    """模拟底层保存返回 false 的运行时。"""
+
+    @property
+    def isolated_contexts(self) -> bool:
+        """测试运行时不启用上下文隔离。"""
+        return False
+
+    def save_workspace(self, path: str = "", session_id: str | None = None, *, context_id: str | None = None) -> JsonObject:
+        """模拟旧实现中会被包装成 ok 的保存失败 payload。"""
+        return {
+            "ok": False,
+            "path": path,
+            "session_id": session_id or "",
+            "context_id": context_id or "",
+            "error": "save_database returned false",
+        }
+
+
+class _WorkflowRuntime:
+    """模拟有活动会话的运行时。"""
+
+    def __init__(self) -> None:
+        """初始化会话状态和调用记录。"""
+        self.mark_writeback_calls: list[str] = []
+        self.recorded_activities: list[str] = []
+        self.session: JsonObject = {
+            "session_id": "sess-001",
+            "source_path": "<输入文件>",
+            "working_idb_path": "<工作库>",
+            "filename": "sample.exe",
+            "created_at": "2026-06-01T00:00:00",
+            "last_accessed": "2026-06-01T00:00:00",
+            "is_analyzing": False,
+            "metadata": {},
+            "is_active": True,
+            "is_current_context": True,
+            "bound_contexts": 1,
+            "dirty": False,
+            "writeback_kind": None,
+            "persistent_after_save": False,
+            "saved_path": "<工作库>",
+            "undo_supported": False,
+            "last_active_tool": "",
+            "recent_targets": [],
+            "recommended_next_tools": [],
+        }
+
+    @property
+    def isolated_contexts(self) -> bool:
+        """测试运行时不启用上下文隔离。"""
+        return False
+
+    def activate_for_request(self, session_id: str | None = None, *, context_id: str | None = None) -> JsonObject:
+        """返回当前会话。"""
+        return self.session
+
+    def current_target(self, *, context_id: str | None = None) -> JsonObject:
+        """返回当前会话。"""
+        return self.session
+
+    def mark_writeback(self, *, writeback_kind: str, session_id: str | None = None, context_id: str | None = None) -> JsonObject:
+        """记录写回标记调用。"""
+        self.mark_writeback_calls.append(writeback_kind)
+        self.session["dirty"] = True
+        self.session["writeback_kind"] = writeback_kind
+        return self.session
+
+    def record_activity(self, tool_name: str, *, target: str = "", session_id: str | None = None, context_id: str | None = None) -> None:
+        """记录活动调用。"""
+        self.recorded_activities.append(tool_name)
+
+
+class _DegradedExplainCore:
+    """模拟 explain_function 的降级子结果。"""
+
+    def get_function_profile(self, query: str, *, include_asm: bool = False) -> JsonObject:
+        """返回函数画像。"""
+        return {"addr": "0x401000", "name": query}
+
+    def decompile_function(self, query: str) -> JsonObject:
+        """返回降级反编译结果。"""
+        return {
+            "status": "degraded",
+            "representation": "asm_fallback",
+            "warnings": ["Hex-Rays 不可用，已降级"],
+            "text": "ret",
+        }
+
+    def microcode_summary(self, query: str, *, max_instructions: int = 80) -> JsonObject:
+        """返回不支持的 microcode 结果。"""
+        return {
+            "status": "unsupported",
+            "data": None,
+            "warnings": ["当前环境不可用 Hex-Rays，无法生成 microcode。"],
+        }
+
+
+class _DegradedTriageCore:
+    """模拟 triage_binary 的降级摘要。"""
+
+    @staticmethod
+    def _summary_payload() -> JsonObject:
+        """返回带状态的摘要 payload。"""
+        return {
+            "status": "degraded",
+            "warnings": ["函数 0x401000 的调用关系摘要读取失败：模拟异常"],
+            "summary": "局部摘要可用",
+            "metadata": {},
+            "statistics": {},
+            "capabilities": {},
+            "quality": {},
+            "entrypoints": [],
+            "interesting_functions": [],
+            "interesting_strings": [],
+            "string_index": {},
+            "imports": {},
+            "managed_summary": {},
+            "recommended_queries": [],
+            "recommended_next_tools": [],
+            "opening_moves": [],
+        }
+
+    def binary_survey_snapshot(self, *, include_strings: bool = False, string_limit: int = 0) -> JsonObject:
+        """返回资源读取使用的降级摘要。"""
+        return self._summary_payload()
+
+    def triage_binary_snapshot(
+        self,
+        *,
+        function_limit: int = 12,
+        string_limit: int = 12,
+        import_limit_per_category: int = 6,
+        include_strings: bool = False,
+    ) -> JsonObject:
+        """返回带状态的开局摘要。"""
+        return self._summary_payload()
+
+
+class _InferNoWriteCore:
+    """模拟 infer_types 只读推断结果。"""
+
+    def infer_types(self, items: list[str]) -> list[JsonObject]:
+        """返回未实际写入的推断结果。"""
+        return [
+            {
+                "addr": "0x401000",
+                "inferred_type": "int main(void)",
+                "method": "function_prototype",
+                "confidence": "high",
+                "applied": False,
+            }
+        ]
+
+
+class _EnumMemberFailureCore:
+    """模拟枚举成员写入失败。"""
+
+    def upsert_enum(self, items: list[JsonObject]) -> list[JsonObject]:
+        """抛出核心层枚举成员写入错误。"""
+        raise RuntimeError("添加枚举成员失败：TestEnum.VALUE=1 error_code=1")
 
 
 def expect_object(value: JsonValue, *, name: str) -> JsonObject:
@@ -313,6 +477,97 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(error["code"], "invalid_arguments")
         details = expect_object(error["details"], name="invalid.details")
         self.assertEqual(details["tool"], "get_function")
+
+    def test_save_workspace_false_payload_is_not_reported_as_success(self) -> None:
+        """保存失败 payload 不得被工作流入口包装成成功。"""
+        service = build_service(cast(HeadlessRuntime, _FalseSaveRuntime()), tool_surface="workflow")
+        result = service.tools.call("save_workspace", {})
+
+        self.assertEqual(result["status"], "error")
+        error = expect_object(result["error"], name="save.error")
+        self.assertEqual(error["code"], "tool_execution_failed")
+        self.assertIn("save_database returned false", expect_string(error["message"], name="save.error.message"))
+
+    def test_explain_function_propagates_child_degraded_status(self) -> None:
+        """工作流解释函数不得把内层降级包装成顶层成功。"""
+        runtime = _WorkflowRuntime()
+        service = build_service(cast(HeadlessRuntime, runtime), tool_surface="workflow")
+
+        with patch("ida_stdio_mcp.service._new_core", return_value=_DegradedExplainCore()):
+            result = service.tools.call("explain_function", {"query": "main", "include_microcode": True})
+
+        self.assertEqual(result["status"], "degraded")
+        self.assertIn("Hex-Rays 不可用，已降级", result["warnings"])
+        self.assertIn("当前环境不可用 Hex-Rays，无法生成 microcode。", result["warnings"])
+        data = expect_object(result["data"], name="explain.data")
+        representation = expect_object(data["representation"], name="explain.representation")
+        self.assertEqual(representation["status"], "degraded")
+        microcode = expect_object(data["microcode"], name="explain.microcode")
+        self.assertEqual(microcode["status"], "unsupported")
+
+    def test_triage_binary_propagates_degraded_summary_status(self) -> None:
+        """开局摘要的局部失败不得被工作流入口包装成顶层成功。"""
+        runtime = _WorkflowRuntime()
+        service = build_service(cast(HeadlessRuntime, runtime), tool_surface="workflow")
+
+        with patch("ida_stdio_mcp.service._new_core", return_value=_DegradedTriageCore()):
+            result = service.tools.call("triage_binary", {})
+
+        self.assertEqual(result["status"], "degraded")
+        self.assertIn("函数 0x401000 的调用关系摘要读取失败：模拟异常", result["warnings"])
+        data = expect_object(result["data"], name="triage.data")
+        summary = expect_object(data["summary"], name="triage.summary")
+        self.assertEqual(summary["status"], "degraded")
+
+    def test_statusful_resource_propagates_degraded_status(self) -> None:
+        """资源读取不得把核心层降级结果包装成顶层成功。"""
+        runtime = _WorkflowRuntime()
+        service = build_service(cast(HeadlessRuntime, runtime), tool_surface="workflow")
+
+        with patch("ida_stdio_mcp.service._new_core", return_value=_DegradedTriageCore()):
+            contents, is_error = service.resources.read("ida://triage")
+
+        self.assertFalse(is_error)
+        raw_payload = json.loads(contents[0]["text"])
+        self.assertIsInstance(raw_payload, dict)
+        assert isinstance(raw_payload, dict)
+        payload = cast(JsonObject, raw_payload)
+        self.assertEqual(payload["status"], "degraded")
+        warnings_value = payload.get("warnings")
+        self.assertIsInstance(warnings_value, list)
+        assert isinstance(warnings_value, list)
+        warnings = [str(item) for item in warnings_value]
+        self.assertIn("函数 0x401000 的调用关系摘要读取失败：模拟异常", warnings)
+
+    def test_infer_types_without_applied_write_does_not_mark_session_dirty(self) -> None:
+        """未实际应用类型的 infer_types 结果不得标记会话为 dirty。"""
+        runtime = _WorkflowRuntime()
+        service = build_service(cast(HeadlessRuntime, runtime), tool_surface="all")
+
+        with patch("ida_stdio_mcp.service._new_core", return_value=_InferNoWriteCore()):
+            result = service.tools.call("infer_types", {"items": ["main"]})
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(runtime.mark_writeback_calls, [])
+        data = expect_object(result["data"], name="infer.data")
+        self.assertFalse(bool(data["dirty"]))
+        self.assertIsNone(data["writeback_kind"])
+        rows = expect_list(data["result"], name="infer.result")
+        row = expect_object(rows[0], name="infer.result[0]")
+        self.assertFalse(bool(row["applied"]))
+
+    def test_upsert_enum_member_failure_is_reported_as_error(self) -> None:
+        """枚举成员写入失败不得被报告为成功写回。"""
+        runtime = _WorkflowRuntime()
+        service = build_service(cast(HeadlessRuntime, runtime), tool_surface="all")
+
+        with patch("ida_stdio_mcp.service._new_core", return_value=_EnumMemberFailureCore()):
+            result = service.tools.call("upsert_enum", {"items": [{"name": "TestEnum", "members": [{"name": "VALUE", "value": 1}]}]})
+
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(runtime.mark_writeback_calls, [])
+        error = expect_object(result["error"], name="enum.error")
+        self.assertIn("添加枚举成员失败", expect_string(error["message"], name="enum.error.message"))
 
     def test_resource_contract_is_uniform_and_global_resources_do_not_need_session(self) -> None:
         """资源 envelope 保持统一。"""

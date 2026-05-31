@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import tomllib
 from dataclasses import dataclass
+from importlib.metadata import PackageNotFoundError, version as package_metadata_version
 from pathlib import Path
 from typing import TypeAlias, cast
 
 from .errors import ConfigurationError
+
+_PROJECT_DISTRIBUTION_NAME = "ida-stdio-mcp"
 
 TomlScalar: TypeAlias = str | int | float | bool | None
 TomlValue: TypeAlias = TomlScalar | list["TomlValue"] | dict[str, "TomlValue"]
@@ -72,27 +75,41 @@ class AppConfig:
     root: Path
 
 
-def _as_str(value: TomlValue, *, default: str) -> str:
-    """把 TOML 标量可靠转换成字符串。"""
+def package_version() -> str:
+    """读取项目包元数据中的版本号。"""
+    try:
+        return package_metadata_version(_PROJECT_DISTRIBUTION_NAME)
+    except PackageNotFoundError as exc:
+        raise ConfigurationError(
+            f"无法读取 {_PROJECT_DISTRIBUTION_NAME} 包版本；请通过 uv run 或安装包后启动服务"
+        ) from exc
+
+
+def _as_str(value: TomlValue, *, key: str, default: str) -> str:
+    """读取可选字符串；字段缺失使用默认值，类型错误显式失败。"""
+    if value is None:
+        return default
     if isinstance(value, str):
         return value
-    return default
+    raise ConfigurationError(f"{key} 必须是字符串")
 
 
-def _as_bool(value: TomlValue, *, default: bool) -> bool:
-    """把 TOML 标量可靠转换成布尔值。"""
-    if isinstance(value, bool):
-        return value
-    return default
-
-
-def _as_int(value: TomlValue, *, default: int) -> int:
-    """把 TOML 标量可靠转换成整数。"""
-    if isinstance(value, bool):
+def _as_bool(value: TomlValue, *, key: str, default: bool) -> bool:
+    """读取可选布尔值；字段缺失使用默认值，类型错误显式失败。"""
+    if value is None:
         return default
-    if isinstance(value, int):
+    if isinstance(value, bool):
         return value
-    return default
+    raise ConfigurationError(f"{key} 必须是布尔值")
+
+
+def _as_int(value: TomlValue, *, key: str, default: int) -> int:
+    """读取可选整数；字段缺失使用默认值，类型错误显式失败。"""
+    if value is None:
+        return default
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigurationError(f"{key} 必须是整数")
+    return value
 
 
 def _as_str_tuple(value: TomlValue) -> tuple[str, ...]:
@@ -115,9 +132,16 @@ def _require_table(raw: TomlTable, key: str) -> TomlTable:
     return cast(TomlTable, value)
 
 
-def _resolve_path(root: Path, value: TomlValue, *, default: str) -> Path:
+def _reject_deprecated_keys(raw: TomlTable, *, section: str, keys: tuple[str, ...]) -> None:
+    """禁止已移出配置文件的字段形成第二事实来源。"""
+    for key in keys:
+        if key in raw:
+            raise ConfigurationError(f"{section}.{key} 已废弃；该值由项目包元数据统一提供")
+
+
+def _resolve_path(root: Path, value: TomlValue, *, key: str, default: str) -> Path:
     """把配置中的路径解析为绝对路径。"""
-    raw_text = _as_str(value, default=default).strip()
+    raw_text = _as_str(value, key=key, default=default).strip()
     path = Path(raw_text) if raw_text else Path(default)
     if not path.is_absolute():
         path = root / path
@@ -145,7 +169,7 @@ def _external_analyzers(raw: TomlTable) -> tuple[ExternalAnalyzerConfig, ...]:
             ExternalAnalyzerConfig(
                 name=name,
                 command=command,
-                timeout_sec=max(1, _as_int(item.get("timeout_sec", 120), default=120)),
+                timeout_sec=max(1, _as_int(item.get("timeout_sec"), key=f"external_analyzers.{name}.timeout_sec", default=120)),
             )
         )
     return tuple(analyzers)
@@ -163,32 +187,34 @@ def load_config(config_path: Path) -> AppConfig:
     server_raw = _require_table(raw, "server")
     runtime_workspace_raw = _require_table(raw, "runtime_workspace")
     limits_raw = _require_table(raw, "limits")
+    _reject_deprecated_keys(server_raw, section="server", keys=("server_version",))
 
     return AppConfig(
         logging=LoggingConfig(
-            level=_as_str(logging_raw.get("level", "INFO"), default="INFO"),
-            directory=_resolve_path(root, logging_raw.get("directory", "logs"), default="logs"),
+            level=_as_str(logging_raw.get("level"), key="logging.level", default="INFO"),
+            directory=_resolve_path(root, logging_raw.get("directory"), key="logging.directory", default="logs"),
         ),
         server=ServerConfig(
-            protocol_version=_as_str(server_raw.get("protocol_version", "2025-06-18"), default="2025-06-18"),
-            server_name=_as_str(server_raw.get("server_name", "ida-stdio-mcp"), default="ida-stdio-mcp"),
-            server_version=_as_str(server_raw.get("server_version", "0.3.0"), default="0.3.0"),
-            default_input_path=_as_str(server_raw.get("default_input_path", ""), default=""),
-            isolated_contexts=_as_bool(server_raw.get("isolated_contexts", False), default=False),
+            protocol_version=_as_str(server_raw.get("protocol_version"), key="server.protocol_version", default="2025-06-18"),
+            server_name=_as_str(server_raw.get("server_name"), key="server.server_name", default="ida-stdio-mcp"),
+            server_version=package_version(),
+            default_input_path=_as_str(server_raw.get("default_input_path"), key="server.default_input_path", default=""),
+            isolated_contexts=_as_bool(server_raw.get("isolated_contexts"), key="server.isolated_contexts", default=False),
         ),
         runtime_workspace=RuntimeWorkspaceConfig(
-            directory=_resolve_path(root, runtime_workspace_raw.get("directory", ".runtime"), default=".runtime"),
+            directory=_resolve_path(root, runtime_workspace_raw.get("directory"), key="runtime_workspace.directory", default=".runtime"),
             symbol_cache_directory=_resolve_path(
                 root,
-                runtime_workspace_raw.get("symbol_cache_directory", ".runtime/symbol-cache"),
+                runtime_workspace_raw.get("symbol_cache_directory"),
+                key="runtime_workspace.symbol_cache_directory",
                 default=".runtime/symbol-cache",
             ),
         ),
         limits=LimitConfig(
-            default_page_size=_as_int(limits_raw.get("default_page_size", 100), default=100),
-            max_page_size=_as_int(limits_raw.get("max_page_size", 1000), default=1000),
-            max_search_hits=_as_int(limits_raw.get("max_search_hits", 1000), default=1000),
-            max_callgraph_depth=_as_int(limits_raw.get("max_callgraph_depth", 4), default=4),
+            default_page_size=_as_int(limits_raw.get("default_page_size"), key="limits.default_page_size", default=100),
+            max_page_size=_as_int(limits_raw.get("max_page_size"), key="limits.max_page_size", default=1000),
+            max_search_hits=_as_int(limits_raw.get("max_search_hits"), key="limits.max_search_hits", default=1000),
+            max_callgraph_depth=_as_int(limits_raw.get("max_callgraph_depth"), key="limits.max_callgraph_depth", default=4),
         ),
         external_analyzers=_external_analyzers(raw),
         root=root,

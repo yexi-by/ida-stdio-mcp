@@ -48,6 +48,7 @@ class ArtifactCoreMixin:
         """扫描通用间接分发器候选。"""
         functions = self.list_functions(limit=max(1, max_functions))
         candidates: list[JsonObject] = []
+        diagnostics: list[JsonObject] = []
         for function in functions:
             addr_value = function.get("addr")
             name_value = function.get("name")
@@ -57,7 +58,15 @@ class ArtifactCoreMixin:
                 function_ea = self.parse_address(addr_value)
                 lines = self.disassembly_lines(function_ea)
                 constants = self.function_constants(function_ea)
-            except Exception:
+            except Exception as exc:
+                diagnostics.append(
+                    {
+                        "stage": "scan_function",
+                        "addr": addr_value,
+                        "name": str(name_value or ""),
+                        "error": str(exc),
+                    }
+                )
                 continue
 
             indirect_sites: list[JsonObject] = []
@@ -121,18 +130,26 @@ class ArtifactCoreMixin:
             return value if isinstance(value, int) and not isinstance(value, bool) else 0
 
         candidates.sort(key=score_value, reverse=True)
+        warnings = [f"{len(diagnostics)} 个函数扫描失败，已在 diagnostics 中列出。"] if diagnostics else []
         return self._json_object(
             {
-                "scanned_functions": len(functions),
-                "candidate_count": len(candidates),
-                "items": candidates[: max(1, max_candidates)],
-                "heuristics": [
-                    "indirect call/jump operands",
-                    "jump-table or pointer-table references",
-                    "switch metadata in disassembly comments",
-                    "hash-mixing instructions and immediate constants",
-                ],
-                "recommended_next_tools": ["decompile_function", "explain_function", "correlate_analysis_artifact"],
+                "status": "degraded" if diagnostics else "ok",
+                "data": {
+                    "scanned_functions": len(functions),
+                    "failed_functions": len(diagnostics),
+                    "candidate_count": len(candidates),
+                    "items": candidates[: max(1, max_candidates)],
+                    "diagnostics": diagnostics[:50],
+                    "diagnostics_truncated": len(diagnostics) > 50,
+                    "heuristics": [
+                        "indirect call/jump operands",
+                        "jump-table or pointer-table references",
+                        "switch metadata in disassembly comments",
+                        "hash-mixing instructions and immediate constants",
+                    ],
+                    "recommended_next_tools": ["decompile_function", "explain_function", "correlate_analysis_artifact"],
+                },
+                "warnings": warnings,
             }
         )
 
@@ -174,27 +191,36 @@ class ArtifactCoreMixin:
         hashes = self._entity_list(entities, "hashes")
         texts = self._entity_list(entities, "texts")
         paths = self._entity_list(entities, "paths")
-        address_matches = self._correlate_addresses(addresses[:max_items])
-        hash_matches = self._correlate_hashes(hashes[:max_items], max_functions=500)
-        string_matches = self._correlate_strings((texts + paths)[:max_items])
+        diagnostics: list[JsonObject] = []
+        address_matches = self._correlate_addresses(addresses[:max_items], diagnostics=diagnostics)
+        hash_matches = self._correlate_hashes(hashes[:max_items], max_functions=500, diagnostics=diagnostics)
+        string_matches = self._correlate_strings((texts + paths)[:max_items], diagnostics=diagnostics)
         function_name_matches = self._correlate_function_names(texts[:max_items])
+        warnings = [f"{len(diagnostics)} 个 artifact 关联步骤失败，已在 diagnostics 中列出。"] if diagnostics else []
         return self._json_object(
             {
-                "artifact": record.to_json(),
-                "entities": entities,
-                "matches": {
-                    "addresses": address_matches,
-                    "hashes": hash_matches,
-                    "strings": string_matches,
-                    "function_names": function_name_matches,
+                "status": "degraded" if diagnostics else "ok",
+                "data": {
+                    "artifact": record.to_json(),
+                    "entities": entities,
+                    "matches": {
+                        "addresses": address_matches,
+                        "hashes": hash_matches,
+                        "strings": string_matches,
+                        "function_names": function_name_matches,
+                    },
+                    "summary": {
+                        "address_matches": len(address_matches),
+                        "hash_matches": len(hash_matches),
+                        "string_matches": len(string_matches),
+                        "function_name_matches": len(function_name_matches),
+                        "diagnostics": len(diagnostics),
+                    },
+                    "diagnostics": diagnostics[:50],
+                    "diagnostics_truncated": len(diagnostics) > 50,
+                    "recommended_next_tools": ["explain_function", "decompile_function", "scan_dispatchers"],
                 },
-                "summary": {
-                    "address_matches": len(address_matches),
-                    "hash_matches": len(hash_matches),
-                    "string_matches": len(string_matches),
-                    "function_name_matches": len(function_name_matches),
-                },
-                "recommended_next_tools": ["explain_function", "decompile_function", "scan_dispatchers"],
+                "warnings": warnings,
             }
         )
 
@@ -206,7 +232,7 @@ class ArtifactCoreMixin:
             return []
         return [cast(JsonObject, item) for item in value if isinstance(item, dict)]
 
-    def _correlate_addresses(self, entities: list[JsonObject]) -> list[JsonObject]:
+    def _correlate_addresses(self, entities: list[JsonObject], *, diagnostics: list[JsonObject]) -> list[JsonObject]:
         """关联 artifact 中的地址候选。"""
         results: list[JsonObject] = []
         for entity in entities:
@@ -217,11 +243,12 @@ class ArtifactCoreMixin:
                 ea = self.parse_address(value)
                 profile = self.get_function_profile(hex(ea), include_asm=False)
                 results.append({"entity": entity, "addr": hex(ea), "function": profile})
-            except Exception:
+            except Exception as exc:
+                diagnostics.append({"stage": "address", "entity": entity, "error": str(exc)})
                 continue
         return results
 
-    def _correlate_hashes(self, entities: list[JsonObject], *, max_functions: int) -> list[JsonObject]:
+    def _correlate_hashes(self, entities: list[JsonObject], *, max_functions: int, diagnostics: list[JsonObject]) -> list[JsonObject]:
         """把 hash 候选与函数常量做通用匹配。"""
         wanted: dict[int, JsonObject] = {}
         for entity in entities:
@@ -230,7 +257,8 @@ class ArtifactCoreMixin:
                 continue
             try:
                 wanted[int(value, 0)] = entity
-            except ValueError:
+            except ValueError as exc:
+                diagnostics.append({"stage": "hash_parse", "entity": entity, "error": str(exc)})
                 continue
         if not wanted:
             return []
@@ -242,14 +270,15 @@ class ArtifactCoreMixin:
             try:
                 function_ea = self.parse_address(addr)
                 constants = set(self.function_constants(function_ea))
-            except Exception:
+            except Exception as exc:
+                diagnostics.append({"stage": "hash_function", "function": function, "error": str(exc)})
                 continue
             for wanted_value, entity in wanted.items():
                 if wanted_value in constants:
                     results.append({"entity": entity, "hash": hex(wanted_value), "function": function})
         return results
 
-    def _correlate_strings(self, entities: list[JsonObject]) -> list[JsonObject]:
+    def _correlate_strings(self, entities: list[JsonObject], *, diagnostics: list[JsonObject]) -> list[JsonObject]:
         """把文本和路径实体与 IDA 字符串缓存关联。"""
         results: list[JsonObject] = []
         seen: set[str] = set()
@@ -263,7 +292,8 @@ class ArtifactCoreMixin:
             seen.add(text)
             try:
                 matches = self.find_strings(text, limit=5)
-            except Exception:
+            except Exception as exc:
+                diagnostics.append({"stage": "string", "entity": entity, "error": str(exc)})
                 continue
             data = matches.get("data")
             if isinstance(data, list) and data:

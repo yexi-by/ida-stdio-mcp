@@ -5,7 +5,6 @@ directory = "logs"
 [server]
 protocol_version = "2025-06-18"
 server_name = "ida-stdio-mcp"
-server_version = "0.2.0"
 default_input_path = ""
 isolated_contexts = false
 

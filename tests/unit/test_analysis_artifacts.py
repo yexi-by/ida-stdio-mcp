@@ -87,6 +87,26 @@ class DummyArtifactCore(ArtifactCoreMixin):
         return {"data": [], "next_offset": None}
 
 
+class FailingScanArtifactCore(DummyArtifactCore):
+    """模拟函数扫描阶段失败的核心对象。"""
+
+    def function_constants(self, start_ea: int) -> list[int]:
+        """模拟 IDA 常量读取失败。"""
+        raise RuntimeError(f"constants failed at {hex(start_ea)}")
+
+
+class FailingCorrelateArtifactCore(DummyArtifactCore):
+    """模拟 artifact 关联阶段部分失败的核心对象。"""
+
+    def get_function_profile(self, query: str, *, include_asm: bool = True) -> JsonObject:
+        """模拟地址关联读取函数画像失败。"""
+        raise RuntimeError(f"profile failed for {query}")
+
+    def find_strings(self, pattern: str, *, offset: int = 0, limit: int = 100) -> JsonObject:
+        """模拟字符串索引不可用。"""
+        raise RuntimeError(f"string index failed for {pattern}")
+
+
 class AnalysisArtifactTests(unittest.TestCase):
     """覆盖外部分析 artifact 的导入、执行和关联。"""
 
@@ -158,7 +178,11 @@ class AnalysisArtifactTests(unittest.TestCase):
                 core = DummyArtifactCore()
 
                 dispatchers = core.scan_dispatchers()
-                items = dispatchers.get("items")
+                self.assertEqual(dispatchers.get("status"), "ok")
+                dispatch_data = dispatchers.get("data")
+                self.assertIsInstance(dispatch_data, dict)
+                assert isinstance(dispatch_data, dict)
+                items = dispatch_data.get("items")
                 self.assertIsInstance(items, list)
                 assert isinstance(items, list)
                 self.assertGreater(len(items), 0)
@@ -171,13 +195,80 @@ class AnalysisArtifactTests(unittest.TestCase):
                 self.assertIn("hash_mixing_or_hash_constants", patterns)
 
                 correlated = core.correlate_analysis_artifact(artifact_id=artifact_id)
-                matches = correlated.get("matches")
+                self.assertEqual(correlated.get("status"), "ok")
+                correlated_data = correlated.get("data")
+                self.assertIsInstance(correlated_data, dict)
+                assert isinstance(correlated_data, dict)
+                matches = correlated_data.get("matches")
                 self.assertIsInstance(matches, dict)
                 assert isinstance(matches, dict)
                 self.assertTrue(matches.get("addresses"))
                 self.assertTrue(matches.get("hashes"))
                 self.assertTrue(matches.get("strings"))
                 self.assertTrue(matches.get("function_names"))
+            finally:
+                configure_runtime_workspace(
+                    RuntimeWorkspaceConfig(
+                        directory=previous_paths.directory,
+                        symbol_cache_directory=previous_paths.symbol_cache_directory,
+                    )
+                )
+
+    def test_artifact_failures_are_reported_as_degraded(self) -> None:
+        """扫描和关联失败不得静默变成空结果。"""
+        previous_paths = get_runtime_workspace_paths()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            try:
+                configure_runtime_workspace(RuntimeWorkspaceConfig(directory=root / "runtime", symbol_cache_directory=root / "symbols"))
+                artifact_path = root / "analysis.json"
+                artifact_path.write_text(
+                    json.dumps(
+                        {
+                            "addr": "0x401000",
+                            "resource": "thumb_ev01_01",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                imported = import_analysis_artifact(artifact_path)
+                record = imported.get("record")
+                self.assertIsInstance(record, dict)
+                assert isinstance(record, dict)
+                artifact_id = record.get("artifact_id")
+                self.assertIsInstance(artifact_id, str)
+                assert isinstance(artifact_id, str)
+
+                dispatchers = FailingScanArtifactCore().scan_dispatchers()
+                self.assertEqual(dispatchers.get("status"), "degraded")
+                scan_warnings = dispatchers.get("warnings")
+                self.assertIsInstance(scan_warnings, list)
+                assert isinstance(scan_warnings, list)
+                self.assertTrue(scan_warnings)
+                scan_data = dispatchers.get("data")
+                self.assertIsInstance(scan_data, dict)
+                assert isinstance(scan_data, dict)
+                failed_functions = scan_data.get("failed_functions")
+                self.assertIsInstance(failed_functions, int)
+                assert isinstance(failed_functions, int)
+                self.assertGreater(failed_functions, 0)
+                self.assertTrue(scan_data.get("diagnostics"))
+
+                correlated = FailingCorrelateArtifactCore().correlate_analysis_artifact(artifact_id=artifact_id)
+                self.assertEqual(correlated.get("status"), "degraded")
+                correlate_warnings = correlated.get("warnings")
+                self.assertIsInstance(correlate_warnings, list)
+                assert isinstance(correlate_warnings, list)
+                self.assertTrue(correlate_warnings)
+                correlated_data = correlated.get("data")
+                self.assertIsInstance(correlated_data, dict)
+                assert isinstance(correlated_data, dict)
+                diagnostics = correlated_data.get("diagnostics")
+                self.assertIsInstance(diagnostics, list)
+                assert isinstance(diagnostics, list)
+                stages = {str(item.get("stage")) for item in diagnostics if isinstance(item, dict)}
+                self.assertIn("address", stages)
+                self.assertIn("string", stages)
             finally:
                 configure_runtime_workspace(
                     RuntimeWorkspaceConfig(

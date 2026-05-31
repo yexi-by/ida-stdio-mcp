@@ -530,7 +530,70 @@ def _unwrap_statusful(value: object) -> tuple[ToolStatus, JsonValue, list[str]]:
             representation_status: ToolStatus = cast(ToolStatus, raw_status) if isinstance(raw_status, str) else "error"
             warnings = [str(item) for item in raw_warnings] if isinstance(raw_warnings, list) else []
             return representation_status, _normalize_tool_data(cast(object, payload)), warnings
+        if {"status", "warnings"} <= set(payload.keys()):
+            raw_status = payload.get("status")
+            raw_warnings = payload.get("warnings")
+            payload_status: ToolStatus = cast(ToolStatus, raw_status) if isinstance(raw_status, str) else "error"
+            warnings = [str(item) for item in raw_warnings] if isinstance(raw_warnings, list) else []
+            return payload_status, _normalize_tool_data(cast(object, payload)), warnings
     return "ok", _normalize_tool_data(cast(object, value)), []
+
+
+def _statusful_status(value: object) -> ToolStatus | None:
+    """从子结果中读取统一状态。"""
+    if not isinstance(value, dict):
+        return None
+    raw_status = cast(JsonObject, value).get("status")
+    if raw_status in {"ok", "degraded", "unsupported", "error"}:
+        return cast(ToolStatus, raw_status)
+    return None
+
+
+def _statusful_warnings(value: object) -> list[str]:
+    """从子结果中读取告警列表。"""
+    if not isinstance(value, dict):
+        return []
+    raw_warnings = cast(JsonObject, value).get("warnings")
+    if not isinstance(raw_warnings, list):
+        return []
+    return [str(item) for item in raw_warnings]
+
+
+def _combine_child_statuses(*values: object) -> tuple[ToolStatus, list[str]]:
+    """把多个子结果状态合并成顶层状态和告警。"""
+    statuses = [status for status in (_statusful_status(value) for value in values) if status is not None]
+    warnings: list[str] = []
+    for value in values:
+        warnings.extend(_statusful_warnings(value))
+    if "error" in statuses:
+        return "error", warnings
+    if "degraded" in statuses:
+        return "degraded", warnings
+    if "unsupported" in statuses:
+        if any(status == "ok" for status in statuses):
+            return "degraded", warnings
+        return "unsupported", warnings
+    return "ok", warnings
+
+
+def _result_indicates_writeback(data: JsonValue) -> bool:
+    """判断工具结果是否表示实际发生了写回。"""
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                return True
+            applied = item.get("applied")
+            if isinstance(applied, bool):
+                if applied:
+                    return True
+                continue
+            return True
+        return False
+    if isinstance(data, dict):
+        applied = data.get("applied")
+        if isinstance(applied, bool):
+            return applied
+    return True
 
 
 def _with_writeback_state(data: JsonValue, session: BinarySummary) -> JsonObject:
@@ -586,11 +649,14 @@ def _tool(
             raw = handler(core, arguments)
             status, data, warnings = _unwrap_statusful(raw)
             if writeback_kind is not None and status in {"ok", "degraded"}:
-                session = runtime.mark_writeback(
-                    writeback_kind=writeback_kind,
-                    session_id=_string_or_default(arguments, "session_id", "") or None,
-                    context_id=_context_id(arguments),
-                )
+                if _result_indicates_writeback(data):
+                    session = runtime.mark_writeback(
+                        writeback_kind=writeback_kind,
+                        session_id=_string_or_default(arguments, "session_id", "") or None,
+                        context_id=_context_id(arguments),
+                    )
+                else:
+                    session = runtime.current_target(context_id=_context_id(arguments))
                 data = _with_writeback_state(data, session)
             if session_required and status in {"ok", "degraded"}:
                 runtime.record_activity(
@@ -728,8 +794,9 @@ def _management_tools(
                 session_id=_string_or_default(arguments, "session_id", "") or None,
                 context_id=_context_id(arguments),
             )
+            status, warnings = _combine_child_statuses(summary)
             return build_result(
-                status="ok",
+                status=status,
                 source="workflow.triage_binary",
                 data=_normalize_tool_data(
                     {
@@ -737,6 +804,7 @@ def _management_tools(
                         "summary": summary,
                     }
                 ),
+                warnings=warnings,
             )
         except Exception as exc:
             return management_error_result("triage_binary", "workflow.triage_binary", exc, session_required=True, requires_context=context_required)
@@ -775,6 +843,7 @@ def _management_tools(
             microcode: JsonValue = None
             if _bool_or_default(arguments, "include_microcode", False):
                 microcode = core.microcode_summary(query, max_instructions=_int_or_default(arguments, "max_micro_instructions", 80))
+            status, warnings = _combine_child_statuses(representation, microcode)
             runtime.record_activity(
                 "explain_function",
                 target=query,
@@ -782,7 +851,7 @@ def _management_tools(
                 context_id=_context_id(arguments),
             )
             return build_result(
-                status="ok",
+                status=status,
                 source="workflow.explain_function",
                 data=_normalize_tool_data(
                     {
@@ -792,6 +861,7 @@ def _management_tools(
                         "recommended_next_tools": ["trace_input_to_check", "investigate_string", "export_report"],
                     }
                 ),
+                warnings=warnings,
             )
         except Exception as exc:
             return management_error_result("explain_function", "workflow.explain_function", exc, session_required=True, requires_context=context_required)
@@ -856,10 +926,14 @@ def _management_tools(
         try:
             session_id = _string_or_default(arguments, "session_id", "") or None
             path = _string_or_default(arguments, "path", "")
+            saved = runtime.save_workspace(path=path, session_id=session_id, context_id=_context_id(arguments))
+            if saved.get("ok") is False:
+                error_text = saved.get("error")
+                raise RuntimeError(str(error_text) if isinstance(error_text, str) and error_text else "保存工作 IDB 失败")
             return build_result(
                 status="ok",
                 source="workflow.save_workspace",
-                data=_normalize_tool_data(runtime.save_workspace(path=path, session_id=session_id, context_id=_context_id(arguments))),
+                data=_normalize_tool_data(saved),
             )
         except Exception as exc:
             return management_error_result("save_workspace", "workflow.save_workspace", exc, session_required=True, requires_context=context_required)
@@ -2357,6 +2431,11 @@ def _register_resources(
         """构造资源读取使用的统一结果 envelope。"""
         return cast(JsonObject, build_result(status=status, source=source, data=data, warnings=warnings, error=error))
 
+    def statusful_resource_payload(source: str, raw: object) -> JsonObject:
+        """构造资源读取结果，并传播核心层自带的状态。"""
+        status, data, warnings = _unwrap_statusful(raw)
+        return resource_payload(source=source, status=status, data=data, warnings=warnings)
+
     def request_context_id(params: dict[str, str], *, required: bool) -> str | None:
         """从资源读取参数中提取上下文 ID。"""
         context_id = params.get("context_id")
@@ -2369,7 +2448,7 @@ def _register_resources(
         def wrapped(_: dict[str, str]) -> JsonValue:
             """读取全局资源并把异常转换为资源 envelope。"""
             try:
-                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader())))
+                return _normalize_tool_data(statusful_resource_payload(source, reader()))
             except Exception as exc:
                 return _normalize_tool_data(
                     _error_result_from_exception(
@@ -2391,7 +2470,7 @@ def _register_resources(
         def wrapped(params: dict[str, str]) -> JsonValue:
             """读取带参数的全局资源并包装结果。"""
             try:
-                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(params))))
+                return _normalize_tool_data(statusful_resource_payload(source, reader(params)))
             except Exception as exc:
                 return _normalize_tool_data(
                     _error_result_from_exception(
@@ -2410,7 +2489,7 @@ def _register_resources(
         def wrapped(params: dict[str, str]) -> JsonValue:
             """读取全局模板资源并包装结果。"""
             try:
-                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(params))))
+                return _normalize_tool_data(statusful_resource_payload(source, reader(params)))
             except Exception as exc:
                 return _normalize_tool_data(
                     _error_result_from_exception(
@@ -2430,7 +2509,7 @@ def _register_resources(
             """激活当前会话后读取资源并包装结果。"""
             try:
                 runtime.activate_for_request(None, context_id=request_context_id(params, required=session_requires_context))
-                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(_new_core()))))
+                return _normalize_tool_data(statusful_resource_payload(source, reader(_new_core())))
             except Exception as exc:
                 return _normalize_tool_data(
                     _error_result_from_exception(
@@ -2450,7 +2529,7 @@ def _register_resources(
             """激活当前会话后读取模板资源并包装结果。"""
             try:
                 runtime.activate_for_request(None, context_id=request_context_id(params, required=session_requires_context))
-                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(_new_core(), params))))
+                return _normalize_tool_data(statusful_resource_payload(source, reader(_new_core(), params)))
             except Exception as exc:
                 return _normalize_tool_data(
                     _error_result_from_exception(
@@ -2473,7 +2552,7 @@ def _register_resources(
             """读取上下文资源并包装结果。"""
             try:
                 context_id = request_context_id(params, required=session_requires_context)
-                return _normalize_tool_data(resource_payload(source=source, data=_normalize_tool_data(reader(context_id))))
+                return _normalize_tool_data(statusful_resource_payload(source, reader(context_id)))
             except Exception as exc:
                 return _normalize_tool_data(
                     _error_result_from_exception(

@@ -26,8 +26,8 @@ ToolEnvelope = JsonObject
 
 START_PROCESS = cast(Callable[[str, str, str], bool], ida_dbg.start_process)
 ATTACH_PROCESS = cast(Callable[..., object], ida_dbg.attach_process)
-EXIT_PROCESS = cast(Callable[[], None], ida_dbg.exit_process)
-CONTINUE_PROCESS = cast(Callable[[], None], ida_dbg.continue_process)
+EXIT_PROCESS = cast(Callable[[], object], ida_dbg.exit_process)
+CONTINUE_PROCESS = cast(Callable[[], object], ida_dbg.continue_process)
 STEP_INTO = ida_dbg.step_into
 STEP_OVER = ida_dbg.step_over
 STEP_UNTIL_RET = ida_dbg.step_until_ret
@@ -117,6 +117,17 @@ def _debug_int_result(value: object) -> int:
     if isinstance(value, float):
         return int(value)
     return int(str(value), 0)
+
+
+def _debug_command_accepted(value: object) -> bool:
+    """判断 IDA 调试命令是否被接受；None 代表 void API 已返回。"""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    return bool(value)
 
 
 def _debug_register_value(name: str) -> JsonValue | None:
@@ -456,17 +467,36 @@ class DebugCoreMixin:
         """退出调试。"""
         if GET_PROCESS_STATE() == -1:
             return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        EXIT_PROCESS()
-        _append_debug_event("exit_request", {})
-        return self._json_object({"status": "ok", "data": {"exited": True}, "warnings": []})
+        result = EXIT_PROCESS()
+        accepted = _debug_command_accepted(result)
+        _append_debug_event("exit_request", {"accepted": accepted, "result": _debug_json_scalar(result)})
+        if not accepted:
+            return self._json_object(
+                {
+                    "status": "unsupported",
+                    "data": {"exited": False, "accepted": False, "result": _debug_json_scalar(result)},
+                    "warnings": ["IDA 调试后端未接受退出请求"],
+                }
+            )
+        return self._json_object({"status": "ok", "data": {"exited": True, "accepted": True}, "warnings": []})
 
     def debug_continue(self) -> ToolEnvelope:
         """继续执行。"""
         if GET_PROCESS_STATE() == -1:
             return self._json_object({"status": "unsupported", "data": {"reason": "当前没有活动调试会话"}, "warnings": ["未附加调试器"]})
-        CONTINUE_PROCESS()
-        _append_debug_event("continue", self._debug_state_snapshot())
-        return self._json_object({"status": "ok", "data": {"continued": True}, "warnings": []})
+        result = CONTINUE_PROCESS()
+        accepted = _debug_command_accepted(result)
+        state = self._debug_state_snapshot()
+        _append_debug_event("continue", {"accepted": accepted, "result": _debug_json_scalar(result), "state": state})
+        if not accepted:
+            return self._json_object(
+                {
+                    "status": "unsupported",
+                    "data": {"continued": False, "accepted": False, "result": _debug_json_scalar(result), "state": state},
+                    "warnings": ["IDA 调试后端未接受继续执行请求"],
+                }
+            )
+        return self._json_object({"status": "ok", "data": {"continued": True, "accepted": True, "state": state}, "warnings": []})
 
     def debug_run_to(self, addr: str) -> ToolEnvelope:
         """运行到指定地址。"""
@@ -663,7 +693,7 @@ class DebugCoreMixin:
                 }
 
         try:
-            CONTINUE_PROCESS()
+            continue_result = CONTINUE_PROCESS()
         except Exception as exc:
             return {
                 "continued": False,
@@ -672,12 +702,22 @@ class DebugCoreMixin:
                 "continue_error": str(exc),
                 "breakpoint_warning": "已新增 fallback 断点，但继续执行失败。" if breakpoint_added else "复用已有断点，但继续执行失败。",
             }
+        if not _debug_command_accepted(continue_result):
+            return {
+                "continued": False,
+                "breakpoint_preexisting": breakpoint_preexisting,
+                "breakpoint_added": breakpoint_added,
+                "continue_error": "",
+                "continue_result": _debug_json_scalar(continue_result),
+                "breakpoint_warning": "已新增 fallback 断点，但继续执行请求被拒绝。" if breakpoint_added else "复用已有断点，但继续执行请求被拒绝。",
+            }
 
         return {
             "continued": True,
             "breakpoint_preexisting": breakpoint_preexisting,
             "breakpoint_added": breakpoint_added,
             "continue_error": "",
+            "continue_result": _debug_json_scalar(continue_result),
             "breakpoint_warning": "新增的 fallback 断点会保留在 IDA 断点列表中，命中后可用 debug_delete_breakpoints 清理。"
             if breakpoint_added
             else "复用了目标地址已有断点。",
