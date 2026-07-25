@@ -1,16 +1,34 @@
-# 项目级协作规则
+# ida-re-mcp 项目协作规则
 
-## 无头运行底线
+## 产品边界
 
-- 本项目定位为 **IDA headless + stdio MCP** 服务，所有核心能力必须在不依赖 IDA GUI 交互的环境中设计、实现和验证。
-- 解决方案不得要求用户打开 IDA GUI、点击菜单、手动选择调试器、手动确认弹窗或依赖 GUI 状态作为前置条件。
-- 动态调试能力必须通过 IDAPython / IDA SDK 可编程接口建立链路；调试器后端缺失时，应在 headless 流程内主动加载、诊断并返回可修复原因。
-- 如果 IDA 官方运行时在 headless 场景确实不支持某能力，必须明确返回 `unsupported` 与下一步机器可执行排障信息，禁止把 GUI 操作作为默认修复路径。
-- 文档、测试、错误提示和交付说明必须维护上述边界；不得把 GUI 流程描述为项目标准路径。
+- 产品与 Python 发行名为 `ida-re-mcp`，导入包为 `ida_re_mcp`，CLI 为 `ida-re-mcp`。
+- 服务面向 IDA Pro 9.3+ headless，分析对象是 Native 二进制与 Unity IL2CPP 原生注解。
+- 动态调试能力限定为 Windows 本机 x64，并以真实 IDA 调试事件作为完成条件。
+- 原始样本只读；所有 IDB 修改都通过 staging、冷验证和原子 revision 发布。
 
-## docs 维护规则
+## 协议与进程
 
-- `docs/official-docs/` 只保留与本项目直接相关、AI 可读的官方资料 Markdown 快照；不提交整站镜像、HTML 原始页、JSON manifest、SDK 压缩包或无关历史抓取。
-- `docs/官方文档资料包.md` 和 `docs/官方知识覆盖清单.md` 是官方依据入口；更新 IDA、Hex-Rays、IDAPython 或 MCP 资料时，同步更新整理日期、快照目录、覆盖结论和仍未覆盖的边界。
-- `docs/验证记录.md` 只记录当前实现可复现的验证命令、环境前提和结果；真实本机安装路径、用户名、客户路径和私有样本名必须脱敏为占位符。
-- README、skill reference 与 docs 必须描述当前实现和当前官方约束；历史对比、迁移说明和版本差异放入 changelog 或专门迁移文档。
+- 只实现 MCP `2026-07-28` 的 UTF-8 单行 JSON-RPC stdio 边界。
+- stdout 只输出协议消息；诊断写入 stderr 或平台日志目录。
+- 工具目录在启动时固定，只广告 tools 和不可变 resources。
+- Supervisor 不导入 IDA；IDA API 只在独立 worker 的 owner 线程调用。
+- Supervisor 与 worker 只通过当前用户私有、带随机鉴权值的本地 JSON IPC 通信。
+- 每个请求显式携带 workspace、revision、operation、debug session 或 stop 等身份。
+
+## 存储与运行目录
+
+- workspace、日志、artifact、checkout、staging、临时文件和开发虚拟环境位于工作树外。
+- 同一 workspace 严格串行；不同 workspace 才允许进程级并行。
+- 只读分析和调试使用私有 checkout，关闭时不保存。
+- mutation 失败、取消或 worker 崩溃不得改变已发布 revision、HEAD 或样本摘要。
+- GC 永不删除 current revision 或 pinned export。
+
+## 工程与验证
+
+- 运行时固定为 Python 3.13，项目使用 uv、Ruff、basedpyright strict 与 pytest。
+- 新增代码内开发者文档使用规范中文，标识符使用英文 ASCII。
+- JSON Schema 使用 2020-12，根对象封闭，输入与输出都由服务端验证。
+- 测试覆盖外部可观察行为、失败路径、worker 崩溃和 revision 不变量。
+- IDA 与 debugger 门禁必须使用受许可的 IDA 9.3+ headless 环境和真实事件。
+- 文档中的“支持”只用于已经通过对应硬门禁的能力。

@@ -1,0 +1,91 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  attestations: read
+  contents: read
+
+jobs:
+  python:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}\ida-re-mcp-venv
+      RUFF_CACHE_DIR: ${{ runner.temp }}\ida-re-mcp-ruff-cache
+      HYPOTHESIS_STORAGE_DIRECTORY: ${{ runner.temp }}\ida-re-mcp-hypothesis
+      PYTHONPYCACHEPREFIX: ${{ runner.temp }}\ida-re-mcp-pycache
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          version: "0.11.28"
+          enable-cache: true
+      - name: Install Python 3.13
+        run: uv python install 3.13
+      - name: Validate lock and environment
+        run: |
+          uv lock --check
+          uv sync --locked
+          uv run --locked python -c "import sys; assert sys.version_info[:2] == (3, 13)"
+      - name: Ruff format
+        run: uv run --locked ruff format --check .
+      - name: Ruff lint
+        run: uv run --locked ruff check .
+      - name: Type check
+        run: uv run --locked basedpyright
+      - name: Unit and protocol integration tests
+        run: >-
+          uv run --locked pytest -q tests/unit tests/integration
+          -o "cache_dir=$env:RUNNER_TEMP\ida-re-mcp-pytest-cache"
+      - name: Provision verified LLVM and LLD 22.1.8
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP "LLVM-22.1.8-win64.exe"
+          $llvmRoot = Join-Path $env:RUNNER_TEMP "llvm-22.1.8"
+          Invoke-WebRequest `
+            -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/LLVM-22.1.8-win64.exe" `
+            -OutFile $installer
+          gh attestation verify --repo llvm/llvm-project $installer
+          $process = Start-Process `
+            -FilePath $installer `
+            -ArgumentList @("/S", "/D=$llvmRoot") `
+            -WindowStyle Hidden `
+            -Wait `
+            -PassThru
+          if ($process.ExitCode -ne 0) {
+            throw "LLVM 安装器失败: $($process.ExitCode)"
+          }
+          $llvmBin = Join-Path $llvmRoot "bin"
+          $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $clangVersion = & (Join-Path $llvmBin "clang.exe") --version |
+            Select-Object -First 1
+          $lldVersion = & (Join-Path $llvmBin "lld-link.exe") --version |
+            Select-Object -First 1
+          if ($clangVersion -notmatch "22\.1\.8" -or $lldVersion -notmatch "22\.1\.8") {
+            throw "实际 LLVM/LLD 版本不是 22.1.8"
+          }
+      - name: Fixture reproducibility
+        run: ./scripts/check_fixture_reproducibility.ps1
+      - name: Build, install, and smoke-test wheel
+        shell: pwsh
+        run: |
+          $dist = Join-Path $env:RUNNER_TEMP "ida-re-mcp-dist"
+          $smoke = Join-Path $env:RUNNER_TEMP "ida-re-mcp-wheel-smoke"
+          $runtime = Join-Path $env:RUNNER_TEMP "ida-re-mcp-runtime"
+          New-Item -ItemType Directory -Force -Path $dist, $runtime | Out-Null
+          uv build --no-sources --out-dir $dist
+          $wheel = @(Get-ChildItem -LiteralPath $dist -Filter "*.whl")
+          if ($wheel.Count -ne 1) {
+            throw "wheel 构建必须且只能产生一个 .whl"
+          }
+          uv venv --python 3.13 $smoke
+          $python = Join-Path $smoke "Scripts/python.exe"
+          $executable = Join-Path $smoke "Scripts/ida-re-mcp.exe"
+          uv pip install --python $python $wheel[0].FullName
+          $env:LOCALAPPDATA = $runtime
+          ./scripts/stdio_smoke.ps1 -Executable $executable

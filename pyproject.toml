@@ -1,44 +1,66 @@
 [project]
-name = "ida-stdio-mcp"
-version = "0.3.0"
-description = "面向 AI Agent 的 IDA Pro 9.3+ stdio MCP 逆向分析服务"
+name = "ida-re-mcp"
+version = "1.0.0.dev0"
+description = "面向 AI Agent 的 IDA Pro 9.3+ headless 逆向工程 MCP 服务"
 readme = "README.md"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
-    { name = "yexi", email = "fanguojun066@gmail.com" }
+    { name = "yexi", email = "fanguojun066@gmail.com" },
 ]
-requires-python = ">=3.11"
+requires-python = ">=3.13,<3.14"
 classifiers = [
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
-    "idapro>=0.0.7",
-    "loguru>=0.7.3",
-    "rich>=15.0.0",
+    "idapro==0.0.7",
+    "mcp-types==2.0.0b2",
+    "platformdirs>=4.3,<5",
+    "pydantic>=2.12,<3",
 ]
 
 [project.scripts]
-ida-stdio-mcp = "ida_stdio_mcp.main:main"
-ida-stdio-mcp-test = "ida_stdio_mcp.test_runner:main"
+ida-re-mcp = "ida_re_mcp.cli:main"
 
 [build-system]
-requires = ["uv_build>=0.9.27,<0.10.0"]
+requires = ["uv_build>=0.11,<0.12"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "basedpyright>=1.39.1",
+    "basedpyright>=1.39,<2",
+    "hypothesis>=6.140,<7",
+    "mcp==2.0.0b2",
+    "pytest>=9,<10",
+    "pytest-cov>=7,<8",
+    "ruff>=0.14,<0.15",
 ]
 
+[tool.uv]
+package = true
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "RUF"]
+
 [tool.basedpyright]
-include = [
-    "src",
-    "tests",
-]
-exclude = [
-    "tests/fixtures",
-]
+include = ["src", "tests"]
+exclude = ["tests/fixtures/build"]
 typeCheckingMode = "strict"
-pythonVersion = "3.11"
+pythonVersion = "3.13"
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests/unit"]
+markers = [
+    "ida: requires a licensed IDA Pro 9.3+ headless runtime",
+    "debugger: requires the Windows x64 local debugger backend",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["ida_re_mcp"]

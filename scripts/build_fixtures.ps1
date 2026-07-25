@@ -1,0 +1,144 @@
+param(
+    [string]$OutputDirectory = "tests/fixtures/bin",
+    [switch]$ExternalOutput
+)
+
+$ErrorActionPreference = "Stop"
+
+$repository = Split-Path -Parent $PSScriptRoot
+$source = Join-Path $repository "tests/fixtures/src"
+$expectedRoot = [System.IO.Path]::GetFullPath((Join-Path $repository "tests/fixtures"))
+if ($ExternalOutput) {
+    if (-not [System.IO.Path]::IsPathRooted($OutputDirectory)) {
+        throw "外部 fixture 输出目录必须是绝对路径"
+    }
+    $output = [System.IO.Path]::GetFullPath($OutputDirectory)
+    $temporaryRootValue = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $env:TEMP }
+    if (-not $temporaryRootValue) {
+        throw "外部 fixture 构建需要 RUNNER_TEMP 或 TEMP"
+    }
+    $temporaryRoot = [System.IO.Path]::GetFullPath($temporaryRootValue)
+    if (
+        $output -eq $temporaryRoot -or
+        -not $output.StartsWith($temporaryRoot + [System.IO.Path]::DirectorySeparatorChar)
+    ) {
+        throw "外部 fixture 输出目录必须严格位于临时目录内"
+    }
+}
+else {
+    $output = [System.IO.Path]::GetFullPath((Join-Path $repository $OutputDirectory))
+    if (-not $output.StartsWith($expectedRoot + [System.IO.Path]::DirectorySeparatorChar)) {
+        throw "提交用 fixture 输出目录必须位于 tests/fixtures 内"
+    }
+}
+
+$clangVersion = (& clang --version | Select-Object -First 1)
+if ($LASTEXITCODE -ne 0) {
+    throw "无法执行 clang"
+}
+$lldVersion = (& lld-link --version | Select-Object -First 1)
+if ($LASTEXITCODE -ne 0) {
+    throw "无法执行 lld-link"
+}
+if ($clangVersion -notmatch "22\.1\.8" -or $lldVersion -notmatch "22\.1\.8") {
+    throw "fixture 构建要求 LLVM/LLD 22.1.8"
+}
+
+New-Item -ItemType Directory -Force -Path $output | Out-Null
+
+$nativePeObject = Join-Path $output "native_pe_x64.obj"
+$nativePeBinary = Join-Path $output "native_pe_x64.dll"
+$nativePeImport = Join-Path $output "native_pe_x64.lib"
+$nativeElfX64 = Join-Path $output "native_elf_x64.so"
+$nativeElfArm64 = Join-Path $output "native_elf_arm64.so"
+$debugObject = Join-Path $output "debug_target_x64.obj"
+$debugBinary = Join-Path $output "debug_target_x64.exe"
+$debugImport = Join-Path $output "debug_target_x64.lib"
+$il2cppPeObject = Join-Path $output "il2cpp_pe_x64.obj"
+$il2cppPeBinary = Join-Path $output "il2cpp_pe_x64.dll"
+$il2cppPeImport = Join-Path $output "il2cpp_pe_x64.lib"
+$il2cppElfBinary = Join-Path $output "il2cpp_elf_x64.so"
+$il2cppMetadata = Join-Path $output "il2cpp_metadata_fingerprint.bin"
+
+$commonC = @(
+    "-O1",
+    "-ffreestanding",
+    "-fno-stack-protector",
+    "-funwind-tables",
+    "-fno-ident",
+    "-ffile-prefix-map=$repository=.",
+    "-fdebug-prefix-map=$repository=."
+)
+
+& clang @commonC --target=x86_64-pc-windows-msvc -c `
+    (Join-Path $source "native_static.c") -o $nativePeObject
+if ($LASTEXITCODE -ne 0) { throw "编译 native PE fixture 失败" }
+& lld-link "/dll" "/noentry" "/nodefaultlib" "/brepro" "/dynamicbase" "/nxcompat" `
+    "/implib:$nativePeImport" "/out:$nativePeBinary" $nativePeObject
+if ($LASTEXITCODE -ne 0) { throw "链接 native PE fixture 失败" }
+
+& clang @commonC --target=x86_64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
+    "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
+    (Join-Path $source "native_static.c") -o $nativeElfX64
+if ($LASTEXITCODE -ne 0) { throw "构建 native ELF x64 fixture 失败" }
+
+& clang @commonC --target=aarch64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
+    "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
+    (Join-Path $source "native_static.c") -o $nativeElfArm64
+if ($LASTEXITCODE -ne 0) { throw "构建 native ELF AArch64 fixture 失败" }
+
+& clang @commonC --target=x86_64-pc-windows-msvc -c `
+    (Join-Path $source "debug_target.c") -o $debugObject
+if ($LASTEXITCODE -ne 0) { throw "编译 debugger fixture 失败" }
+& lld-link "/entry:mainCRTStartup" "/subsystem:console" "/nodefaultlib" "/brepro" "/dynamicbase" `
+    "/nxcompat" "/implib:$debugImport" "/out:$debugBinary" $debugObject "kernel32.lib"
+if ($LASTEXITCODE -ne 0) { throw "链接 debugger fixture 失败" }
+
+& clang++ @commonC --target=x86_64-pc-windows-msvc -fno-exceptions -fno-rtti -c `
+    (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppPeObject
+if ($LASTEXITCODE -ne 0) { throw "编译 IL2CPP PE fixture 失败" }
+& lld-link "/dll" "/noentry" "/nodefaultlib" "/brepro" "/dynamicbase" "/nxcompat" `
+    "/implib:$il2cppPeImport" "/out:$il2cppPeBinary" $il2cppPeObject
+if ($LASTEXITCODE -ne 0) { throw "链接 IL2CPP PE fixture 失败" }
+
+& clang++ @commonC --target=x86_64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
+    -fno-exceptions -fno-rtti "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
+    (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppElfBinary
+if ($LASTEXITCODE -ne 0) { throw "构建 IL2CPP ELF fixture 失败" }
+
+$metadataSource = Join-Path $source "il2cpp_metadata_fingerprint.json"
+$metadataBytes = [System.IO.File]::ReadAllBytes($metadataSource)
+$metadataDigest = [System.Security.Cryptography.SHA256]::HashData($metadataBytes)
+$metadataLength = [System.BitConverter]::GetBytes([uint32]$metadataBytes.Length)
+if (-not [System.BitConverter]::IsLittleEndian) {
+    [Array]::Reverse($metadataLength)
+}
+$metadataMagic = [System.Text.Encoding]::ASCII.GetBytes("IDA-RE-IL2CPP-METADATA`0")
+$metadataStream = [System.IO.MemoryStream]::new()
+try {
+    $metadataStream.Write($metadataMagic, 0, $metadataMagic.Length)
+    $metadataStream.Write($metadataLength, 0, $metadataLength.Length)
+    $metadataStream.Write($metadataDigest, 0, $metadataDigest.Length)
+    $metadataStream.Write($metadataBytes, 0, $metadataBytes.Length)
+    [System.IO.File]::WriteAllBytes($il2cppMetadata, $metadataStream.ToArray())
+}
+finally {
+    $metadataStream.Dispose()
+}
+
+Remove-Item -Force -LiteralPath $nativePeImport
+Remove-Item -Force -LiteralPath $debugImport
+Remove-Item -Force -LiteralPath $il2cppPeImport
+
+Get-ChildItem -LiteralPath $output -File |
+    Where-Object { $_.Extension -ne ".obj" -and $_.Name -ne "SHA256SUMS" } |
+    Sort-Object Name |
+    Get-FileHash -Algorithm SHA256 |
+    ForEach-Object {
+        "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path -Leaf $_.Path)
+    } |
+    Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $output "SHA256SUMS")
+
+Remove-Item -Force -LiteralPath $nativePeObject
+Remove-Item -Force -LiteralPath $debugObject
+Remove-Item -Force -LiteralPath $il2cppPeObject
