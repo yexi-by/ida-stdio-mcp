@@ -32,14 +32,54 @@ else {
     }
 }
 
-$clangVersion = (& clang --version | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) {
-    throw "无法执行 clang"
+$llvmBin = if ($env:LLVM_BIN) {
+    [System.IO.Path]::GetFullPath($env:LLVM_BIN)
 }
-$lldVersion = (& lld-link --version | Select-Object -First 1)
-if ($LASTEXITCODE -ne 0) {
-    throw "无法执行 lld-link"
+else {
+    $null
 }
+if ($llvmBin) {
+    if (-not (Test-Path -LiteralPath $llvmBin -PathType Container)) {
+        throw "LLVM_BIN 不是可访问目录"
+    }
+    $env:PATH = "$llvmBin;$env:PATH"
+}
+$clang = if ($llvmBin) {
+    Join-Path $llvmBin "clang.exe"
+}
+else {
+    (Get-Command clang -CommandType Application -ErrorAction Stop).Source
+}
+$clangCpp = if ($llvmBin) {
+    Join-Path $llvmBin "clang++.exe"
+}
+else {
+    (Get-Command clang++ -CommandType Application -ErrorAction Stop).Source
+}
+$lldLink = if ($llvmBin) {
+    Join-Path $llvmBin "lld-link.exe"
+}
+else {
+    (Get-Command lld-link -CommandType Application -ErrorAction Stop).Source
+}
+foreach ($tool in @($clang, $clangCpp, $lldLink)) {
+    if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) {
+        throw "LLVM 工具不存在: $tool"
+    }
+}
+
+$clangOutput = @(& $clang --version)
+$clangExitCode = $LASTEXITCODE
+if ($clangExitCode -ne 0) {
+    throw "无法执行 clang，退出码 $clangExitCode"
+}
+$lldOutput = @(& $lldLink --version)
+$lldExitCode = $LASTEXITCODE
+if ($lldExitCode -ne 0) {
+    throw "无法执行 lld-link，退出码 $lldExitCode"
+}
+$clangVersion = $clangOutput | Select-Object -First 1
+$lldVersion = $lldOutput | Select-Object -First 1
 if ($clangVersion -notmatch "22\.1\.8" -or $lldVersion -notmatch "22\.1\.8") {
     throw "fixture 构建要求 LLVM/LLD 22.1.8"
 }
@@ -70,38 +110,38 @@ $commonC = @(
     "-fdebug-prefix-map=$repository=."
 )
 
-& clang @commonC --target=x86_64-pc-windows-msvc -c `
+& $clang @commonC --target=x86_64-pc-windows-msvc -c `
     (Join-Path $source "native_static.c") -o $nativePeObject
 if ($LASTEXITCODE -ne 0) { throw "编译 native PE fixture 失败" }
-& lld-link "/dll" "/noentry" "/nodefaultlib" "/brepro" "/dynamicbase" "/nxcompat" `
+& $lldLink "/dll" "/noentry" "/nodefaultlib" "/brepro" "/dynamicbase" "/nxcompat" `
     "/implib:$nativePeImport" "/out:$nativePeBinary" $nativePeObject
 if ($LASTEXITCODE -ne 0) { throw "链接 native PE fixture 失败" }
 
-& clang @commonC --target=x86_64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
+& $clang @commonC --target=x86_64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
     "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
     (Join-Path $source "native_static.c") -o $nativeElfX64
 if ($LASTEXITCODE -ne 0) { throw "构建 native ELF x64 fixture 失败" }
 
-& clang @commonC --target=aarch64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
+& $clang @commonC --target=aarch64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
     "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
     (Join-Path $source "native_static.c") -o $nativeElfArm64
 if ($LASTEXITCODE -ne 0) { throw "构建 native ELF AArch64 fixture 失败" }
 
-& clang @commonC --target=x86_64-pc-windows-msvc -c `
+& $clang @commonC --target=x86_64-pc-windows-msvc -c `
     (Join-Path $source "debug_target.c") -o $debugObject
 if ($LASTEXITCODE -ne 0) { throw "编译 debugger fixture 失败" }
-& lld-link "/entry:mainCRTStartup" "/subsystem:console" "/nodefaultlib" "/brepro" "/dynamicbase" `
+& $lldLink "/entry:mainCRTStartup" "/subsystem:console" "/nodefaultlib" "/brepro" "/dynamicbase" `
     "/nxcompat" "/implib:$debugImport" "/out:$debugBinary" $debugObject "kernel32.lib"
 if ($LASTEXITCODE -ne 0) { throw "链接 debugger fixture 失败" }
 
-& clang++ @commonC --target=x86_64-pc-windows-msvc -fno-exceptions -fno-rtti -c `
+& $clangCpp @commonC --target=x86_64-pc-windows-msvc -fno-exceptions -fno-rtti -c `
     (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppPeObject
 if ($LASTEXITCODE -ne 0) { throw "编译 IL2CPP PE fixture 失败" }
-& lld-link "/dll" "/noentry" "/nodefaultlib" "/brepro" "/dynamicbase" "/nxcompat" `
+& $lldLink "/dll" "/noentry" "/nodefaultlib" "/brepro" "/dynamicbase" "/nxcompat" `
     "/implib:$il2cppPeImport" "/out:$il2cppPeBinary" $il2cppPeObject
 if ($LASTEXITCODE -ne 0) { throw "链接 IL2CPP PE fixture 失败" }
 
-& clang++ @commonC --target=x86_64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
+& $clangCpp @commonC --target=x86_64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
     -fno-exceptions -fno-rtti "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
     (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppElfBinary
 if ($LASTEXITCODE -ne 0) { throw "构建 IL2CPP ELF fixture 失败" }

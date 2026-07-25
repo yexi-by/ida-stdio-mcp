@@ -66,10 +66,18 @@ jobs:
           }
           $llvmBin = Join-Path $llvmRoot "bin"
           $llvmBin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          $clangVersion = & (Join-Path $llvmBin "clang.exe") --version |
-            Select-Object -First 1
-          $lldVersion = & (Join-Path $llvmBin "lld-link.exe") --version |
-            Select-Object -First 1
+          "LLVM_BIN=$llvmBin" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          $clangOutput = @(& (Join-Path $llvmBin "clang.exe") --version)
+          if ($LASTEXITCODE -ne 0) {
+            throw "无法执行已验签的 clang"
+          }
+          $lldOutput = @(& (Join-Path $llvmBin "lld-link.exe") --version)
+          if ($LASTEXITCODE -ne 0) {
+            throw "无法执行已验签的 lld-link"
+          }
+          $clangVersion = $clangOutput | Select-Object -First 1
+          $lldVersion = $lldOutput | Select-Object -First 1
           if ($clangVersion -notmatch "22\.1\.8" -or $lldVersion -notmatch "22\.1\.8") {
             throw "实际 LLVM/LLD 版本不是 22.1.8"
           }

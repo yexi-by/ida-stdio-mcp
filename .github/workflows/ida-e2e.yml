@@ -46,11 +46,27 @@ jobs:
       - name: Require LLVM and LLD 22.1.8
         shell: pwsh
         run: |
-          $clangVersion = & clang --version | Select-Object -First 1
-          $lldVersion = & lld-link --version | Select-Object -First 1
+          $clang = (Get-Command clang -CommandType Application -ErrorAction Stop).Source
+          $lldLink = (Get-Command lld-link -CommandType Application -ErrorAction Stop).Source
+          $clangOutput = @(& $clang --version)
+          if ($LASTEXITCODE -ne 0) {
+            throw "self-hosted runner 无法执行 clang"
+          }
+          $lldOutput = @(& $lldLink --version)
+          if ($LASTEXITCODE -ne 0) {
+            throw "self-hosted runner 无法执行 lld-link"
+          }
+          $clangVersion = $clangOutput | Select-Object -First 1
+          $lldVersion = $lldOutput | Select-Object -First 1
           if ($clangVersion -notmatch "22\.1\.8" -or $lldVersion -notmatch "22\.1\.8") {
             throw "self-hosted runner 必须提供 LLVM/LLD 22.1.8"
           }
+          $llvmBin = Split-Path -Parent $clang
+          if ((Split-Path -Parent $lldLink) -ne $llvmBin) {
+            throw "clang 与 lld-link 必须来自同一个 LLVM_BIN"
+          }
+          "LLVM_BIN=$llvmBin" |
+            Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Build deterministic fixtures
         run: ./scripts/build_fixtures.ps1
       - name: Probe IDA headless worker
