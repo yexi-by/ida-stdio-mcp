@@ -1343,7 +1343,7 @@ def _adapt_function_inspect(
     selected = set(args.views)
     entry = _hex_text(raw.get("entry"), "function.inspect.entry")
     function_entity = _function_entity(context.revision, entry)
-    raw_chunks = _items(raw, "chunks", "function.inspect")
+    raw_chunks = _items(raw, "chunks", "function.inspect") if "chunks" in selected else []
     chunk_bounds: list[tuple[str, str]] = []
     for index, chunk in enumerate(raw_chunks):
         start = _hex_text(chunk.get("start"), f"function.inspect.chunks[{index}].start")

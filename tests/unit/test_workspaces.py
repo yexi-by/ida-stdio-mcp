@@ -53,6 +53,22 @@ def test_uninitialized_workspace_can_be_discarded(tmp_path: Path) -> None:
         registry.get(workspace.workspace_id)
 
 
+def test_workspace_rejects_candidate_changed_by_validator(tmp_path: Path) -> None:
+    source = tmp_path / "sample.bin"
+    source.write_bytes(b"trusted sample")
+    registry = WorkspaceRegistry(tmp_path / "workspaces")
+
+    def mutate_candidate(path: Path, _sha256: str, _size: int) -> None:
+        path.write_bytes(b"changed during validation")
+
+    with pytest.raises(StorageCorruptionError, match="候选样本"):
+        registry.create(source, validate_copy=mutate_candidate)
+
+    assert registry.list() == ()
+    assert tuple((registry.root / ".creating").iterdir()) == ()
+    assert source.read_bytes() == b"trusted sample"
+
+
 def test_workspace_missing_is_explicit(tmp_path: Path) -> None:
     registry = WorkspaceRegistry(tmp_path / "workspaces")
 

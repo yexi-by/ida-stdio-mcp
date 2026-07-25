@@ -9,7 +9,7 @@ import shutil
 import threading
 import time
 import uuid
-from collections.abc import Generator, Mapping
+from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -230,7 +230,12 @@ class WorkspaceRegistry:
 
         return self._lock_root
 
-    def create(self, sample: Path) -> WorkspaceSnapshot:
+    def create(
+        self,
+        sample: Path,
+        *,
+        validate_copy: Callable[[Path, str, int], None] | None = None,
+    ) -> WorkspaceSnapshot:
         """复制并哈希原样本; 源路径永远不会被写入。"""
 
         source = sample.resolve(strict=True)
@@ -244,14 +249,30 @@ class WorkspaceRegistry:
         with self._locks_guard:
             self._active_creating.add(creating)
         try:
-            copied_sha256, copied_size = _copy_sample(source, creating / _SAMPLE_NAME)
+            candidate = creating / _SAMPLE_NAME
+            copied_sha256, copied_size = _copy_sample(source, candidate)
             after = source.stat()
             if (
                 copied_size != before.st_size
                 or before.st_size != after.st_size
                 or before.st_mtime_ns != after.st_mtime_ns
+                or before.st_ctime_ns != after.st_ctime_ns
+                or before.st_ino != after.st_ino
             ):
                 raise StorageCorruptionError("原样本在复制期间发生变化")
+            candidate_before_validation = candidate.stat()
+            if validate_copy is not None:
+                validate_copy(candidate, copied_sha256, copied_size)
+            candidate_after_validation = candidate.stat()
+            if (
+                candidate_after_validation.st_size != copied_size
+                or candidate_before_validation.st_size != candidate_after_validation.st_size
+                or candidate_before_validation.st_mtime_ns != candidate_after_validation.st_mtime_ns
+                or candidate_before_validation.st_ctime_ns != candidate_after_validation.st_ctime_ns
+                or candidate_before_validation.st_ino != candidate_after_validation.st_ino
+                or sha256_file(candidate) != copied_sha256
+            ):
+                raise StorageCorruptionError("workspace 候选样本在验证期间发生变化")
             sample_name = _validate_sample_name(source.name)
             manifest = _WorkspaceManifest(
                 schema_version=STORAGE_SCHEMA_VERSION,

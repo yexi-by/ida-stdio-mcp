@@ -8,11 +8,16 @@ description: 使用 ida-re-mcp 调用 IDA Pro 9.3+ headless MCP，完成 Native 
 ## 建立上下文
 
 1. 调用 `tools/list`，只使用当前目录实际提供的工具。
-2. 调用 `workspace.create`，保存 `workspace_id`、`sample_sha256` 和
+2. 确认输入是可由 IDA 直接加载的 PE/ELF Native 镜像，再调用 `workspace.create`，
+   保存 `workspace_id`、`sample_sha256` 和
    `analysis_operation_id`。
 3. 用 `operation.wait` 等待首次分析；从成功结果中取得 revision。
 4. 调用 `workspace.get`，核对样本摘要、架构与 current revision；按 `next_cursor`
    逐页读取 revision 摘要。
+
+`workspace.create` 会复制输入并只在私有候选副本上执行严格格式预检。不要提交 shell
+脚本、gzexe 或其他压缩包装器；这些输入稳定返回 `unsupported`。服务不会解包或执行
+候选文件，应由用户提供直接 Native 镜像。
 
 不要猜测活动 workspace。每次静态查询都显式传 `workspace_id` 和目标 `revision`。
 revision 改变后重新发起分页查询，不复用 cursor。

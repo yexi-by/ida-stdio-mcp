@@ -513,6 +513,52 @@ def test_function_entity_round_trip_and_all_raw_backed_views() -> None:
     assert request.input["address"] == {"space": "database", "ea": "0x401000"}
 
 
+def test_function_summary_accepts_worker_omission_of_unrequested_views() -> None:
+    args = FunctionInspectInput(
+        workspace_id=_WORKSPACE_ID,
+        revision=_REVISION,
+        function=FunctionByAddress(kind="address", address=_database("0x401000")),
+    )
+
+    output = adapt_worker_results(
+        "function.inspect",
+        args,
+        [
+            _raw(
+                {
+                    "entry": "0x401000",
+                    "name": "renamed_entry",
+                    "size": 32,
+                    "flags": 0,
+                    "does_return": True,
+                    "page": {
+                        "offset": 0,
+                        "limit": 50,
+                        "returned": 0,
+                        "has_more": False,
+                        "next_offset": None,
+                    },
+                    "coverage": {
+                        "complete": True,
+                        "truncated": False,
+                        "reasons": [],
+                    },
+                }
+            )
+        ],
+        _context(),
+    )
+
+    assert isinstance(output, FunctionInspectOutput)
+    assert isinstance(output.start, DatabaseAddress)
+    assert isinstance(output.end, DatabaseAddress)
+    assert output.name == "renamed_entry"
+    assert output.start.ea == "0x401000"
+    assert output.end.ea == "0x401020"
+    assert output.chunks == []
+    assert output.instructions == []
+
+
 def test_graph_query_uses_one_bounded_multihop_worker_contract() -> None:
     args = GraphQueryInput(
         workspace_id=_WORKSPACE_ID,
