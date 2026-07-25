@@ -896,7 +896,7 @@ class AnalysisWorker(OwnerThreadBound):
             operand_type = int(operand.type)
             if operand_type == int(api.ida_ua.o_void):
                 break
-            operand_text = str(api.ida_ua.print_operand(ea, index) or "")
+            operand_text = str(api.ida_lines.tag_remove(api.ida_ua.print_operand(ea, index) or ""))
             text_truncated |= len(operand_text) > 4_096
             operands.append(
                 {

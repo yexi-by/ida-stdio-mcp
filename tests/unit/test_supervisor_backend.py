@@ -55,6 +55,14 @@ class _BlockingWorker:
         self.close_calls += 1
 
 
+class _AbortRecordingWorker(WorkerProcess):
+    def __init__(self) -> None:
+        self.abort_calls = 0
+
+    def abort(self) -> None:
+        self.abort_calls += 1
+
+
 def _replace_launch(
     monkeypatch: pytest.MonkeyPatch,
     worker: _BlockingWorker,
@@ -135,5 +143,40 @@ def test_analysis_cancellation_aborts_persistent_worker_process(
         assert worker.cancelled_request_id is None
         await analysis.close()
         assert worker.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_launch_cancellation_aborts_worker_returned_by_launch_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        launch_started = threading.Event()
+        release_launch = threading.Event()
+        worker = _AbortRecordingWorker()
+
+        def launch(*_args: object, **_kwargs: object) -> WorkerProcess:
+            launch_started.set()
+            assert release_launch.wait(3)
+            return worker
+
+        monkeypatch.setattr(WorkerProcess, "launch", launch)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+        opening = asyncio.create_task(
+            backend.open_analysis(
+                checkout_path=tmp_path / "checkout.i64",
+                revision="revision_123",
+            )
+        )
+        assert await asyncio.to_thread(launch_started.wait, 1)
+
+        opening.cancel()
+        await asyncio.sleep(0)
+        release_launch.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await opening
+        assert worker.abort_calls == 1
 
     asyncio.run(scenario())

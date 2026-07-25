@@ -172,6 +172,11 @@ from ida_re_mcp.supervisor.expert_adapter import (
     ExpertAdapterError,
     adapt_expert_worker_result,
 )
+from ida_re_mcp.supervisor.native_formats import (
+    NativeImageIdentity,
+    UnsupportedNativeImageError,
+    inspect_native_image,
+)
 from ida_re_mcp.supervisor.operations import OperationSnapshot, OperationState
 from ida_re_mcp.supervisor.refine_adapter import (
     RefineAdapterInputError,
@@ -243,6 +248,7 @@ _WORKER_BUSINESS_ERRORS: dict[str, BusinessErrorCode] = {
     "debug_state_conflict": BusinessErrorCode.DEBUG_STATE_CONFLICT,
     "policy_denied": BusinessErrorCode.POLICY_DENIED,
     "revision_conflict": BusinessErrorCode.REVISION_CONFLICT,
+    "slice_seed_not_found": BusinessErrorCode.UNSUPPORTED,
     "unsupported": BusinessErrorCode.UNSUPPORTED,
     "worker_crashed": BusinessErrorCode.WORKER_CRASHED,
     "worker_timeout": BusinessErrorCode.WORKER_CRASHED,
@@ -718,27 +724,40 @@ class Application:
         arguments: WorkspaceCreateInput,
     ) -> WorkspaceCreateOutput:
         sample = Path(arguments.sample_path)
-        workspace = await _complete_thread_call(lambda: self.storage.workspaces.create(sample))
-        if (
-            arguments.expected_sha256 is not None
-            and workspace.sample_sha256 != arguments.expected_sha256
-        ):
-            await _complete_thread_call(
-                lambda: self.storage.workspaces.discard_uninitialized(workspace.workspace_id)
-            )
-            raise ToolExecutionError(
-                BusinessErrorCode.PRECONDITION_FAILED,
-                "样本 SHA-256 与 expected_sha256 不一致",
-                details={
-                    "actual_sha256": workspace.sample_sha256,
-                },
-            )
+        native_identity: NativeImageIdentity | None = None
+
+        def validate_copy(path: Path, sample_sha256: str, _sample_size: int) -> None:
+            nonlocal native_identity
+            if arguments.expected_sha256 is not None and sample_sha256 != arguments.expected_sha256:
+                raise ToolExecutionError(
+                    BusinessErrorCode.PRECONDITION_FAILED,
+                    "样本 SHA-256 与 expected_sha256 不一致",
+                    details={
+                        "actual_sha256": sample_sha256,
+                    },
+                )
+            try:
+                native_identity = inspect_native_image(path)
+            except UnsupportedNativeImageError as exc:
+                raise ToolExecutionError(
+                    BusinessErrorCode.UNSUPPORTED,
+                    str(exc),
+                    details=cast(dict[str, JsonValue], exc.details),
+                ) from exc
+
+        workspace = await _complete_thread_call(
+            lambda: self.storage.workspaces.create(sample, validate_copy=validate_copy)
+        )
+        validated_identity = native_identity
+        if validated_identity is None:
+            raise RuntimeError("workspace 候选样本缺少 Native 预检身份")
         operation_id = self._schedule_operation(
             "workspace_create",
             workspace.workspace_id,
             lambda current_operation_id: self._initialize_workspace(
                 workspace,
                 operation_id=current_operation_id,
+                native_identity=validated_identity,
             ),
             discard_workspace_on_failure=True,
             cancellable=True,
@@ -2281,6 +2300,7 @@ class Application:
         workspace: WorkspaceSnapshot,
         *,
         operation_id: str,
+        native_identity: NativeImageIdentity,
     ) -> JsonObject:
         async with (
             self._workspace_lock(workspace.workspace_id),
@@ -2289,6 +2309,7 @@ class Application:
             return await self._initialize_workspace_unlocked(
                 workspace,
                 operation_id=operation_id,
+                native_identity=native_identity,
             )
 
     async def _initialize_workspace_unlocked(
@@ -2296,7 +2317,22 @@ class Application:
         workspace: WorkspaceSnapshot,
         *,
         operation_id: str,
+        native_identity: NativeImageIdentity,
     ) -> JsonObject:
+        current_workspace = await asyncio.to_thread(
+            self.storage.workspaces.get,
+            workspace.workspace_id,
+        )
+        current_identity = await asyncio.to_thread(
+            inspect_native_image,
+            current_workspace.sample_path,
+        )
+        if (
+            current_workspace.sample_sha256 != workspace.sample_sha256
+            or current_identity != native_identity
+        ):
+            raise RuntimeError("workspace 样本身份在 Native 预检后发生变化")
+        workspace = current_workspace
         staging = await self._begin_revision_staging(
             workspace.workspace_id,
             expected_revision=None,
@@ -2311,7 +2347,12 @@ class Application:
                 raise RuntimeError("bootstrap worker 返回的样本摘要不一致")
             receipt = await self._cold_validate(
                 staging,
-                expected=_ColdImageIdentity(sample_sha256=workspace.sample_sha256),
+                expected=_ColdImageIdentity(
+                    sample_sha256=workspace.sample_sha256,
+                    architecture=native_identity.architecture,
+                    bitness=native_identity.bitness,
+                    endianness=native_identity.endian,
+                ),
             )
             operation_result: JsonObject = {
                 "workspace_id": workspace.workspace_id,
@@ -2850,7 +2891,17 @@ def _operation_failure(exc: Exception) -> tuple[str, str, JsonValue]:
     if isinstance(exc, ToolExecutionError):
         return exc.code.value, exc.message, cast(JsonValue, exc.details)
     if isinstance(exc, WorkerProcessError):
-        return exc.code, str(exc), cast(JsonValue, exc.details)
+        details = dict(exc.details)
+        if exc.code == "worker_timeout":
+            details["reason"] = "timeout"
+            message = "worker 操作超时并已终止"
+        else:
+            message = "worker 进程崩溃或失联"
+        return (
+            BusinessErrorCode.WORKER_CRASHED.value,
+            message,
+            cast(JsonValue, details),
+        )
     translated = _tool_error(exc)
     if translated is not None:
         return (

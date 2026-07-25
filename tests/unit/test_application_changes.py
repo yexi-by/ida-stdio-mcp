@@ -35,6 +35,7 @@ from ida_re_mcp.domain.tools import (
     ProgramSearchInput,
     ProgramSearchOutput,
     RenameOperation,
+    WorkspaceCreateInput,
     WorkspaceExportInput,
     WorkspaceExportOutput,
     WorkspaceGetInput,
@@ -433,6 +434,45 @@ def _prepare(workspace: WorkspaceSnapshot) -> ChangePrepareInput:
             )
         ],
     )
+
+
+def test_workspace_create_rejects_shell_wrapper_before_worker_launch(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig()
+        paths = _paths(tmp_path)
+        storage = SupervisorStorage.open(config=config, paths=paths)
+        source = tmp_path / "self-extracting.sh"
+        source.write_bytes(b"#!/system/bin/sh\n" + b"\x1f\x8b\x08" + b"\0" * 64)
+        source_before = source.read_bytes()
+        source_sha256 = hashlib.sha256(source_before).hexdigest()
+        backend = _FakeIdaBackend(source_sha256)
+        application = Application(
+            config=config,
+            storage=storage,
+            changes=ChangeSetStore(
+                paths.data_root / "change-sets",
+                workspace_lease_root=storage.workspaces.lease_root,
+            ),
+            cursors=CursorCodec(paths.data_root / "cursor.key"),
+            backend=backend,
+        )
+        try:
+            with pytest.raises(ToolExecutionError) as raised:
+                await application.execute_tool(
+                    "workspace.create",
+                    WorkspaceCreateInput(sample_path=str(source)),
+                )
+
+            assert raised.value.code is BusinessErrorCode.UNSUPPORTED
+            assert raised.value.details["detected"] == "shell_script"
+            assert storage.workspaces.list() == ()
+            assert tuple((paths.workspace_root / ".creating").iterdir()) == ()
+            assert source.read_bytes() == source_before
+            assert hashlib.sha256(source.read_bytes()).hexdigest() == source_sha256
+        finally:
+            await application.aclose()
+
+    asyncio.run(scenario())
 
 
 def test_change_prepare_apply_and_inverse_preserve_all_revision_invariants(
@@ -1025,6 +1065,7 @@ def test_workspace_list_restores_failed_initialization_state_after_restart(
     [
         ("cursor_stale", BusinessErrorCode.CURSOR_STALE),
         ("ambiguous_reference", BusinessErrorCode.AMBIGUOUS_REFERENCE),
+        ("slice_seed_not_found", BusinessErrorCode.UNSUPPORTED),
         ("unsupported", BusinessErrorCode.UNSUPPORTED),
         ("capability_unavailable", BusinessErrorCode.CAPABILITY_UNAVAILABLE),
         ("private_worker_detail", BusinessErrorCode.EXECUTION_FAILED),

@@ -9,6 +9,7 @@ import json
 import os
 import platform
 import sys
+import threading
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, cast
@@ -101,6 +102,80 @@ class _IdaPro(Protocol):
     def close_database(self, save: bool = True) -> None: ...
 
 
+class IdaSessionHandler:
+    """建立 IPC 后再在 owner 线程打开数据库, 并代理实际 worker。"""
+
+    def __init__(self, arguments: argparse.Namespace) -> None:
+        self._arguments = arguments
+        self._idapro: _IdaPro | None = None
+        self._handler: WorkerHandler | None = None
+        self._cancellation: threading.Event | None = None
+
+    def bind_cancellation(self, cancellation: threading.Event | None) -> None:
+        self._cancellation = cancellation
+        if self._handler is None:
+            return
+        bind = getattr(self._handler, "bind_cancellation", None)
+        if callable(bind):
+            bind(cancellation)
+
+    def execute(self, operation: str, input: Mapping[str, object]) -> dict[str, object]:
+        handler = self._ensure_open()
+        return handler.execute(operation, input)
+
+    def poll(self) -> None:
+        if self._handler is None:
+            return
+        poll = getattr(self._handler, "poll", None)
+        if callable(poll):
+            poll()
+
+    def close(self) -> None:
+        try:
+            if self._handler is not None:
+                close = getattr(self._handler, "close", None)
+                if callable(close):
+                    close()
+        finally:
+            self._handler = None
+            if self._idapro is not None:
+                self._idapro.close_database(save=False)
+                self._idapro = None
+
+    def _ensure_open(self) -> WorkerHandler:
+        if self._handler is not None:
+            return self._handler
+        kind = cast(str, self._arguments.kind)
+        database_value = (
+            cast(str | None, self._arguments.sample)
+            if kind == "bootstrap"
+            else cast(str | None, self._arguments.checkout)
+        )
+        if database_value is None:
+            raise WorkerInputError(f"{kind} worker 缺少数据库输入路径")
+        idapro = cast(_IdaPro, importlib.import_module("idapro"))
+        run_auto_analysis = kind in {"bootstrap", "analysis", "mutation", "expert"}
+        result = idapro.open_database(database_value, run_auto_analysis=run_auto_analysis)
+        if result != 0:
+            raise WorkerError(
+                "ida_open_failed",
+                "IDALib 无法打开 worker 数据库输入",
+                details={"ida_result": result, "kind": kind},
+            )
+        self._idapro = idapro
+        try:
+            handler = cast(WorkerHandler, _build_handler(self._arguments))
+        except BaseException:
+            self._idapro.close_database(save=False)
+            self._idapro = None
+            raise
+        self._handler = handler
+        bind = getattr(handler, "bind_cancellation", None)
+        if callable(bind):
+            bind(self._cancellation)
+        return handler
+
+
 def _build_handler(arguments: argparse.Namespace) -> object:
     kind = cast(str, arguments.kind)
     checkout_value = cast(str | None, arguments.checkout)
@@ -154,32 +229,8 @@ def _serve(arguments: argparse.Namespace) -> int:
         cast(str, arguments.address),
         authkey,
     )
-    idapro = cast(_IdaPro, importlib.import_module("idapro"))
-    kind = cast(str, arguments.kind)
-    database_value = (
-        cast(str | None, arguments.sample)
-        if kind == "bootstrap"
-        else cast(str | None, arguments.checkout)
-    )
-    if database_value is None:
-        raise WorkerInputError(f"{kind} worker 缺少数据库输入路径")
-    run_auto_analysis = kind in {"bootstrap", "analysis", "mutation", "expert"}
-    opened = False
-    try:
-        result = idapro.open_database(database_value, run_auto_analysis=run_auto_analysis)
-        if result != 0:
-            raise WorkerError(
-                "ida_open_failed",
-                "IDALib 无法打开 worker 数据库输入",
-                details={"ida_result": result, "kind": kind},
-            )
-        opened = True
-        handler = _build_handler(arguments)
-        serve_worker(endpoint, cast(WorkerHandler, handler))
-        return 0
-    finally:
-        if opened:
-            idapro.close_database(save=False)
+    serve_worker(endpoint, IdaSessionHandler(arguments))
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

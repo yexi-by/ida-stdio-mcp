@@ -216,10 +216,8 @@ class SubprocessIdaBackend:
         checkout_path: Path,
         revision: str,
     ) -> AnalysisBackend:
-        process = await asyncio.to_thread(
-            WorkerProcess.launch,
+        process = await self._launch(
             kind="analysis",
-            log_root=self._log_root,
             checkout=checkout_path,
             revision=revision,
         )
@@ -281,10 +279,8 @@ class SubprocessIdaBackend:
         revision: str,
         allow_attach: bool,
     ) -> DebugBackend:
-        process = await asyncio.to_thread(
-            WorkerProcess.launch,
+        process = await self._launch(
             kind="debug",
-            log_root=self._log_root,
             checkout=checkout_path,
             sample=sample_path,
             allow_attach=allow_attach,
@@ -336,10 +332,8 @@ class SubprocessIdaBackend:
         sample: Path | None = None,
         revision: str | None = None,
     ) -> JsonObject:
-        process = await asyncio.to_thread(
-            WorkerProcess.launch,
+        process = await self._launch(
             kind=kind,
-            log_root=self._log_root,
             checkout=checkout,
             sample=sample,
             revision=revision,
@@ -360,3 +354,33 @@ class SubprocessIdaBackend:
             raise
         finally:
             await asyncio.to_thread(process.close)
+
+    async def _launch(
+        self,
+        *,
+        kind: WorkerKind,
+        checkout: Path | None = None,
+        sample: Path | None = None,
+        revision: str | None = None,
+        allow_attach: bool = False,
+    ) -> WorkerProcess:
+        """取消若撞上进程启动, 等待句柄产生并立即终止, 避免遗失 worker。"""
+
+        launch = asyncio.create_task(
+            asyncio.to_thread(
+                WorkerProcess.launch,
+                kind=kind,
+                log_root=self._log_root,
+                checkout=checkout,
+                sample=sample,
+                revision=revision,
+                allow_attach=allow_attach,
+            )
+        )
+        try:
+            return await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            outcome = (await asyncio.gather(launch, return_exceptions=True))[0]
+            if isinstance(outcome, WorkerProcess):
+                await asyncio.to_thread(outcome.abort)
+            raise

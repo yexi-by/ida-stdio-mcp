@@ -52,6 +52,10 @@ staging、临时文件和虚拟环境都位于工作树外。
 
 ## Agent 工作流
 
+`workspace.create` 会先把用户提供的文件复制为私有候选副本，再对副本执行严格的
+PE/ELF Native 格式预检。调用方必须提供可由 IDA 直接加载的 Native 镜像；shell
+脚本、gzexe 和其他压缩包装器稳定返回 `unsupported`。服务不会解包或执行候选文件。
+
 1. 调用 `workspace.create`，保存 `workspace_id` 与 `analysis_operation_id`。
 2. 用 `operation.wait` 等待首次分析，取得不可变 revision。
 3. 使用显式 `workspace_id` 与 `revision` 调用静态查询。
@@ -67,7 +71,8 @@ staging、临时文件和虚拟环境都位于工作树外。
 
 ## 安全与一致性
 
-- 原始样本只读，`workspace.create` 会复制并校验 SHA-256。
+- 原始样本只读，`workspace.create` 会复制并校验 SHA-256，所有格式识别都发生在私有
+  候选副本上。
 - AnalysisWorker 与 DebugWorker 使用私有 checkout，关闭时不保存。
 - 所有 IDB 写入都在 staging 中完成，经过回读、冷验证和 CAS 后发布为新 revision。
 - mutation 失败、取消或 worker 崩溃不得改变旧 revision、HEAD 或样本摘要。
