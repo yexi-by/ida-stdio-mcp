@@ -1,0 +1,22 @@
+schema_version = "1"
+
+[policy]
+# 允许事务化 IDB 写回。
+authoring = true
+# 只允许启动当前 workspace 对应的样本。
+debug_launch = true
+# 附加外部进程需要操作者显式开启。
+debug_attach = false
+# 开放世界 IDAPython 默认不进入工具目录。
+expert = false
+
+[workers]
+# 并发上限受 IDA 许可证约束；同一 workspace 仍严格串行。
+analysis_limit = 1
+debug_limit = 1
+idle_seconds = 300
+
+[storage]
+# 软配额不会删除 HEAD revision 或 pinned export。
+quota_gib = 20
+retained_revisions = 3

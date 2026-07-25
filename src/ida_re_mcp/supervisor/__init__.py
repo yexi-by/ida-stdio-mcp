@@ -1,0 +1,78 @@
+"""不依赖 IDA 的 Supervisor 公共 API。"""
+
+from ida_re_mcp.supervisor.artifacts import (
+    ArtifactChunk,
+    ArtifactFileInput,
+    ArtifactGarbageCollectionResult,
+    ArtifactMetadata,
+    ArtifactStore,
+    ChunkedArtifact,
+    artifact_uri,
+    parse_artifact_uri,
+)
+from ida_re_mcp.supervisor.errors import (
+    ArtifactIntegrityError,
+    ArtifactNotFoundError,
+    InvalidIdentifierError,
+    OperationNotFoundError,
+    OperationStateError,
+    RevisionConflictError,
+    RevisionNotFoundError,
+    StagingIntegrityError,
+    StorageCorruptionError,
+    SupervisorError,
+    WorkspaceNotFoundError,
+)
+from ida_re_mcp.supervisor.operations import (
+    OperationCoordinator,
+    OperationFailure,
+    OperationSnapshot,
+    OperationState,
+)
+from ida_re_mcp.supervisor.storage import StorageUsage, SupervisorStorage
+from ida_re_mcp.supervisor.workspaces import (
+    ColdValidationReceipt,
+    GarbageCollectionResult,
+    RevisionCheckout,
+    RevisionSnapshot,
+    RevisionStaging,
+    WorkspaceRegistry,
+    WorkspaceSnapshot,
+    hash_staging_payload,
+)
+
+__all__ = [
+    "ArtifactChunk",
+    "ArtifactFileInput",
+    "ArtifactGarbageCollectionResult",
+    "ArtifactIntegrityError",
+    "ArtifactMetadata",
+    "ArtifactNotFoundError",
+    "ArtifactStore",
+    "ChunkedArtifact",
+    "ColdValidationReceipt",
+    "GarbageCollectionResult",
+    "InvalidIdentifierError",
+    "OperationCoordinator",
+    "OperationFailure",
+    "OperationNotFoundError",
+    "OperationSnapshot",
+    "OperationState",
+    "OperationStateError",
+    "RevisionCheckout",
+    "RevisionConflictError",
+    "RevisionNotFoundError",
+    "RevisionSnapshot",
+    "RevisionStaging",
+    "StagingIntegrityError",
+    "StorageCorruptionError",
+    "StorageUsage",
+    "SupervisorError",
+    "SupervisorStorage",
+    "WorkspaceNotFoundError",
+    "WorkspaceRegistry",
+    "WorkspaceSnapshot",
+    "artifact_uri",
+    "hash_staging_payload",
+    "parse_artifact_uri",
+]

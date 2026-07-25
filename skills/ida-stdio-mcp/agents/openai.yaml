@@ -1,7 +1,0 @@
-interface:
-  display_name: "ida-stdio-mcp"
-  short_description: "IDA 9.3+ MCP 逆向工作流"
-  default_prompt: "使用 $ida-stdio-mcp 按 MCP 逆向工作流分析这个二进制样本。"
-
-policy:
-  allow_implicit_invocation: true

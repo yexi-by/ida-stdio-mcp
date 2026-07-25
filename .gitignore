@@ -1,23 +1,11 @@
-# Python-generated files
 __pycache__/
-*.py[oc]
+*.py[cod]
+*.egg-info/
+.basedpyright/
+.hypothesis/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 build/
 dist/
-wheels/
-*.egg-info
-*.i64
-*.idb
-*.nam
-*.til
-
-# Virtual environments
-.venv
-
-# 运行产物
-logs/
-.runtime/
-*.pdb/
-*.pdb/**
-
-# 本地测试与人工评审材料
-真实用例测试报告/
