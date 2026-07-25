@@ -2,6 +2,7 @@ name: ida-e2e
 
 on:
   push:
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
@@ -10,6 +11,9 @@ permissions:
 
 jobs:
   ida:
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, windows, x64, ida-pro-9_3]
     timeout-minutes: 60
     steps:
