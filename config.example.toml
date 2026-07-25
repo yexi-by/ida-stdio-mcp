@@ -1,5 +1,11 @@
 schema_version = "1"
 
+# 本机部署可在一份共享配置中指定以下路径；MCP host 无需分别设置 data/log root。
+# [runtime]
+# data_root = 'C:\Users\you\AppData\Local\ida-re-mcp\data'
+# log_root = 'C:\Users\you\AppData\Local\ida-re-mcp\logs'
+# ida_dir = 'C:\Program Files\IDA Professional 9.3'
+
 [policy]
 # 允许事务化 IDB 写回。
 authoring = true
@@ -11,7 +17,7 @@ debug_attach = false
 expert = false
 
 [workers]
-# 并发上限受 IDA 许可证约束；同一 workspace 仍严格串行。
+# 并发上限在共享 data_root 内跨所有 stdio host 全局生效；同一 workspace 仍严格串行。
 analysis_limit = 1
 debug_limit = 1
 idle_seconds = 300

@@ -12,7 +12,7 @@ import pytest
 from pydantic import JsonValue
 
 from ida_re_mcp.application import Application
-from ida_re_mcp.config import AppConfig, RuntimePaths
+from ida_re_mcp.config import AppConfig, RuntimePaths, WorkerConfig
 from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES
 from ida_re_mcp.domain.address import DatabaseAddress
 from ida_re_mcp.domain.base import JsonObject
@@ -43,6 +43,7 @@ from ida_re_mcp.domain.tools import (
     WorkspaceListInput,
     WorkspaceListOutput,
 )
+from ida_re_mcp.supervisor._process_lock import AsyncInterprocessSlotLease
 from ida_re_mcp.supervisor.artifacts import ArtifactNotFoundError, parse_artifact_uri
 from ida_re_mcp.supervisor.backend import AnalysisBackend, DebugBackend
 from ida_re_mcp.supervisor.changes import ChangeSetStore
@@ -50,6 +51,7 @@ from ida_re_mcp.supervisor.cursors import CursorCodec
 from ida_re_mcp.supervisor.storage import SupervisorStorage
 from ida_re_mcp.supervisor.workspaces import (
     ColdValidationReceipt,
+    RevisionCheckout,
     RevisionSnapshot,
     WorkspaceSnapshot,
     hash_staging_payload,
@@ -350,6 +352,78 @@ class _FakeIdaBackend:
         return {"available": True}
 
 
+class _ControlledOpenIdaBackend(_FakeIdaBackend):
+    def __init__(self, sample_sha256: str) -> None:
+        super().__init__(sample_sha256)
+        self.open_entered = asyncio.Event()
+        self.allow_open_return = asyncio.Event()
+
+    async def open_analysis(
+        self,
+        *,
+        checkout_path: Path,
+        revision: str,
+    ) -> AnalysisBackend:
+        self.analysis_open_count += 1
+        self.open_entered.set()
+        await self.allow_open_return.wait()
+        return _FakeAnalysisBackend(self, checkout_path, revision)
+
+
+class _TestApplication(Application):
+    def __init__(
+        self,
+        *,
+        config: AppConfig,
+        storage: SupervisorStorage,
+        changes: ChangeSetStore,
+        cursors: CursorCodec,
+        backend: _FakeIdaBackend,
+    ) -> None:
+        super().__init__(
+            config=config,
+            storage=storage,
+            changes=changes,
+            cursors=cursors,
+            backend=backend,
+        )
+        self.analysis_opening_finish_entered = asyncio.Event()
+
+    @property
+    def analysis_opening_count_for_test(self) -> int:
+        return self._analysis_opening_count
+
+    async def hold_analysis_opening_guard_for_test(self) -> None:
+        await self._analysis_sessions_guard.acquire()
+
+    def release_analysis_opening_guard_for_test(self) -> None:
+        self._analysis_sessions_guard.release()
+
+    async def open_transient_analysis_for_test(
+        self,
+        checkout_path: Path,
+        revision: str,
+    ) -> tuple[AnalysisBackend, AsyncInterprocessSlotLease]:
+        return await self._open_transient_analysis(checkout_path, revision)
+
+    async def acquire_analysis_session_for_test(
+        self,
+        workspace_id: str,
+        revision: str,
+    ) -> None:
+        await self._acquire_analysis_session(workspace_id, revision)
+
+    async def acquire_global_analysis_slot_for_test(self) -> AsyncInterprocessSlotLease:
+        return await self._analysis_worker_slots.acquire()
+
+    def set_close_task_for_test(self, task: asyncio.Task[None] | None) -> None:
+        self._close_task = task
+
+    async def _finish_analysis_opening(self) -> None:
+        self.analysis_opening_finish_entered.set()
+        await super()._finish_analysis_opening()
+
+
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -366,6 +440,20 @@ def _paths(tmp_path: Path) -> RuntimePaths:
     )
 
 
+def _session_paths(tmp_path: Path, session_id: str) -> RuntimePaths:
+    data_root = tmp_path / "runtime"
+    session_root = data_root / "sessions" / session_id
+    return RuntimePaths(
+        data_root=data_root,
+        log_root=data_root / "logs" / "sessions" / session_id,
+        workspace_root=data_root / "workspaces",
+        artifact_root=data_root / "artifacts",
+        checkout_root=session_root / "checkouts",
+        temp_root=session_root / "temp",
+        session_root=session_root,
+    )
+
+
 def _application(
     tmp_path: Path,
     *,
@@ -377,7 +465,7 @@ def _application(
     large_overview_count: int = 0,
     cold_sample_sha256: str | None = None,
     cold_mismatch_call: int | None = None,
-) -> tuple[Application, WorkspaceSnapshot, bytes, _FakeIdaBackend]:
+) -> tuple[_TestApplication, WorkspaceSnapshot, bytes, _FakeIdaBackend]:
     config = AppConfig()
     paths = _paths(tmp_path)
     storage = SupervisorStorage.open(config=config, paths=paths)
@@ -408,7 +496,7 @@ def _application(
         cold_sample_sha256=cold_sample_sha256,
         cold_mismatch_call=cold_mismatch_call,
     )
-    application = Application(
+    application = _TestApplication(
         config=config,
         storage=storage,
         changes=ChangeSetStore(
@@ -940,6 +1028,249 @@ def test_analysis_worker_and_private_checkout_are_reused_until_application_close
 
         assert backend.analysis_close_count == 1
         assert tuple(application.storage.paths.checkout_root.rglob("chk_*")) == ()
+
+    asyncio.run(scenario())
+
+
+def test_remote_waiter_preempts_idle_analysis_worker_across_sessions(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(
+            workers=WorkerConfig(
+                analysis_limit=1,
+                debug_limit=1,
+                idle_seconds=300,
+            )
+        )
+        first_paths = _session_paths(tmp_path, "session_first")
+        second_paths = _session_paths(tmp_path, "session_second")
+        first_storage = SupervisorStorage.open(config=config, paths=first_paths)
+
+        source = tmp_path / "shared-sample.exe"
+        source.write_bytes(b"MZ" + b"\0" * 510)
+        workspace = first_storage.workspaces.create(source)
+        staging = first_storage.workspaces.begin_staging(
+            workspace.workspace_id,
+            expected_revision=None,
+        )
+        staging.database_path.write_bytes(b"cold-base")
+        receipt = ColdValidationReceipt.create(
+            validator="fake_ida_9_3_headless",
+            component_hashes=hash_staging_payload(staging),
+        )
+        published = first_storage.workspaces.publish_staging(staging, receipt=receipt)
+        workspace = first_storage.workspaces.get(workspace.workspace_id)
+        assert workspace.current_revision == published.revision
+
+        second_storage = SupervisorStorage.open(config=config, paths=second_paths)
+        first_backend = _FakeIdaBackend(workspace.sample_sha256)
+        second_backend = _FakeIdaBackend(workspace.sample_sha256)
+        first_application = _TestApplication(
+            config=config,
+            storage=first_storage,
+            changes=ChangeSetStore(
+                first_paths.change_root,
+                workspace_lease_root=first_storage.workspaces.lease_root,
+            ),
+            cursors=CursorCodec(first_paths.cursor_key_path),
+            backend=first_backend,
+        )
+        second_application = _TestApplication(
+            config=config,
+            storage=second_storage,
+            changes=ChangeSetStore(
+                second_paths.change_root,
+                workspace_lease_root=second_storage.workspaces.lease_root,
+            ),
+            cursors=CursorCodec(second_paths.cursor_key_path),
+            backend=second_backend,
+        )
+        request = ProgramOverviewInput(
+            workspace_id=workspace.workspace_id,
+            revision=published.revision,
+            include=[],
+        )
+
+        try:
+            first = await first_application.execute_tool("program.overview", request)
+            assert isinstance(first, ProgramOverviewOutput)
+            assert first_backend.analysis_open_count == 1
+            assert first_backend.analysis_close_count == 0
+
+            second = await asyncio.wait_for(
+                second_application.execute_tool("program.overview", request),
+                timeout=2,
+            )
+
+            assert isinstance(second, ProgramOverviewOutput)
+            assert first_backend.analysis_close_count == 1
+            assert second_backend.analysis_open_count == 1
+        finally:
+            await second_application.aclose()
+            await first_application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_transient_analysis_open_releases_backend_slot_and_opening_count(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        application, workspace, _sample_bytes, _unused_backend = _application(tmp_path)
+        assert workspace.current_revision is not None
+        backend = _ControlledOpenIdaBackend(workspace.sample_sha256)
+        application.backend = backend
+        checkout_path = tmp_path / "transient-analysis.i64"
+        checkout_path.write_bytes(b"cold-checkout")
+        task = asyncio.create_task(
+            application.open_transient_analysis_for_test(
+                checkout_path,
+                workspace.current_revision,
+            )
+        )
+        guard_held = False
+        try:
+            await asyncio.wait_for(backend.open_entered.wait(), timeout=1)
+            await application.hold_analysis_opening_guard_for_test()
+            guard_held = True
+            backend.allow_open_return.set()
+            await asyncio.wait_for(
+                application.analysis_opening_finish_entered.wait(),
+                timeout=1,
+            )
+
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            application.release_analysis_opening_guard_for_test()
+            guard_held = False
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert backend.analysis_open_count == 1
+            assert backend.analysis_close_count == 1
+            assert application.analysis_opening_count_for_test == 0
+            replacement_slot = await asyncio.wait_for(
+                application.acquire_global_analysis_slot_for_test(),
+                timeout=1,
+            )
+            await replacement_slot.release()
+        finally:
+            backend.allow_open_return.set()
+            if guard_held:
+                application.release_analysis_opening_guard_for_test()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_analysis_checkout_copy_is_discarded_after_thread_returns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        application, workspace, _sample_bytes, backend = _application(tmp_path)
+        assert workspace.current_revision is not None
+        checkout_created = threading.Event()
+        allow_create_return = threading.Event()
+        created: list[RevisionCheckout] = []
+        original_create = cast(
+            Callable[..., RevisionCheckout],
+            application.storage.workspaces.create_checkout,
+        )
+
+        def blocked_create_checkout(
+            workspace_id: str,
+            revision: str,
+            *,
+            purpose: str,
+        ) -> RevisionCheckout:
+            checkout = original_create(
+                workspace_id,
+                revision,
+                purpose=purpose,
+            )
+            created.append(checkout)
+            checkout_created.set()
+            if not allow_create_return.wait(timeout=5):
+                raise TimeoutError("测试未释放 checkout 创建线程")
+            return checkout
+
+        monkeypatch.setattr(
+            application.storage.workspaces,
+            "create_checkout",
+            blocked_create_checkout,
+        )
+        task = asyncio.create_task(
+            application.acquire_analysis_session_for_test(
+                workspace.workspace_id,
+                workspace.current_revision,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(checkout_created.wait, 1)
+            assert len(created) == 1
+            checkout = created[0]
+            assert checkout.path.is_dir()
+
+            task.cancel()
+            await asyncio.sleep(0)
+            assert not task.done()
+            allow_create_return.set()
+
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert backend.analysis_open_count == 0
+            assert application.analysis_opening_count_for_test == 0
+            assert not checkout.path.exists()
+            assert tuple(application.storage.paths.checkout_root.rglob("chk_*")) == ()
+
+            checkout.path.mkdir(parents=True)
+            (checkout.path / "orphan-probe").write_bytes(b"orphan")
+            preview = application.storage.workspaces.collect_garbage(
+                workspace_id=workspace.workspace_id,
+                dry_run=True,
+            )
+            assert checkout.path in preview.removed_paths
+            applied = application.storage.workspaces.collect_garbage(
+                workspace_id=workspace.workspace_id,
+                dry_run=False,
+            )
+            assert checkout.path in applied.removed_paths
+            assert not checkout.path.exists()
+        finally:
+            allow_create_return.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_application_close_propagates_an_already_cancelled_close_task(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        application, _workspace, _sample_bytes, _backend = _application(tmp_path)
+        cancelled_close = asyncio.create_task(asyncio.sleep(60))
+        cancelled_close.cancel()
+        await asyncio.gather(cancelled_close, return_exceptions=True)
+        assert cancelled_close.cancelled()
+
+        application.set_close_task_for_test(cancelled_close)
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await application.aclose()
+        finally:
+            application.set_close_task_for_test(None)
+            await application.aclose()
 
     asyncio.run(scenario())
 

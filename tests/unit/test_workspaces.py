@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
@@ -13,6 +15,7 @@ from ida_re_mcp.supervisor import (
     WorkspaceNotFoundError,
     WorkspaceRegistry,
 )
+from ida_re_mcp.supervisor._process_lock import InterprocessFileLock
 
 
 def test_workspace_copies_and_hashes_original_without_overwriting(tmp_path: Path) -> None:
@@ -101,6 +104,246 @@ def test_workspace_gc_removes_crash_left_creating_directory(tmp_path: Path) -> N
     applied = registry.collect_garbage(dry_run=False)
     assert applied.removed_paths == (crashed,)
     assert not crashed.exists()
+
+
+def test_workspace_gc_preserves_other_session_active_creation(tmp_path: Path) -> None:
+    registry = WorkspaceRegistry(tmp_path / "workspaces")
+    active = registry.root / ".creating" / "ws_active"
+    active.mkdir()
+    (active / "sample.bin").write_bytes(b"partial")
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_creation_lease() -> None:
+        lease = registry.workspace_lease_lock("ws_active")
+        with lease:
+            acquired.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_creation_lease)
+    holder.start()
+    assert acquired.wait(timeout=1)
+    try:
+        result = registry.collect_garbage(dry_run=False)
+        assert result.removed_paths == ()
+        assert result.skipped_workspace_ids == ("ws_active",)
+        assert active.is_dir()
+    finally:
+        release.set()
+        holder.join(timeout=1)
+    assert not holder.is_alive()
+
+
+def test_concurrent_workspace_gc_continues_when_creating_directory_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = WorkspaceRegistry(tmp_path / "workspaces")
+    second = WorkspaceRegistry(tmp_path / "workspaces")
+    crashed = first.root / ".creating" / "ws_crashed"
+    crashed.mkdir()
+    (crashed / "sample.bin").write_bytes(b"partial")
+    reached_lease = threading.Event()
+    continue_gc = threading.Event()
+    original_workspace_lease_lock = first.workspace_lease_lock
+
+    def delayed_workspace_lease_lock(workspace_id: str) -> InterprocessFileLock:
+        if workspace_id == "ws_crashed":
+            reached_lease.set()
+            assert continue_gc.wait(timeout=5)
+        return original_workspace_lease_lock(workspace_id)
+
+    monkeypatch.setattr(first, "workspace_lease_lock", delayed_workspace_lease_lock)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(first.collect_garbage, dry_run=False)
+        try:
+            assert reached_lease.wait(timeout=1)
+            winner = second.collect_garbage(dry_run=False)
+        finally:
+            continue_gc.set()
+        follower = future.result(timeout=1)
+
+    assert winner.removed_paths == (crashed,)
+    assert follower.removed_paths == ()
+
+
+def test_workspace_gc_reclaims_expired_uninitialized_workspace_after_lease_release(
+    tmp_path: Path,
+) -> None:
+    registry = WorkspaceRegistry(tmp_path / "workspaces")
+    source = tmp_path / "sample.bin"
+    source.write_bytes(b"sample")
+    workspace = registry.create(source)
+    workspace_root = workspace.sample_path.parent
+    manifest_path = workspace_root / "workspace.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["created_at"] = 0.0
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_initialization_lease() -> None:
+        lease = registry.workspace_lease_lock(workspace.workspace_id)
+        with lease:
+            acquired.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_initialization_lease)
+    holder.start()
+    assert acquired.wait(timeout=1)
+    try:
+        active = registry.collect_garbage(dry_run=False)
+        assert active.removed_paths == ()
+        assert active.skipped_workspace_ids == (workspace.workspace_id,)
+        assert workspace_root.is_dir()
+    finally:
+        release.set()
+        holder.join(timeout=1)
+    assert not holder.is_alive()
+
+    collected = registry.collect_garbage(dry_run=False)
+    assert collected.removed_paths == (workspace_root,)
+    assert not workspace_root.exists()
+    with pytest.raises(WorkspaceNotFoundError):
+        registry.get(workspace.workspace_id)
+
+
+def test_concurrent_workspace_gc_continues_when_workspace_disappears(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = WorkspaceRegistry(tmp_path / "workspaces")
+    second = WorkspaceRegistry(tmp_path / "workspaces")
+    source = tmp_path / "sample.bin"
+    source.write_bytes(b"sample")
+    workspace = first.create(source)
+    workspace_root = workspace.sample_path.parent
+    manifest_path = workspace_root / "workspace.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["created_at"] = 0.0
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+
+    reached_lease = threading.Event()
+    continue_gc = threading.Event()
+    original_workspace_lease_lock = first.workspace_lease_lock
+
+    def delayed_workspace_lease_lock(workspace_id: str) -> InterprocessFileLock:
+        if workspace_id == workspace.workspace_id:
+            reached_lease.set()
+            assert continue_gc.wait(timeout=5)
+        return original_workspace_lease_lock(workspace_id)
+
+    monkeypatch.setattr(first, "workspace_lease_lock", delayed_workspace_lease_lock)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(first.collect_garbage, dry_run=False)
+        try:
+            assert reached_lease.wait(timeout=1)
+            winner = second.collect_garbage(dry_run=False)
+        finally:
+            continue_gc.set()
+        follower = future.result(timeout=1)
+
+    assert winner.removed_paths == (workspace_root,)
+    assert follower.removed_paths == ()
+    assert follower.reclaimed_bytes == 0
+    assert not workspace_root.exists()
+
+
+def test_workspace_list_continues_when_gc_removes_enumerated_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = WorkspaceRegistry(tmp_path / "workspaces")
+    collector = WorkspaceRegistry(tmp_path / "workspaces")
+    source = tmp_path / "sample.bin"
+    source.write_bytes(b"sample")
+    workspace = reader.create(source)
+    workspace_root = workspace.sample_path.parent
+    manifest_path = workspace_root / "workspace.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["created_at"] = 0.0
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+
+    reached_lease = threading.Event()
+    continue_list = threading.Event()
+    original_workspace_lease_lock = reader.workspace_lease_lock
+
+    def delayed_workspace_lease_lock(workspace_id: str) -> InterprocessFileLock:
+        if workspace_id == workspace.workspace_id:
+            reached_lease.set()
+            assert continue_list.wait(timeout=5)
+        return original_workspace_lease_lock(workspace_id)
+
+    monkeypatch.setattr(reader, "workspace_lease_lock", delayed_workspace_lease_lock)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(reader.list)
+        try:
+            assert reached_lease.wait(timeout=1)
+            removed = collector.collect_garbage(dry_run=False)
+        finally:
+            continue_list.set()
+        snapshots = future.result(timeout=1)
+
+    assert removed.removed_paths == (workspace_root,)
+    assert snapshots == ()
+
+
+def test_workspace_list_continues_when_workspace_vanishes_before_type_check(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reader = WorkspaceRegistry(tmp_path / "workspaces")
+    collector = WorkspaceRegistry(tmp_path / "workspaces")
+    source = tmp_path / "sample.bin"
+    source.write_bytes(b"sample")
+    workspace = reader.create(source)
+    workspace_root = workspace.sample_path.parent
+    manifest_path = workspace_root / "workspace.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["created_at"] = 0.0
+    manifest_path.write_text(
+        json.dumps(manifest, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+        encoding="utf-8",
+    )
+
+    reached_type_check = threading.Event()
+    continue_list = threading.Event()
+    reader_thread_id: int | None = None
+    original_lstat = Path.lstat
+
+    def delayed_lstat(path: Path) -> os.stat_result:
+        if threading.get_ident() == reader_thread_id and path == workspace_root:
+            reached_type_check.set()
+            assert continue_list.wait(timeout=5)
+        return original_lstat(path)
+
+    def list_in_reader_thread() -> tuple[object, ...]:
+        nonlocal reader_thread_id
+        reader_thread_id = threading.get_ident()
+        return reader.list()
+
+    monkeypatch.setattr(Path, "lstat", delayed_lstat)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(list_in_reader_thread)
+        try:
+            assert reached_type_check.wait(timeout=1)
+            removed = collector.collect_garbage(dry_run=False)
+        finally:
+            continue_list.set()
+        snapshots = future.result(timeout=1)
+
+    assert removed.removed_paths == (workspace_root,)
+    assert snapshots == ()
 
 
 def test_workspace_lock_serializes_same_workspace(tmp_path: Path) -> None:

@@ -8,8 +8,9 @@ import codecs
 import json
 import shutil
 import tempfile
+import time
 import uuid
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -17,7 +18,11 @@ from typing import cast
 from pydantic import JsonValue
 
 from ida_re_mcp.config import AppConfig, RuntimePaths, load_config
-from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES, RESOURCE_CHUNK_BYTES
+from ida_re_mcp.constants import (
+    MAX_INLINE_RESULT_BYTES,
+    OPERATION_RETENTION_SECONDS,
+    RESOURCE_CHUNK_BYTES,
+)
 from ida_re_mcp.domain.base import JsonObject, StrictModel
 from ida_re_mcp.domain.catalog import build_tool_catalog
 from ida_re_mcp.domain.errors import (
@@ -89,6 +94,8 @@ from ida_re_mcp.protocol import McpRuntime
 from ida_re_mcp.supervisor._fs import canonical_json_bytes
 from ida_re_mcp.supervisor._process_lock import (
     AsyncInterprocessFileLock,
+    AsyncInterprocessSlotLease,
+    AsyncInterprocessSlotPool,
     InterprocessFileLock,
     exclusive_process_lease,
 )
@@ -278,8 +285,10 @@ class _DebugSession:
     backend: DebugBackend
     context: DebugContext
     workspace_lock: AsyncInterprocessFileLock
+    worker_slot: AsyncInterprocessSlotLease
     owned_target: bool
     idle_task: asyncio.Task[None] | None = None
+    close_task: asyncio.Task[None] | None = None
 
 
 @dataclass(slots=True)
@@ -288,9 +297,11 @@ class _AnalysisSession:
     revision: str
     checkout: RevisionCheckout
     backend: AnalysisBackend
+    worker_slot: AsyncInterprocessSlotLease
     in_use: bool
     last_used: float
     idle_task: asyncio.Task[None] | None = None
+    close_task: asyncio.Task[None] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -316,6 +327,13 @@ class _ColdImageIdentity:
             endianness=overview.image.endian,
             image_size=overview.image.image_size,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionGarbageCollection:
+    removed_paths: tuple[Path, ...]
+    skipped_session_ids: tuple[str, ...]
+    reclaimed_bytes: int
 
 
 class Application:
@@ -350,9 +368,21 @@ class Application:
         self._debug_sessions: dict[str, _DebugSession] = {}
         self._analysis_sessions: dict[tuple[str, str], _AnalysisSession] = {}
         self._analysis_sessions_guard = asyncio.Lock()
+        self._analysis_opening_count = 0
+        self._session_close_tasks: set[asyncio.Task[None]] = set()
         self._workspace_locks: dict[str, AsyncInterprocessFileLock] = {}
         self._analysis_slots = asyncio.Semaphore(config.workers.analysis_limit)
         self._debug_slots = asyncio.Semaphore(config.workers.debug_limit)
+        worker_slot_root = storage.paths.data_root / "worker-slots"
+        self._analysis_worker_slots = AsyncInterprocessSlotPool(
+            worker_slot_root / "analysis",
+            limit=config.workers.analysis_limit,
+        )
+        self._debug_worker_slots = AsyncInterprocessSlotPool(
+            worker_slot_root / "debug",
+            limit=config.workers.debug_limit,
+        )
+        self._close_task: asyncio.Task[None] | None = None
         self._closed = False
 
     @classmethod
@@ -364,29 +394,45 @@ class Application:
         backend: IdaBackend | None = None,
     ) -> Application:
         config = load_config(config_path)
-        runtime_paths = (paths or RuntimePaths.discover()).ensure()
-        owner_lease = exclusive_process_lease(runtime_paths.data_root / ".supervisor.lease.lock")
-        if not owner_lease.try_acquire():
-            raise SupervisorAlreadyRunningError(
-                "运行数据目录已被另一个 ida-re-mcp Supervisor 占用: "
-                f"{runtime_paths.data_root.resolve()}"
-            )
+        runtime_paths = paths or RuntimePaths.discover(runtime=config.runtime)
+        runtime_paths.data_root.mkdir(parents=True, exist_ok=True)
+        registry_lease = exclusive_process_lease(_session_registry_lease_path(runtime_paths))
+        registry_lease.acquire()
         try:
-            storage = SupervisorStorage.open(config=config, paths=runtime_paths)
-            return cls(
-                config=config,
-                storage=storage,
-                changes=ChangeSetStore(
-                    storage.paths.data_root / "change-sets",
-                    workspace_lease_root=storage.workspaces.lease_root,
-                ),
-                cursors=CursorCodec(storage.paths.data_root / "cursor.key"),
-                backend=backend or SubprocessIdaBackend(log_root=storage.paths.log_root),
-                owner_lease=owner_lease,
-            )
-        except BaseException:
-            owner_lease.release()
-            raise
+            runtime_paths.ensure()
+            owner_lease = exclusive_process_lease(runtime_paths.session_lease_path)
+            if not owner_lease.try_acquire():
+                raise SupervisorAlreadyRunningError(
+                    "当前 MCP 会话目录已被另一个 ida-re-mcp Supervisor 占用: "
+                    f"{runtime_paths.session_data_root.resolve()}"
+                )
+            try:
+                storage = SupervisorStorage.open(config=config, paths=runtime_paths)
+                worker_environment = (
+                    {"IDADIR": config.runtime.ida_dir}
+                    if config.runtime.ida_dir is not None
+                    else None
+                )
+                return cls(
+                    config=config,
+                    storage=storage,
+                    changes=ChangeSetStore(
+                        storage.paths.change_root,
+                        workspace_lease_root=storage.workspaces.lease_root,
+                    ),
+                    cursors=CursorCodec(storage.paths.cursor_key_path),
+                    backend=backend
+                    or SubprocessIdaBackend(
+                        log_root=storage.paths.log_root,
+                        environment=worker_environment,
+                    ),
+                    owner_lease=owner_lease,
+                )
+            except BaseException:
+                owner_lease.release()
+                raise
+        finally:
+            registry_lease.release()
 
     async def serve(self) -> None:
         """通过官方 MCP stdio transport 运行服务。"""
@@ -543,7 +589,7 @@ class Application:
 
     async def doctor(self) -> tuple[bool, JsonObject]:
         self._require_open()
-        worker = await self.backend.doctor()
+        worker = await self._run_analysis_worker(self.backend.doctor)
         usage = await asyncio.to_thread(self.storage.usage)
         report: JsonObject = {
             "healthy": bool(worker.get("available")),
@@ -552,6 +598,7 @@ class Application:
             "runtime_paths": {
                 "data": str(self.storage.paths.data_root),
                 "logs": str(self.storage.paths.log_root),
+                "session": str(self.storage.paths.session_data_root),
             },
             "storage": {
                 "bytes": usage.total_bytes,
@@ -577,15 +624,22 @@ class Application:
         artifact_result = await asyncio.to_thread(
             self.storage.artifacts.collect_garbage,
             retained_scopes=retained_scopes,
+            retained_revision_provider=self._retained_revisions_for_gc,
             dry_run=not apply,
         )
         change_set_result = await asyncio.to_thread(
             self.changes.collect_garbage,
             retained_scopes=retained_scopes,
+            retained_revision_provider=self._retained_revisions_for_gc,
             dry_run=not apply,
         )
         expired_operations = (
             await asyncio.to_thread(self.storage.operations.purge_expired) if apply else 0
+        )
+        session_result = await asyncio.to_thread(
+            _collect_stale_sessions,
+            self.storage.paths,
+            dry_run=not apply,
         )
         usage = await asyncio.to_thread(self.storage.usage)
         skipped = sorted(
@@ -600,6 +654,7 @@ class Application:
             workspace_result.reclaimed_bytes
             + artifact_result.reclaimed_bytes
             + change_set_result.reclaimed_bytes
+            + session_result.reclaimed_bytes
         )
         protected_bytes = (
             usage.total_bytes if apply else max(0, usage.total_bytes - reclaimed_bytes)
@@ -609,6 +664,7 @@ class Application:
             "artifact": [str(path) for path in artifact_result.removed_paths],
             "change_set": [str(path) for path in change_set_result.removed_change_set_paths],
             "change_set_staging": [str(path) for path in change_set_result.removed_staging_paths],
+            "session": [str(path) for path in session_result.removed_paths],
         }
         storage: JsonObject = {
             "bytes": usage.total_bytes,
@@ -621,49 +677,153 @@ class Application:
             "applied": apply,
             "candidates": candidates,
             "skipped_workspace_ids": skipped_json,
+            "skipped_session_ids": list(session_result.skipped_session_ids),
             "reclaimed_bytes": reclaimed_bytes,
             "expired_operations_removed": expired_operations,
             "storage": storage,
         }
 
-    async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
+    def _retained_revisions_for_gc(self, workspace_id: str) -> set[str]:
+        """在 workspace lifecycle lease 内解析当前已发布 revision。"""
+
         try:
-            for operation_id, task in self._operation_tasks.items():
-                if not task.done():
-                    try:
-                        snapshot = self.storage.operations.get(operation_id)
-                        if snapshot.state is OperationState.QUEUED:
-                            self.storage.operations.cancel(operation_id)
-                            continue
-                    except SupervisorError:
-                        pass
-                    task.cancel()
-            if self._operation_tasks:
-                await asyncio.gather(*self._operation_tasks.values(), return_exceptions=True)
-            for session in tuple(self._debug_sessions.values()):
-                await self._close_debug_session(session)
-            async with self._analysis_sessions_guard:
-                analysis_sessions = tuple(self._analysis_sessions.values())
-                self._analysis_sessions.clear()
-                for session in analysis_sessions:
-                    _cancel_idle_task(session.idle_task)
-                    session.idle_task = None
-            if analysis_sessions:
-                await asyncio.gather(
-                    *(self._close_analysis_session(session) for session in analysis_sessions),
-                )
-            if self._workspace_locks:
-                await asyncio.gather(
-                    *(lock.aclose() for lock in self._workspace_locks.values()),
-                )
+            workspace = self.storage.workspaces.get(workspace_id)
+        except WorkspaceNotFoundError:
+            return set()
+        return {revision.revision for revision in workspace.revisions}
+
+    async def aclose(self) -> None:
+        close_task = self._close_task
+        if close_task is None:
+            self._closed = True
+            close_task = asyncio.create_task(
+                self._aclose_once(),
+                name=f"application-close:{self.storage.paths.session_data_root.name}",
+            )
+            self._close_task = close_task
+        await _await_task_preserving_cancellation(close_task)
+
+    async def _aclose_once(self) -> None:
+        """无论资源清理成败, 都释放当前 stdio 连接的 owner lease。"""
+
+        failures: list[BaseException] = []
+        try:
+            await self._close_runtime_resources_once()
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            self._release_owner_lease()
+        except BaseException as exc:
+            failures.append(exc)
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("ida-re-mcp 关闭期间发生多个清理错误", failures)
+
+    async def _close_runtime_resources_once(self) -> None:
+        """尽量关闭全部任务、worker、checkout 与跨进程锁线程。"""
+
+        failures: list[BaseException] = []
+
+        def record_failures(
+            results: Sequence[object],
+            *,
+            ignore_cancellation: bool = False,
+        ) -> None:
+            for result in results:
+                if not isinstance(result, BaseException):
+                    continue
+                if ignore_cancellation and isinstance(result, asyncio.CancelledError):
+                    continue
+                failures.append(result)
+
+        for operation_id, task in self._operation_tasks.items():
+            if not task.done():
+                try:
+                    snapshot = self.storage.operations.get(operation_id)
+                    if snapshot.state is OperationState.QUEUED:
+                        self.storage.operations.cancel(operation_id)
+                        continue
+                except SupervisorError:
+                    pass
+                except BaseException as exc:
+                    failures.append(exc)
+                task.cancel()
+        if self._operation_tasks:
+            operation_results = await asyncio.gather(
+                *self._operation_tasks.values(),
+                return_exceptions=True,
+            )
+            record_failures(operation_results, ignore_cancellation=True)
+
+        debug_sessions = tuple(self._debug_sessions.values())
+        debug_results = await asyncio.gather(
+            *(self._close_debug_session(session) for session in debug_sessions),
+            return_exceptions=True,
+        )
+        record_failures(debug_results)
+
+        async with self._analysis_sessions_guard:
+            analysis_sessions = tuple(self._analysis_sessions.values())
+            self._analysis_sessions.clear()
+            for session in analysis_sessions:
+                _cancel_idle_task(session.idle_task)
+                session.idle_task = None
+        analysis_results = await asyncio.gather(
+            *(self._close_analysis_session(session) for session in analysis_sessions),
+            return_exceptions=True,
+        )
+        record_failures(analysis_results)
+        self._session_close_tasks.difference_update(
+            task
+            for task in (
+                *(session.close_task for session in debug_sessions),
+                *(session.close_task for session in analysis_sessions),
+            )
+            if task is not None
+        )
+
+        while self._session_close_tasks:
+            closing_sessions = tuple(self._session_close_tasks)
+            close_results = await asyncio.gather(
+                *closing_sessions,
+                return_exceptions=True,
+            )
+            self._session_close_tasks.difference_update(closing_sessions)
+            record_failures(close_results)
+
+        workspace_lock_results = await asyncio.gather(
+            *(lock.aclose() for lock in tuple(self._workspace_locks.values())),
+            return_exceptions=True,
+        )
+        record_failures(workspace_lock_results)
+        pool_results = await asyncio.gather(
+            self._analysis_worker_slots.aclose(),
+            self._debug_worker_slots.aclose(),
+            return_exceptions=True,
+        )
+        record_failures(pool_results)
+
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("ida-re-mcp 关闭期间发生多个清理错误", failures)
+
+    def _release_owner_lease(self) -> None:
+        owner_lease = self._owner_lease
+        self._owner_lease = None
+        if owner_lease is None:
+            return
+        if self.storage.paths.session_root is None:
+            owner_lease.release()
+            return
+        registry_lease = exclusive_process_lease(_session_registry_lease_path(self.storage.paths))
+        registry_lease.acquire()
+        try:
+            owner_lease.release()
+            self.storage.paths.session_lease_path.unlink(missing_ok=True)
         finally:
-            owner_lease = self._owner_lease
-            self._owner_lease = None
-            if owner_lease is not None:
-                owner_lease.release()
+            registry_lease.release()
 
     async def _operation_wait(self, arguments: OperationWaitInput) -> OperationWaitOutput:
         loop = asyncio.get_running_loop()
@@ -1057,11 +1217,13 @@ class Application:
             )
         except (WorkerProcessError, asyncio.CancelledError):
             reusable = False
-            await self._discard_analysis_session(session)
+            discard = asyncio.create_task(self._discard_analysis_session(session))
+            await _await_task_preserving_cancellation(discard)
             raise
         finally:
             if reusable:
-                await self._release_analysis_session(session)
+                release = asyncio.create_task(self._release_analysis_session(session))
+                await _await_task_preserving_cancellation(release)
 
     async def _acquire_analysis_session(
         self,
@@ -1069,6 +1231,7 @@ class Application:
         revision: str,
     ) -> _AnalysisSession:
         key = (workspace_id, revision)
+        victim: _AnalysisSession | None = None
         async with self._analysis_sessions_guard:
             existing = self._analysis_sessions.get(key)
             if existing is not None:
@@ -1079,41 +1242,112 @@ class Application:
                 existing.in_use = True
                 return existing
 
-            if len(self._analysis_sessions) >= self.config.workers.analysis_limit:
+            if (
+                len(self._analysis_sessions) + self._analysis_opening_count
+                >= self.config.workers.analysis_limit
+            ):
                 idle = [item for item in self._analysis_sessions.values() if not item.in_use]
                 if not idle:
                     raise RuntimeError("analysis worker 池与并发信号量状态不一致")
                 victim = min(idle, key=lambda item: item.last_used)
-                del self._analysis_sessions[(victim.workspace_id, victim.revision)]
-                await self._close_analysis_session(victim)
+                victim.in_use = True
+                _cancel_idle_task(victim.idle_task)
+                victim.idle_task = None
+            self._analysis_opening_count += 1
 
-            checkout = await asyncio.to_thread(
-                self.storage.workspaces.create_checkout,
+        if victim is not None:
+            try:
+                await self._close_analysis_session(victim)
+            except BaseException:
+                finish = asyncio.create_task(self._finish_analysis_opening())
+                await _await_task_without_cancellation(finish)
+                raise
+
+        checkout: RevisionCheckout | None = None
+        session: _AnalysisSession | None = None
+        opening_finished = False
+        try:
+            checkout = await self._create_checkout(
                 workspace_id,
                 revision,
                 purpose="analysis",
             )
+            worker_slot: AsyncInterprocessSlotLease | None = None
             try:
+                worker_slot = await self._acquire_analysis_worker_slot()
                 backend = await self.backend.open_analysis(
                     checkout_path=checkout.database_path,
                     revision=revision,
                 )
             except BaseException:
-                await asyncio.to_thread(
-                    self.storage.workspaces.discard_checkout,
-                    checkout,
-                )
+                try:
+                    await _complete_thread_call(
+                        lambda: self.storage.workspaces.discard_checkout(checkout)
+                    )
+                finally:
+                    if worker_slot is not None:
+                        release = asyncio.create_task(worker_slot.release())
+                        await _await_task_without_cancellation(release)
                 raise
             session = _AnalysisSession(
                 workspace_id=workspace_id,
                 revision=revision,
                 checkout=checkout,
                 backend=backend,
+                worker_slot=worker_slot,
                 in_use=True,
                 last_used=asyncio.get_running_loop().time(),
             )
-            self._analysis_sessions[key] = session
+            async with self._analysis_sessions_guard:
+                self._analysis_opening_count -= 1
+                opening_finished = True
+                if key in self._analysis_sessions:
+                    raise RuntimeError("analysis session 在启动期间被重复创建")
+                self._analysis_sessions[key] = session
             return session
+        except BaseException:
+            try:
+                if session is not None and self._analysis_sessions.get(key) is not session:
+                    await self._close_analysis_session(session)
+                elif checkout is not None and session is None and checkout.path.exists():
+                    await _complete_thread_call(
+                        lambda: self.storage.workspaces.discard_checkout(checkout)
+                    )
+            finally:
+                if not opening_finished:
+                    finish = asyncio.create_task(self._finish_analysis_opening())
+                    await _await_task_without_cancellation(finish)
+            raise
+
+    async def _finish_analysis_opening(self) -> None:
+        async with self._analysis_sessions_guard:
+            if self._analysis_opening_count <= 0:
+                raise RuntimeError("analysis worker opening 计数失配")
+            self._analysis_opening_count -= 1
+
+    async def _create_checkout(
+        self,
+        workspace_id: str,
+        revision: str,
+        *,
+        purpose: str,
+    ) -> RevisionCheckout:
+        """取消撞上复制时等待 checkout 身份落定, 完整删除后再传播取消。"""
+
+        creation = asyncio.create_task(
+            asyncio.to_thread(
+                self.storage.workspaces.create_checkout,
+                workspace_id,
+                revision,
+                purpose=purpose,
+            )
+        )
+        try:
+            return await asyncio.shield(creation)
+        except asyncio.CancelledError as cancellation:
+            checkout = await _await_task_without_cancellation(creation)
+            await _complete_thread_call(lambda: self.storage.workspaces.discard_checkout(checkout))
+            raise cancellation
 
     async def _release_analysis_session(self, session: _AnalysisSession) -> None:
         key = (session.workspace_id, session.revision)
@@ -1126,10 +1360,21 @@ class Application:
 
             async def expire() -> None:
                 try:
-                    await asyncio.sleep(self.config.workers.idle_seconds)
+                    loop = asyncio.get_running_loop()
+                    deadline = loop.time() + self.config.workers.idle_seconds
+                    while True:
+                        if await self._analysis_worker_slots.has_waiters():
+                            break
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(min(0.25, remaining))
+                    await self._expire_analysis_session(key, session)
                 except asyncio.CancelledError:
                     return
-                await self._expire_analysis_session(key, session)
+                except Exception:
+                    # close task 会保留失败供 Application.aclose 聚合, idle wrapper 不再告警。
+                    return
 
             session.idle_task = asyncio.create_task(
                 expire(),
@@ -1144,48 +1389,139 @@ class Application:
         async with self._analysis_sessions_guard:
             if self._analysis_sessions.get(key) is not session or session.in_use:
                 return
-            del self._analysis_sessions[key]
+            session.in_use = True
             session.idle_task = None
         await self._close_analysis_session(session)
 
     async def _discard_analysis_session(self, session: _AnalysisSession) -> None:
-        key = (session.workspace_id, session.revision)
         async with self._analysis_sessions_guard:
-            if self._analysis_sessions.get(key) is session:
-                del self._analysis_sessions[key]
             _cancel_idle_task(session.idle_task)
             session.idle_task = None
-            session.in_use = False
+            session.in_use = True
         await self._close_analysis_session(session)
 
     async def _open_transient_analysis(
         self,
         checkout_path: Path,
         revision: str,
-    ) -> AnalysisBackend:
+    ) -> tuple[AnalysisBackend, AsyncInterprocessSlotLease]:
+        victim: _AnalysisSession | None = None
         async with self._analysis_sessions_guard:
-            if len(self._analysis_sessions) >= self.config.workers.analysis_limit:
+            if (
+                len(self._analysis_sessions) + self._analysis_opening_count
+                >= self.config.workers.analysis_limit
+            ):
                 idle = [item for item in self._analysis_sessions.values() if not item.in_use]
                 if not idle:
                     raise RuntimeError("没有可回收的 analysis worker 容量用于冷验证")
                 victim = min(idle, key=lambda item: item.last_used)
-                del self._analysis_sessions[(victim.workspace_id, victim.revision)]
+                victim.in_use = True
+                _cancel_idle_task(victim.idle_task)
+                victim.idle_task = None
+            self._analysis_opening_count += 1
+
+        worker_slot: AsyncInterprocessSlotLease | None = None
+        backend: AnalysisBackend | None = None
+        opening_finished = False
+        try:
+            if victim is not None:
                 await self._close_analysis_session(victim)
-            return await self.backend.open_analysis(
+            worker_slot = await self._acquire_analysis_worker_slot()
+            backend = await self.backend.open_analysis(
                 checkout_path=checkout_path,
                 revision=revision,
             )
+            finish = asyncio.create_task(self._finish_analysis_opening())
+            try:
+                await asyncio.shield(finish)
+            except asyncio.CancelledError as cancellation:
+                await _await_task_without_cancellation(finish)
+                opening_finished = True
+                raise cancellation
+            opening_finished = True
+            return backend, worker_slot
+        except BaseException:
+            try:
+                if backend is not None and worker_slot is not None:
+                    cleanup = asyncio.create_task(
+                        self._close_transient_analysis(backend, worker_slot)
+                    )
+                    await _await_task_without_cancellation(cleanup)
+                elif worker_slot is not None:
+                    release = asyncio.create_task(worker_slot.release())
+                    await _await_task_without_cancellation(release)
+            finally:
+                if not opening_finished:
+                    finish = asyncio.create_task(self._finish_analysis_opening())
+                    await _await_task_without_cancellation(finish)
+            raise
+
+    @staticmethod
+    async def _close_transient_analysis(
+        backend: AnalysisBackend,
+        worker_slot: AsyncInterprocessSlotLease,
+    ) -> None:
+        try:
+            await backend.close()
+        finally:
+            await worker_slot.release()
+
+    async def _run_analysis_worker[T](self, call: Callable[[], Awaitable[T]]) -> T:
+        """在共享 data root 的全局 analysis 容量内运行一个 one-shot worker。"""
+
+        worker_slot = await self._acquire_analysis_worker_slot()
+        try:
+            return await call()
+        finally:
+            await worker_slot.release()
+
+    async def _acquire_analysis_worker_slot(self) -> AsyncInterprocessSlotLease:
+        """优先复用空闲全局槽位; 容量满时先关闭本进程空闲 worker。"""
+
+        worker_slot = await self._analysis_worker_slots.try_acquire()
+        if worker_slot is not None:
+            return worker_slot
+
+        victim: _AnalysisSession | None = None
+        async with self._analysis_sessions_guard:
+            idle = [item for item in self._analysis_sessions.values() if not item.in_use]
+            if idle:
+                victim = min(idle, key=lambda item: item.last_used)
+                victim.in_use = True
+                _cancel_idle_task(victim.idle_task)
+                victim.idle_task = None
+        if victim is not None:
+            await self._close_analysis_session(victim)
+        return await self._analysis_worker_slots.acquire()
 
     async def _close_analysis_session(self, session: _AnalysisSession) -> None:
+        close_task = session.close_task
+        if close_task is None:
+            close_task = asyncio.create_task(
+                self._close_analysis_session_once(session),
+                name=f"analysis-close:{session.workspace_id}:{session.revision}",
+            )
+            session.close_task = close_task
+            self._track_session_close_task(close_task)
+        await _await_task_preserving_cancellation(close_task)
+
+    async def _close_analysis_session_once(self, session: _AnalysisSession) -> None:
+        key = (session.workspace_id, session.revision)
+        async with self._analysis_sessions_guard:
+            if self._analysis_sessions.get(key) is session:
+                del self._analysis_sessions[key]
         _cancel_idle_task(session.idle_task)
         session.idle_task = None
         try:
             await session.backend.close()
         finally:
-            await asyncio.to_thread(
-                self.storage.workspaces.discard_checkout,
-                session.checkout,
-            )
+            try:
+                await asyncio.to_thread(
+                    self.storage.workspaces.discard_checkout,
+                    session.checkout,
+                )
+            finally:
+                await session.worker_slot.release()
 
     async def _put_public_artifact(
         self,
@@ -1216,7 +1552,7 @@ class Application:
         ).resolve()
         source = temporary / "payload.bin"
         try:
-            await asyncio.to_thread(source.write_bytes, data)
+            await _settle_thread_call_preserving_cancellation(lambda: source.write_bytes(data))
             chunked = await _complete_thread_call(
                 lambda: self.storage.artifacts.put_chunked_file(
                     workspace_id=workspace_id,
@@ -1336,7 +1672,7 @@ class Application:
             raise RuntimeError(f"{name} 的 artifact 引用输出仍超过 inline 上限")
         return compact
 
-    async def _static_query_by_ids(
+    async def _static_query_by_ids_unlocked(
         self,
         name: str,
         workspace_id: str,
@@ -1351,7 +1687,10 @@ class Application:
                 **extra,
             }
         )
-        return await self._static_query(name, arguments)
+        return await self._static_query_unlocked(
+            name,
+            cast(StaticAdapterInput, arguments),
+        )
 
     async def _report_build(
         self,
@@ -1445,10 +1784,12 @@ class Application:
                     expected_revision=arguments.base_revision,
                 )
                 try:
-                    raw = await self.backend.mutate(
-                        staging_path=staging.database_path,
-                        operations=execution.worker_operations,
-                        timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                    raw = await self._run_analysis_worker(
+                        lambda: self.backend.mutate(
+                            staging_path=staging.database_path,
+                            operations=execution.worker_operations,
+                            timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                        )
                     )
                     impact = parse_preflight_impact(
                         arguments,
@@ -1583,10 +1924,11 @@ class Application:
                 )
             ).resolve()
             try:
-                materializations = await asyncio.to_thread(
-                    self._materialize_change_artifacts,
-                    change_set.operations,
-                    temporary,
+                materializations = await _settle_thread_call_preserving_cancellation(
+                    lambda: self._materialize_change_artifacts(
+                        change_set.operations,
+                        temporary,
+                    )
                 )
                 execution = build_mutation_execution(
                     change_set.operations,
@@ -1600,10 +1942,12 @@ class Application:
                 )
                 try:
                     if execution.mode == "worker":
-                        raw = await self.backend.mutate(
-                            staging_path=staging.database_path,
-                            operations=execution.worker_operations,
-                            timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                        raw = await self._run_analysis_worker(
+                            lambda: self.backend.mutate(
+                                staging_path=staging.database_path,
+                                operations=execution.worker_operations,
+                                timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                            )
                         )
                         parse_worker_impact(change_set.operations, raw)
                     receipt = await self._cold_validate(staging, expected=cold_identity)
@@ -1909,13 +2253,14 @@ class Application:
         workspace_lock = self._workspace_lock(workspace.workspace_id)
         await workspace_lock.acquire()
         debug_slot_acquired = False
+        worker_slot: AsyncInterprocessSlotLease | None = None
         checkout: RevisionCheckout | None = None
         backend: DebugBackend | None = None
         try:
             await self._debug_slots.acquire()
             debug_slot_acquired = True
-            checkout = await asyncio.to_thread(
-                self.storage.workspaces.create_checkout,
+            worker_slot = await self._debug_worker_slots.acquire()
+            checkout = await self._create_checkout(
                 workspace.workspace_id,
                 arguments.revision,
                 purpose="debug",
@@ -1954,6 +2299,7 @@ class Application:
                 backend=backend,
                 context=adapted.context,
                 workspace_lock=workspace_lock,
+                worker_slot=worker_slot,
                 owned_target=isinstance(arguments.target, DebugLaunchTarget),
             )
             # 读取一次不可消费的事件快照, 以建立 module/RVA 映射事实。
@@ -1974,17 +2320,47 @@ class Application:
             self._arm_debug_idle(session)
             return adapted.output
         except BaseException:
+            cleanup = asyncio.create_task(
+                self._cleanup_failed_debug_open(
+                    backend=backend,
+                    checkout=checkout,
+                    worker_slot=worker_slot,
+                    debug_slot_acquired=debug_slot_acquired,
+                    workspace_lock=workspace_lock,
+                )
+            )
+            await _await_task_without_cancellation(cleanup)
+            raise
+
+    async def _cleanup_failed_debug_open(
+        self,
+        *,
+        backend: DebugBackend | None,
+        checkout: RevisionCheckout | None,
+        worker_slot: AsyncInterprocessSlotLease | None,
+        debug_slot_acquired: bool,
+        workspace_lock: AsyncInterprocessFileLock,
+    ) -> None:
+        try:
             if backend is not None:
                 await backend.close()
-            if checkout is not None:
-                await asyncio.to_thread(
-                    self.storage.workspaces.discard_checkout,
-                    checkout,
-                )
-            if debug_slot_acquired:
-                self._debug_slots.release()
-            await workspace_lock.release()
-            raise
+        finally:
+            try:
+                if checkout is not None:
+                    await asyncio.to_thread(
+                        self.storage.workspaces.discard_checkout,
+                        checkout,
+                    )
+            finally:
+                try:
+                    if worker_slot is not None:
+                        await worker_slot.release()
+                finally:
+                    try:
+                        if debug_slot_acquired:
+                            self._debug_slots.release()
+                    finally:
+                        await workspace_lock.release()
 
     async def _execute_debug(
         self,
@@ -2105,7 +2481,30 @@ class Application:
         )
 
     async def _close_debug_session(self, session: _DebugSession) -> None:
-        self._debug_sessions.pop(session.context.debug_session_id, None)
+        close_task = session.close_task
+        if close_task is None:
+            close_task = asyncio.create_task(
+                self._close_debug_session_once(session),
+                name=f"debug-close:{session.context.debug_session_id}",
+            )
+            session.close_task = close_task
+            self._track_session_close_task(close_task)
+        await _await_task_preserving_cancellation(close_task)
+
+    def _track_session_close_task(self, task: asyncio.Task[None]) -> None:
+        self._session_close_tasks.add(task)
+        task.add_done_callback(self._finish_tracking_session_close_task)
+
+    def _finish_tracking_session_close_task(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            return
+        if task.exception() is None:
+            self._session_close_tasks.discard(task)
+
+    async def _close_debug_session_once(self, session: _DebugSession) -> None:
+        session_id = session.context.debug_session_id
+        if self._debug_sessions.get(session_id) is session:
+            del self._debug_sessions[session_id]
         self._cancel_debug_idle(session)
         try:
             await session.backend.close()
@@ -2119,7 +2518,10 @@ class Application:
                 try:
                     await session.workspace_lock.release()
                 finally:
-                    self._debug_slots.release()
+                    try:
+                        await session.worker_slot.release()
+                    finally:
+                        self._debug_slots.release()
 
     def _cancel_debug_idle(self, session: _DebugSession) -> None:
         task = session.idle_task
@@ -2136,6 +2538,9 @@ class Application:
                 if self._debug_sessions.get(session.context.debug_session_id) is session:
                     await self._close_debug_session(session)
             except asyncio.CancelledError:
+                return
+            except Exception:
+                # close task 会保留失败供 Application.aclose 聚合, idle wrapper 不再告警。
                 return
 
         session.idle_task = asyncio.create_task(
@@ -2165,10 +2570,12 @@ class Application:
                 expected_revision=arguments.revision,
             )
             try:
-                raw = await self.backend.expert(
-                    staging_path=staging.database_path,
-                    code=arguments.code,
-                    timeout_seconds=float(arguments.timeout_seconds),
+                raw = await self._run_analysis_worker(
+                    lambda: self.backend.expert(
+                        staging_path=staging.database_path,
+                        code=arguments.code,
+                        timeout_seconds=float(arguments.timeout_seconds),
+                    )
                 )
                 result = adapt_expert_worker_result(raw, staging.database_path)
                 receipt = await self._cold_validate(staging, expected=cold_identity)
@@ -2259,10 +2666,12 @@ class Application:
             )
             try:
                 request = build_refine_worker_request(arguments, staging.database_path)
-                raw = await self.backend.refine(
-                    staging_path=staging.database_path,
-                    input=request.input,
-                    timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                raw = await self._run_analysis_worker(
+                    lambda: self.backend.refine(
+                        staging_path=staging.database_path,
+                        input=request.input,
+                        timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                    )
                 )
                 result = adapt_refine_worker_result(
                     arguments,
@@ -2338,10 +2747,12 @@ class Application:
             expected_revision=None,
         )
         try:
-            result = await self.backend.bootstrap(
-                sample_path=workspace.sample_path,
-                staging_path=staging.database_path,
-                timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+            result = await self._run_analysis_worker(
+                lambda: self.backend.bootstrap(
+                    sample_path=workspace.sample_path,
+                    staging_path=staging.database_path,
+                    timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                )
             )
             if result.get("input_sha256") != workspace.sample_sha256:
                 raise RuntimeError("bootstrap worker 返回的样本摘要不一致")
@@ -2427,7 +2838,7 @@ class Application:
         *,
         expected: _ColdImageIdentity,
     ) -> ColdValidationReceipt:
-        backend = await self._open_transient_analysis(
+        backend, worker_slot = await self._open_transient_analysis(
             staging.database_path,
             staging.candidate_revision,
         )
@@ -2438,7 +2849,10 @@ class Application:
                 timeout_seconds=_WORKER_TIMEOUT_SECONDS,
             )
         finally:
-            await backend.close()
+            try:
+                await backend.close()
+            finally:
+                await worker_slot.release()
         image = overview.get("image")
         if not isinstance(image, dict):
             raise RuntimeError("冷验证未返回可信镜像身份")
@@ -2465,7 +2879,9 @@ class Application:
             or (expected.image_size is not None and image_size != expected.image_size)
         ):
             raise RuntimeError("冷验证镜像身份与 base revision 不一致")
-        hashes = await asyncio.to_thread(hash_staging_payload, staging)
+        hashes = await _settle_thread_call_preserving_cancellation(
+            lambda: hash_staging_payload(staging)
+        )
         return ColdValidationReceipt.create(
             validator="ida_9_3_headless",
             component_hashes=hashes,
@@ -2525,20 +2941,25 @@ class Application:
         }
 
     async def _build_report(self, arguments: ReportBuildInput) -> JsonObject:
+        async with self._workspace_lock(arguments.workspace_id):
+            return await self._build_report_unlocked(arguments)
+
+    async def _build_report_unlocked(self, arguments: ReportBuildInput) -> JsonObject:
         include: list[JsonValue] = []
         if "entry_points" in arguments.sections:
             include.append("entry_points")
         if "imports_exports" in arguments.sections:
             include.extend(("imports", "exports"))
-        overview = cast(
-            ProgramOverviewOutput,
-            await self._static_query_by_ids(
-                "program.overview",
-                arguments.workspace_id,
-                arguments.revision,
-                {"include": include},
-            ),
-        )
+        async with self._analysis_slots:
+            overview = cast(
+                ProgramOverviewOutput,
+                await self._static_query_by_ids_unlocked(
+                    "program.overview",
+                    arguments.workspace_id,
+                    arguments.revision,
+                    {"include": include},
+                ),
+            )
         if overview.result_artifact is not None:
             artifact_ref = overview.result_artifact
             artifact_workspace, artifact_revision, artifact_id = parse_artifact_uri(
@@ -2865,12 +3286,37 @@ async def _complete_thread_call[T](call: Callable[[], T]) -> T:
     return await _await_task_without_cancellation(future)
 
 
+async def _settle_thread_call_preserving_cancellation[T](call: Callable[[], T]) -> T:
+    """线程调用开始后等待其落定, 再传播调用方取消。"""
+
+    future = asyncio.create_task(asyncio.to_thread(call))
+    return await _await_task_preserving_cancellation(future)
+
+
 async def _await_task_without_cancellation[T](task: asyncio.Task[T]) -> T:
     while True:
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
+            if task.done():
+                return task.result()
             continue
+
+
+async def _await_task_preserving_cancellation[T](task: asyncio.Task[T]) -> T:
+    """调用方取消时先等清理任务结束, 再传播原始取消。"""
+
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError as cancellation:
+        await _await_task_without_cancellation(task)
+        raise cancellation
+
+
+def _session_registry_lease_path(paths: RuntimePaths) -> Path:
+    """返回协调 session 创建、回收和 lease 文件删除的全局锁。"""
+
+    return paths.data_root.resolve() / "session-registry.lease.lock"
 
 
 def _safe_remove_temp_directory(path: Path, root: Path) -> None:
@@ -2885,6 +3331,174 @@ def _safe_remove_temp_directory(path: Path, root: Path) -> None:
     if not relative.parts:
         raise RuntimeError(f"拒绝清理临时目录根: {resolved}")
     shutil.rmtree(resolved)
+
+
+def _collect_stale_sessions(
+    paths: RuntimePaths,
+    *,
+    dry_run: bool,
+) -> _SessionGarbageCollection:
+    """回收超过 operation 保留期且未被进程持有的连接私有目录。"""
+
+    if paths.session_root is None:
+        return _SessionGarbageCollection((), (), 0)
+    sessions_root = paths.session_root.parent.resolve()
+    data_root = paths.data_root.resolve()
+    if sessions_root.name != "sessions" or sessions_root.parent != data_root:
+        raise RuntimeError("MCP 会话目录不在 data_root/sessions 边界内")
+    if not sessions_root.is_dir():
+        return _SessionGarbageCollection((), (), 0)
+
+    current = paths.session_root.resolve()
+    lease_root = paths.session_lease_root.resolve()
+    if lease_root.parent != data_root or lease_root.name != "session-leases":
+        raise RuntimeError("MCP 会话 lease 目录不在 data_root/session-leases 边界内")
+    log_sessions_root = (
+        paths.log_root.parent.resolve() if paths.log_root.name == current.name else None
+    )
+    cutoff = time.time() - OPERATION_RETENTION_SECONDS
+    removed: list[Path] = []
+    skipped: list[str] = []
+    reclaimed = 0
+    registry = exclusive_process_lease(_session_registry_lease_path(paths))
+    registry.acquire()
+    try:
+        session_names = _session_entry_names(sessions_root, label="会话根目录")
+        if log_sessions_root is not None and log_sessions_root.is_dir():
+            session_names.update(_session_entry_names(log_sessions_root, label="会话日志根目录"))
+        session_names.discard(current.name)
+
+        for session_name in sorted(session_names):
+            data_candidate = sessions_root / session_name
+            log_candidate = (
+                log_sessions_root / session_name if log_sessions_root is not None else None
+            )
+            lease_path = lease_root / f"{session_name}.lease.lock"
+            lease = exclusive_process_lease(lease_path)
+            if not lease.try_acquire():
+                skipped.append(session_name)
+                continue
+            remove_lease_file = False
+            try:
+                roots: list[Path] = []
+                if data_candidate.exists():
+                    roots.append(
+                        _validated_session_directory(
+                            data_candidate,
+                            parent=sessions_root,
+                            label="会话根目录",
+                        )
+                    )
+                if log_candidate is not None and log_candidate.exists():
+                    assert log_sessions_root is not None
+                    roots.append(
+                        _validated_session_directory(
+                            log_candidate,
+                            parent=log_sessions_root,
+                            label="会话日志根目录",
+                        )
+                    )
+                if not roots:
+                    remove_lease_file = not dry_run
+                    continue
+
+                facts = [_directory_tree_facts(root) for root in roots]
+                latest_activity = max(latest for _size, latest in facts)
+                if latest_activity > cutoff:
+                    continue
+                removed.extend(roots)
+                reclaimed += sum(size for size, _latest in facts)
+                if not dry_run:
+                    # 先删日志; 即使随后数据目录暂时删除失败, 下次仍能从数据侧发现。
+                    if log_candidate is not None and log_candidate.exists():
+                        shutil.rmtree(log_candidate.resolve(strict=True))
+                    if data_candidate.exists():
+                        shutil.rmtree(data_candidate.resolve(strict=True))
+                    remove_lease_file = True
+            finally:
+                lease.release()
+                if remove_lease_file:
+                    lease_path.unlink(missing_ok=True)
+
+        if not dry_run:
+            _remove_orphan_session_lease_files(
+                lease_root,
+                current_session_id=current.name,
+                known_session_ids=session_names,
+            )
+    finally:
+        registry.release()
+    return _SessionGarbageCollection(tuple(removed), tuple(skipped), reclaimed)
+
+
+def _session_entry_names(root: Path, *, label: str) -> set[str]:
+    names: set[str] = set()
+    for candidate in root.iterdir():
+        if candidate.is_symlink():
+            raise RuntimeError(f"{label}包含非法条目: {candidate}")
+        if (
+            not candidate.is_dir()
+            or not candidate.name.startswith("session_")
+            or not candidate.name.replace("_", "").isalnum()
+            or not candidate.name.isascii()
+        ):
+            raise RuntimeError(f"{label}包含非法条目: {candidate}")
+        names.add(candidate.name)
+    return names
+
+
+def _validated_session_directory(candidate: Path, *, parent: Path, label: str) -> Path:
+    if candidate.is_symlink() or not candidate.is_dir():
+        raise RuntimeError(f"{label}包含非法条目: {candidate}")
+    resolved = candidate.resolve(strict=True)
+    if resolved.parent != parent:
+        raise RuntimeError(f"拒绝清理{label}边界外路径: {resolved}")
+    return resolved
+
+
+def _remove_orphan_session_lease_files(
+    lease_root: Path,
+    *,
+    current_session_id: str,
+    known_session_ids: set[str],
+) -> None:
+    for lease_path in lease_root.iterdir():
+        suffix = ".lease.lock"
+        if (
+            lease_path.is_symlink()
+            or not lease_path.is_file()
+            or not lease_path.name.endswith(suffix)
+        ):
+            raise RuntimeError(f"会话 lease 目录包含非法条目: {lease_path}")
+        session_id = lease_path.name[: -len(suffix)]
+        if session_id == current_session_id or session_id in known_session_ids:
+            continue
+        if (
+            not session_id.startswith("session_")
+            or not session_id.replace("_", "").isalnum()
+            or not session_id.isascii()
+        ):
+            raise RuntimeError(f"会话 lease 目录包含非法条目: {lease_path}")
+        lease = exclusive_process_lease(lease_path)
+        if not lease.try_acquire():
+            continue
+        lease.release()
+        lease_path.unlink(missing_ok=True)
+
+
+def _directory_tree_facts(root: Path) -> tuple[int, float]:
+    total = 0
+    latest_activity = root.stat().st_mtime
+    for candidate in root.rglob("*"):
+        if candidate.is_symlink():
+            raise RuntimeError(f"拒绝计算包含 symlink 的会话目录: {root}")
+        stat = candidate.stat()
+        latest_activity = max(latest_activity, stat.st_mtime)
+        if candidate.is_file():
+            total += stat.st_size
+        elif not candidate.is_dir():
+            raise RuntimeError(f"会话目录包含非法文件类型: {candidate}")
+    return total, latest_activity
 
 
 def _operation_failure(exc: Exception) -> tuple[str, str, JsonValue]:

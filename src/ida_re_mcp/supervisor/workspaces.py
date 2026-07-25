@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import shutil
+import stat
 import threading
 import time
 import uuid
@@ -18,7 +19,11 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, model_validator
 
-from ida_re_mcp.constants import DEFAULT_RETAINED_REVISIONS, STORAGE_SCHEMA_VERSION
+from ida_re_mcp.constants import (
+    DEFAULT_RETAINED_REVISIONS,
+    OPERATION_RETENTION_SECONDS,
+    STORAGE_SCHEMA_VERSION,
+)
 from ida_re_mcp.supervisor._fs import (
     atomic_write_json,
     sha256_file,
@@ -245,76 +250,101 @@ class WorkspaceRegistry:
         workspace_id = f"ws_{uuid.uuid4().hex}"
         creating = self.root / ".creating" / workspace_id
         final = self.root / workspace_id
-        creating.mkdir(parents=False, exist_ok=False)
-        with self._locks_guard:
-            self._active_creating.add(creating)
+        creation_lease = self.workspace_lease_lock(workspace_id)
+        if not creation_lease.try_acquire():
+            raise StorageCorruptionError("新 workspace 的生命周期 lease 被意外占用")
         try:
-            candidate = creating / _SAMPLE_NAME
-            copied_sha256, copied_size = _copy_sample(source, candidate)
-            after = source.stat()
-            if (
-                copied_size != before.st_size
-                or before.st_size != after.st_size
-                or before.st_mtime_ns != after.st_mtime_ns
-                or before.st_ctime_ns != after.st_ctime_ns
-                or before.st_ino != after.st_ino
-            ):
-                raise StorageCorruptionError("原样本在复制期间发生变化")
-            candidate_before_validation = candidate.stat()
-            if validate_copy is not None:
-                validate_copy(candidate, copied_sha256, copied_size)
-            candidate_after_validation = candidate.stat()
-            if (
-                candidate_after_validation.st_size != copied_size
-                or candidate_before_validation.st_size != candidate_after_validation.st_size
-                or candidate_before_validation.st_mtime_ns != candidate_after_validation.st_mtime_ns
-                or candidate_before_validation.st_ctime_ns != candidate_after_validation.st_ctime_ns
-                or candidate_before_validation.st_ino != candidate_after_validation.st_ino
-                or sha256_file(candidate) != copied_sha256
-            ):
-                raise StorageCorruptionError("workspace 候选样本在验证期间发生变化")
-            sample_name = _validate_sample_name(source.name)
-            manifest = _WorkspaceManifest(
-                schema_version=STORAGE_SCHEMA_VERSION,
-                workspace_id=workspace_id,
-                sample_name=sample_name,
-                sample_sha256=copied_sha256,
-                sample_size=copied_size,
-                created_at=time.time(),
-                current_revision=None,
-                revision_ids=[],
-                pinned_revisions=[],
-            )
-            atomic_write_json(creating / _WORKSPACE_MANIFEST_NAME, _workspace_dict(manifest))
-            snapshot = WorkspaceSnapshot(
-                workspace_id=workspace_id,
-                sample_name=sample_name,
-                sample_sha256=copied_sha256,
-                sample_size=copied_size,
-                created_at=manifest.created_at,
-                current_revision=None,
-                sample_path=final / _SAMPLE_NAME,
-                revisions=(),
-            )
-            os.replace(creating, final)
-        except BaseException:
-            _safe_remove_tree(creating, parent=self.root / ".creating")
-            raise
-        finally:
+            creating.mkdir(parents=False, exist_ok=False)
             with self._locks_guard:
-                self._active_creating.discard(creating)
+                self._active_creating.add(creating)
+            try:
+                candidate = creating / _SAMPLE_NAME
+                copied_sha256, copied_size = _copy_sample(source, candidate)
+                after = source.stat()
+                if (
+                    copied_size != before.st_size
+                    or before.st_size != after.st_size
+                    or before.st_mtime_ns != after.st_mtime_ns
+                    or before.st_ctime_ns != after.st_ctime_ns
+                    or before.st_ino != after.st_ino
+                ):
+                    raise StorageCorruptionError("原样本在复制期间发生变化")
+                candidate_before_validation = candidate.stat()
+                if validate_copy is not None:
+                    validate_copy(candidate, copied_sha256, copied_size)
+                candidate_after_validation = candidate.stat()
+                if (
+                    candidate_after_validation.st_size != copied_size
+                    or candidate_before_validation.st_size != candidate_after_validation.st_size
+                    or candidate_before_validation.st_mtime_ns
+                    != candidate_after_validation.st_mtime_ns
+                    or candidate_before_validation.st_ctime_ns
+                    != candidate_after_validation.st_ctime_ns
+                    or candidate_before_validation.st_ino != candidate_after_validation.st_ino
+                    or sha256_file(candidate) != copied_sha256
+                ):
+                    raise StorageCorruptionError("workspace 候选样本在验证期间发生变化")
+                sample_name = _validate_sample_name(source.name)
+                manifest = _WorkspaceManifest(
+                    schema_version=STORAGE_SCHEMA_VERSION,
+                    workspace_id=workspace_id,
+                    sample_name=sample_name,
+                    sample_sha256=copied_sha256,
+                    sample_size=copied_size,
+                    created_at=time.time(),
+                    current_revision=None,
+                    revision_ids=[],
+                    pinned_revisions=[],
+                )
+                atomic_write_json(
+                    creating / _WORKSPACE_MANIFEST_NAME,
+                    _workspace_dict(manifest),
+                )
+                snapshot = WorkspaceSnapshot(
+                    workspace_id=workspace_id,
+                    sample_name=sample_name,
+                    sample_sha256=copied_sha256,
+                    sample_size=copied_size,
+                    created_at=manifest.created_at,
+                    current_revision=None,
+                    sample_path=final / _SAMPLE_NAME,
+                    revisions=(),
+                )
+                os.replace(creating, final)
+            except BaseException:
+                _safe_remove_tree(creating, parent=self.root / ".creating")
+                raise
+            finally:
+                with self._locks_guard:
+                    self._active_creating.discard(creating)
+        finally:
+            creation_lease.release()
         return snapshot
 
     def list(self) -> tuple[WorkspaceSnapshot, ...]:
         snapshots: list[WorkspaceSnapshot] = []
         for path in sorted(self.root.iterdir(), key=lambda item: item.name):
+            try:
+                mode = path.lstat().st_mode
+            except FileNotFoundError:
+                continue
             if path.name in {".creating", ".locks"}:
-                if path.is_symlink() or not path.is_dir():
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
                     raise StorageCorruptionError("workspace 私有目录类型无效")
                 continue
-            if path.is_symlink() or not path.is_dir() or not path.name.startswith("ws_"):
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or not path.name.startswith("ws_"):
                 raise StorageCorruptionError("workspace 根目录包含非法条目")
-            snapshots.append(self.get(path.name))
+            lease = self.workspace_lease_lock(path.name)
+            with lease:
+                if not path.exists():
+                    continue
+                try:
+                    snapshots.append(self.get(path.name))
+                except WorkspaceNotFoundError as exc:
+                    if path.exists():
+                        raise StorageCorruptionError(
+                            f"workspace manifest 缺失: {path.name}"
+                        ) from exc
         return tuple(snapshots)
 
     def get(self, workspace_id: str) -> WorkspaceSnapshot:
@@ -736,7 +766,19 @@ class WorkspaceRegistry:
         """回收未被 manifest 引用且当前进程未使用的 staging/revision/checkout。"""
 
         if workspace_id is None:
-            workspace_ids = [snapshot.workspace_id for snapshot in self.list()]
+            workspace_ids: list[str] = []
+            for path in sorted(self.root.iterdir(), key=lambda item: item.name):
+                try:
+                    mode = path.lstat().st_mode
+                except FileNotFoundError:
+                    continue
+                if path.name in {".creating", ".locks"}:
+                    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                        raise StorageCorruptionError("workspace 私有目录类型无效")
+                    continue
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or not path.name.startswith("ws_"):
+                    raise StorageCorruptionError("workspace 根目录包含非法条目")
+                workspace_ids.append(validate_identifier(path.name, field="workspace_id"))
         else:
             workspace_ids = [validate_identifier(workspace_id, field="workspace_id")]
         candidates: list[Path] = []
@@ -747,17 +789,33 @@ class WorkspaceRegistry:
             creating_root = self.root / ".creating"
             with self._locks_guard:
                 active_creating = set(self._active_creating)
-            creating_candidates: list[Path] = []
             for path in sorted(creating_root.iterdir(), key=lambda item: item.name):
-                if path.is_symlink() or not path.is_dir() or not path.name.startswith("ws_"):
+                try:
+                    mode = path.lstat().st_mode
+                except FileNotFoundError:
+                    continue
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or not path.name.startswith("ws_"):
                     raise StorageCorruptionError("workspace creating 根目录包含非法条目")
-                if path not in active_creating:
-                    creating_candidates.append(path)
-            candidates.extend(creating_candidates)
-            reclaimed += sum(_tree_size(path) for path in creating_candidates)
-            if not dry_run:
-                for candidate in creating_candidates:
-                    _safe_remove_tree(candidate, parent=creating_root)
+                if path in active_creating:
+                    skipped.append(path.name)
+                    continue
+                creation_lease = self.workspace_lease_lock(path.name)
+                if not creation_lease.try_acquire():
+                    skipped.append(path.name)
+                    continue
+                try:
+                    try:
+                        mode = path.lstat().st_mode
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                        raise StorageCorruptionError("workspace creating 根目录包含非法条目")
+                    candidates.append(path)
+                    reclaimed += _tree_size(path)
+                    if not dry_run:
+                        _safe_remove_tree(path, parent=creating_root)
+                finally:
+                    creation_lease.release()
 
         for current_workspace_id in workspace_ids:
             lease = self.workspace_lease_lock(current_workspace_id)
@@ -768,65 +826,87 @@ class WorkspaceRegistry:
                 workspace_candidates: list[Path] = []
                 lock = self._lock_for(current_workspace_id)
                 with lock:
-                    manifest = self._read_workspace_manifest(current_workspace_id)
-                    referenced = set(manifest.revision_ids)
-                    revision_root = self._workspace_path(current_workspace_id) / "revisions"
-                    if revision_root.exists():
-                        if revision_root.is_symlink() or not revision_root.is_dir():
-                            raise StorageCorruptionError("revision 根目录类型无效")
-                        for path in revision_root.iterdir():
-                            if (
-                                path.is_symlink()
-                                or not path.is_dir()
-                                or not path.name.startswith("rev_")
-                            ):
-                                raise StorageCorruptionError("revision 根目录包含非法条目")
-                            validate_identifier(path.name, field="revision")
-                            if path.name not in referenced:
-                                workspace_candidates.append(path)
-                    staging_root = self._workspace_path(current_workspace_id) / ".staging"
-                    if staging_root.exists():
-                        if staging_root.is_symlink() or not staging_root.is_dir():
-                            raise StorageCorruptionError("staging 根目录类型无效")
-                        with self._locks_guard:
-                            active_staging = set(self._active_staging)
-                        for path in staging_root.iterdir():
-                            if (
-                                path.is_symlink()
-                                or not path.is_dir()
-                                or not path.name.startswith("stg_")
-                            ):
-                                raise StorageCorruptionError("staging 根目录包含非法条目")
-                            validate_identifier(path.name, field="staging_id")
-                            if path not in active_staging:
-                                workspace_candidates.append(path)
-                    checkout_parent = self.checkout_root / current_workspace_id
-                    if checkout_parent.exists():
-                        if checkout_parent.is_symlink() or not checkout_parent.is_dir():
-                            raise StorageCorruptionError("checkout workspace 目录类型无效")
-                        with self._locks_guard:
-                            active_checkouts = set(self._active_checkouts)
-                        for path in checkout_parent.iterdir():
-                            if (
-                                path.is_symlink()
-                                or not path.is_dir()
-                                or not path.name.startswith("chk_")
-                            ):
-                                raise StorageCorruptionError("checkout workspace 目录包含非法条目")
-                            validate_identifier(path.name, field="checkout_id")
-                            if path not in active_checkouts:
-                                workspace_candidates.append(path)
+                    try:
+                        manifest = self._read_workspace_manifest(current_workspace_id)
+                    except WorkspaceNotFoundError:
+                        # 另一进程可能已在本轮预扫描后完成同一 workspace 的 GC。
+                        continue
+                    workspace_path = self._workspace_path(current_workspace_id)
+                    orphan_uninitialized = (
+                        manifest.current_revision is None
+                        and not manifest.revision_ids
+                        and time.time() - manifest.created_at >= OPERATION_RETENTION_SECONDS
+                    )
+                    if orphan_uninitialized:
+                        workspace_candidates.append(workspace_path)
+                    else:
+                        referenced = set(manifest.revision_ids)
+                        revision_root = workspace_path / "revisions"
+                        if revision_root.exists():
+                            if revision_root.is_symlink() or not revision_root.is_dir():
+                                raise StorageCorruptionError("revision 根目录类型无效")
+                            for path in revision_root.iterdir():
+                                if (
+                                    path.is_symlink()
+                                    or not path.is_dir()
+                                    or not path.name.startswith("rev_")
+                                ):
+                                    raise StorageCorruptionError("revision 根目录包含非法条目")
+                                validate_identifier(path.name, field="revision")
+                                if path.name not in referenced:
+                                    workspace_candidates.append(path)
+                        staging_root = workspace_path / ".staging"
+                        if staging_root.exists():
+                            if staging_root.is_symlink() or not staging_root.is_dir():
+                                raise StorageCorruptionError("staging 根目录类型无效")
+                            with self._locks_guard:
+                                active_staging = set(self._active_staging)
+                            for path in staging_root.iterdir():
+                                if (
+                                    path.is_symlink()
+                                    or not path.is_dir()
+                                    or not path.name.startswith("stg_")
+                                ):
+                                    raise StorageCorruptionError("staging 根目录包含非法条目")
+                                validate_identifier(path.name, field="staging_id")
+                                if path not in active_staging:
+                                    workspace_candidates.append(path)
+                        checkout_parent = self.checkout_root / current_workspace_id
+                        if checkout_parent.exists():
+                            if checkout_parent.is_symlink() or not checkout_parent.is_dir():
+                                raise StorageCorruptionError("checkout workspace 目录类型无效")
+                            with self._locks_guard:
+                                active_checkouts = set(self._active_checkouts)
+                            for path in checkout_parent.iterdir():
+                                if (
+                                    path.is_symlink()
+                                    or not path.is_dir()
+                                    or not path.name.startswith("chk_")
+                                ):
+                                    raise StorageCorruptionError(
+                                        "checkout workspace 目录包含非法条目"
+                                    )
+                                validate_identifier(path.name, field="checkout_id")
+                                if path not in active_checkouts:
+                                    workspace_candidates.append(path)
                 workspace_candidates = sorted(set(workspace_candidates), key=str)
                 candidates.extend(workspace_candidates)
                 reclaimed += sum(_tree_size(path) for path in workspace_candidates)
                 if not dry_run:
                     for candidate in workspace_candidates:
-                        parent = _allowed_gc_parent(
-                            candidate,
-                            workspace_root=self.root,
-                            checkout_root=self.checkout_root,
+                        parent = (
+                            self.root
+                            if candidate == self._workspace_path(current_workspace_id)
+                            else _allowed_gc_parent(
+                                candidate,
+                                workspace_root=self.root,
+                                checkout_root=self.checkout_root,
+                            )
                         )
                         _safe_remove_tree(candidate, parent=parent)
+                    if orphan_uninitialized:
+                        with self._locks_guard:
+                            self._sample_identities.pop(current_workspace_id, None)
             finally:
                 lease.release()
 

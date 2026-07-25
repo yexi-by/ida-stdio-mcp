@@ -434,6 +434,34 @@ def test_gc_removes_only_unreachable_plans_and_current_staging_residue(
     assert empty.reclaimed_bytes == 0
 
 
+def test_gc_refreshes_retained_revisions_under_workspace_lease(tmp_path: Path) -> None:
+    lease_root = tmp_path / "data" / "workspaces" / ".locks"
+    store = ChangeSetStore(
+        tmp_path / "data" / "changes",
+        workspace_lease_root=lease_root,
+    )
+    published = _prepare(store, base_revision="revision_just_published")
+
+    applied = store.collect_garbage(
+        retained_scopes=set(),
+        retained_revision_provider=lambda workspace_id: (
+            {"revision_just_published"} if workspace_id == published.workspace_id else set()
+        ),
+        dry_run=False,
+    )
+
+    assert applied.removed_paths == ()
+    assert (
+        store.load_for_apply(
+            workspace_id=published.workspace_id,
+            base_revision=published.base_revision,
+            change_set_id=published.change_set_id,
+            digest=published.digest,
+        )
+        == published
+    )
+
+
 def test_gc_skips_workspace_held_by_other_process(
     tmp_path: Path,
 ) -> None:

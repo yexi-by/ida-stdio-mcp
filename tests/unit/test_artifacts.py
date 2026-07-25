@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -417,6 +421,87 @@ def test_artifact_gc_only_removes_unretained_revision_scopes(tmp_path: Path) -> 
     assert store.get("ws_one", "rev_current", retained.artifact_id) == retained
     with pytest.raises(ArtifactNotFoundError):
         store.get("ws_one", "rev_orphan", orphan.artifact_id)
+
+
+def test_artifact_gc_refreshes_retained_revisions_under_workspace_lease(
+    tmp_path: Path,
+) -> None:
+    store = ArtifactStore(
+        tmp_path / "artifacts",
+        workspace_lease_root=tmp_path / "workspaces" / ".locks",
+    )
+    published = store.put_bytes(
+        workspace_id="ws_one",
+        revision="rev_just_published",
+        data=b"published by another supervisor",
+        media_type="application/octet-stream",
+    )
+
+    applied = store.collect_garbage(
+        retained_scopes=set(),
+        retained_revision_provider=lambda workspace_id: (
+            {"rev_just_published"} if workspace_id == "ws_one" else set()
+        ),
+        dry_run=False,
+    )
+
+    assert applied.removed_paths == ()
+    assert store.get("ws_one", "rev_just_published", published.artifact_id) == published
+
+
+def test_artifact_list_and_gc_share_artifact_gc_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "artifacts"
+    lease_root = tmp_path / "workspaces" / ".locks"
+    reader = ArtifactStore(root, workspace_lease_root=lease_root)
+    collector = ArtifactStore(root, workspace_lease_root=lease_root)
+    metadata = reader.put_bytes(
+        workspace_id="ws_one",
+        revision="rev_orphan",
+        data=b"orphan",
+        media_type="application/octet-stream",
+    )
+    artifact_root = root / "ws_one" / "rev_orphan" / metadata.artifact_id
+    list_holds_lease = threading.Event()
+    continue_list = threading.Event()
+    reader_thread_id: int | None = None
+    original_lstat = Path.lstat
+
+    def delayed_lstat(path: Path) -> os.stat_result:
+        if threading.get_ident() == reader_thread_id and path == artifact_root:
+            list_holds_lease.set()
+            assert continue_list.wait(timeout=5)
+        return original_lstat(path)
+
+    def list_in_reader_thread() -> tuple[ArtifactMetadata, ...]:
+        nonlocal reader_thread_id
+        reader_thread_id = threading.get_ident()
+        return reader.list()
+
+    monkeypatch.setattr(Path, "lstat", delayed_lstat)
+    gc_future = None
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list_future = executor.submit(list_in_reader_thread)
+        try:
+            assert list_holds_lease.wait(timeout=1)
+            gc_future = executor.submit(
+                collector.collect_garbage,
+                retained_scopes=set(),
+                retained_revision_provider=lambda _workspace_id: set(),
+                dry_run=False,
+            )
+            time.sleep(0.05)
+            assert not gc_future.done()
+        finally:
+            continue_list.set()
+        listed = list_future.result(timeout=1)
+        assert gc_future is not None
+        removed = gc_future.result(timeout=1)
+
+    assert listed == (metadata,)
+    assert removed.removed_paths == (root / "ws_one" / "rev_orphan",)
 
 
 def test_artifact_gc_removes_crash_staging_inside_retained_scope_only(

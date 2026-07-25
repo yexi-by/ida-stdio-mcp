@@ -62,7 +62,7 @@ class SupervisorStorage:
             config=config,
             paths=runtime_paths,
             operations=OperationCoordinator(
-                storage_root=runtime_paths.data_root / "operations",
+                storage_root=runtime_paths.operation_root,
                 recover_incomplete=lambda snapshot: _recover_revision_operation(
                     workspaces,
                     snapshot,
@@ -93,7 +93,15 @@ class SupervisorStorage:
 def _directory_size(root: Path) -> int:
     if not root.is_dir():
         return 0
-    return sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
+    total = 0
+    for path in root.rglob("*"):
+        try:
+            if path.is_file():
+                total += path.stat().st_size
+        except FileNotFoundError:
+            # 共享 data root 中的原子发布或 GC 可在枚举后移走该条目.
+            continue
+    return total
 
 
 def _recover_revision_operation(

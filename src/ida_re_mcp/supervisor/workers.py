@@ -302,6 +302,7 @@ class WorkerProcess:
         allow_attach: bool = False,
         connect_timeout_seconds: float = 10.0,
         working_tree: Path | None = None,
+        environment: Mapping[str, str] | None = None,
         process_launcher: ProcessLauncher = _default_process_launcher,
         endpoint_factory: Callable[[Path], IpcEndpoint] = _default_endpoint_factory,
         client_factory: Callable[[IpcEndpoint], WorkerClientLike] = _default_client_factory,
@@ -348,13 +349,16 @@ class WorkerProcess:
             raise
 
         auth_environment_name = f"{_AUTH_ENV_PREFIX}{secrets.token_hex(16).upper()}"
-        environment = os.environ.copy()
-        environment[auth_environment_name] = base64.b64encode(endpoint.authkey).decode("ascii")
+        worker_environment = os.environ.copy()
+        worker_environment.update(environment or {})
+        worker_environment[auth_environment_name] = base64.b64encode(endpoint.authkey).decode(
+            "ascii"
+        )
         command = _build_command(inputs, endpoint, auth_environment_name)
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         launch = ProcessLaunch(
             command=command,
-            environment=environment,
+            environment=worker_environment,
             working_directory=resolved_log_root,
             creation_flags=creation_flags,
         )
@@ -372,7 +376,7 @@ class WorkerProcess:
                 details={"kind": kind, "reason": type(exc).__name__},
             ) from exc
         finally:
-            environment.pop(auth_environment_name, None)
+            worker_environment.pop(auth_environment_name, None)
 
         worker = cls(
             inputs=inputs,

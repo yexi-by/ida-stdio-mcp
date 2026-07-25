@@ -8,6 +8,7 @@ from typing import cast
 
 import pytest
 
+from ida_re_mcp.supervisor import backend as backend_module
 from ida_re_mcp.supervisor.backend import (
     DebugRequestCancelled,
     SubprocessIdaBackend,
@@ -55,12 +56,75 @@ class _BlockingWorker:
         self.close_calls += 1
 
 
+class _BlockingCleanupWorker(_BlockingWorker):
+    def __init__(self) -> None:
+        super().__init__()
+        self.abort_started = threading.Event()
+        self.release_abort = threading.Event()
+        self.abort_finished = threading.Event()
+        self.close_started = threading.Event()
+        self.release_close = threading.Event()
+        self.close_finished = threading.Event()
+
+    def abort(self) -> None:
+        self.abort_started.set()
+        assert self.release_abort.wait(3)
+        super().abort()
+        self.abort_finished.set()
+
+    def close(self) -> None:
+        self.close_started.set()
+        assert self.release_close.wait(3)
+        super().close()
+        self.close_finished.set()
+
+
 class _AbortRecordingWorker(WorkerProcess):
     def __init__(self) -> None:
         self.abort_calls = 0
+        self.abort_started = threading.Event()
+        self.release_abort = threading.Event()
+        self.abort_finished = threading.Event()
 
     def abort(self) -> None:
+        self.abort_started.set()
+        assert self.release_abort.wait(3)
         self.abort_calls += 1
+        self.abort_finished.set()
+
+
+class _ProbeProcess:
+    def __init__(self, *, exits_on_terminate: bool) -> None:
+        self.returncode: int | None = None
+        self.exits_on_terminate = exits_on_terminate
+        self.communication_started = asyncio.Event()
+        self.exited = asyncio.Event()
+        self.actions: list[str] = []
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        self.actions.append("communicate")
+        self.communication_started.set()
+        await self.exited.wait()
+        self.actions.append("communicate.done")
+        return b"", b""
+
+    def terminate(self) -> None:
+        self.actions.append("terminate")
+        if self.exits_on_terminate:
+            self.returncode = -15
+            self.exited.set()
+
+    def kill(self) -> None:
+        self.actions.append("kill")
+        self.returncode = -9
+        self.exited.set()
+
+    async def wait(self) -> int:
+        self.actions.append("wait")
+        await self.exited.wait()
+        assert self.returncode is not None
+        self.actions.append("wait.done")
+        return self.returncode
 
 
 def _replace_launch(
@@ -147,6 +211,109 @@ def test_analysis_cancellation_aborts_persistent_worker_process(
     asyncio.run(scenario())
 
 
+def test_analysis_repeated_cancellation_waits_for_abort_to_finish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        worker = _BlockingCleanupWorker()
+        _replace_launch(monkeypatch, worker)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+        analysis = await backend.open_analysis(
+            checkout_path=tmp_path / "checkout.i64",
+            revision="revision_123",
+        )
+        execution = asyncio.create_task(analysis.execute("program.overview", {}, timeout_seconds=5))
+        assert await asyncio.to_thread(worker.started.wait, 1)
+
+        execution.cancel()
+        assert await asyncio.to_thread(worker.abort_started.wait, 1)
+        execution.cancel()
+        await asyncio.sleep(0)
+        assert not execution.done()
+
+        worker.release_abort.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(execution), timeout=1)
+        assert worker.abort_finished.is_set()
+        assert worker.released.is_set()
+
+        worker.release_close.set()
+        await analysis.close()
+        assert worker.close_finished.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_analysis_close_cancellation_waits_for_process_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        worker = _BlockingCleanupWorker()
+        _replace_launch(monkeypatch, worker)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+        analysis = await backend.open_analysis(
+            checkout_path=tmp_path / "checkout.i64",
+            revision="revision_123",
+        )
+
+        closing = asyncio.create_task(analysis.close())
+        assert await asyncio.to_thread(worker.close_started.wait, 1)
+        closing.cancel()
+        await asyncio.sleep(0)
+        closing.cancel()
+        await asyncio.sleep(0)
+        assert not closing.done()
+
+        worker.release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(closing), timeout=1)
+        assert worker.close_finished.is_set()
+        assert worker.close_calls == 1
+
+    asyncio.run(scenario())
+
+
+def test_one_shot_repeated_cancellation_waits_for_abort_and_close(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        worker = _BlockingCleanupWorker()
+        _replace_launch(monkeypatch, worker)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+        execution = asyncio.create_task(
+            backend.mutate(
+                staging_path=tmp_path / "staging.i64",
+                operations=[],
+                timeout_seconds=5,
+            )
+        )
+        assert await asyncio.to_thread(worker.started.wait, 1)
+
+        execution.cancel()
+        assert await asyncio.to_thread(worker.abort_started.wait, 1)
+        execution.cancel()
+        await asyncio.sleep(0)
+        assert not execution.done()
+
+        worker.release_abort.set()
+        assert await asyncio.to_thread(worker.close_started.wait, 1)
+        assert worker.abort_finished.is_set()
+        execution.cancel()
+        await asyncio.sleep(0)
+        assert not execution.done()
+
+        worker.release_close.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(asyncio.shield(execution), timeout=1)
+        assert worker.close_finished.is_set()
+        assert worker.close_calls == 1
+
+    asyncio.run(scenario())
+
+
 def test_launch_cancellation_aborts_worker_returned_by_launch_thread(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -174,9 +341,120 @@ def test_launch_cancellation_aborts_worker_returned_by_launch_thread(
         opening.cancel()
         await asyncio.sleep(0)
         release_launch.set()
+        assert await asyncio.to_thread(worker.abort_started.wait, 1)
+        opening.cancel()
+        await asyncio.sleep(0)
+        assert not opening.done()
+        worker.release_abort.set()
 
         with pytest.raises(asyncio.CancelledError):
             await opening
         assert worker.abort_calls == 1
+        assert worker.abort_finished.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_doctor_cancellation_terminates_and_reaps_probe_before_propagating(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        process = _ProbeProcess(exits_on_terminate=True)
+
+        async def create_subprocess_exec(
+            *_args: str,
+            **_kwargs: object,
+        ) -> asyncio.subprocess.Process:
+            return cast(asyncio.subprocess.Process, cast(object, process))
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+        execution = asyncio.create_task(backend.doctor())
+        await asyncio.wait_for(process.communication_started.wait(), timeout=1)
+
+        execution.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+        assert process.returncode == -15
+        assert process.actions.count("terminate") == 1
+        assert process.actions.count("wait") == 1
+        assert "kill" not in process.actions
+        assert "communicate.done" in process.actions
+        assert "wait.done" in process.actions
+        assert process.actions.index("terminate") < process.actions.index("wait.done")
+
+    asyncio.run(scenario())
+
+
+def test_doctor_cancellation_waits_for_inflight_probe_launch_then_reaps_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        process = _ProbeProcess(exits_on_terminate=True)
+        launch_started = asyncio.Event()
+        release_launch = asyncio.Event()
+
+        async def create_subprocess_exec(
+            *_args: str,
+            **_kwargs: object,
+        ) -> asyncio.subprocess.Process:
+            launch_started.set()
+            await release_launch.wait()
+            return cast(asyncio.subprocess.Process, cast(object, process))
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+        execution = asyncio.create_task(backend.doctor())
+        await asyncio.wait_for(launch_started.wait(), timeout=1)
+
+        execution.cancel()
+        await asyncio.sleep(0)
+        assert not execution.done()
+        release_launch.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+        assert process.returncode == -15
+        assert process.actions.count("communicate") == 1
+        assert process.actions.count("terminate") == 1
+        assert process.actions.count("wait") == 1
+        assert "kill" not in process.actions
+        assert "communicate.done" in process.actions
+        assert "wait.done" in process.actions
+
+    asyncio.run(scenario())
+
+
+def test_doctor_timeout_kills_and_reaps_probe_that_ignores_terminate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        process = _ProbeProcess(exits_on_terminate=False)
+
+        async def create_subprocess_exec(
+            *_args: str,
+            **_kwargs: object,
+        ) -> asyncio.subprocess.Process:
+            return cast(asyncio.subprocess.Process, cast(object, process))
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+        monkeypatch.setattr(backend_module, "_PROBE_TIMEOUT_SECONDS", 0.01)
+        monkeypatch.setattr(backend_module, "_PROBE_TERMINATE_SECONDS", 0.01)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+
+        with pytest.raises(TimeoutError):
+            await backend.doctor()
+        assert process.returncode == -9
+        assert process.actions[0:3] == ["communicate", "terminate", "wait"]
+        assert process.actions.count("kill") == 1
+        assert process.actions.count("wait") == 1
+        assert "communicate.done" in process.actions
+        assert "wait.done" in process.actions
+        assert process.actions.index("terminate") < process.actions.index("kill")
+        assert process.actions.index("kill") < process.actions.index("wait.done")
 
     asyncio.run(scenario())

@@ -43,6 +43,7 @@ class _FakeDebugBackend:
         self.state = "suspended"
         self.stop_id: str | None = _STOP_ID
         self.closed = False
+        self.close_count = 0
 
     async def execute(
         self,
@@ -85,6 +86,7 @@ class _FakeDebugBackend:
 
     async def close(self) -> None:
         self.closed = True
+        self.close_count += 1
 
     def session_payload(self, **extra: JsonValue) -> JsonObject:
         return {
@@ -305,8 +307,9 @@ def test_application_pages_all_debug_events_within_inline_budget(tmp_path: Path)
             assert controlled.completion_provenance == "state_observation"
             assert controlled.observed_debugger_state == "DSTATE_RUN"
         finally:
-            await application.aclose()
+            await asyncio.gather(application.aclose(), application.aclose())
         assert backend.debug.closed
+        assert backend.debug.close_count == 1
 
     asyncio.run(scenario())
 

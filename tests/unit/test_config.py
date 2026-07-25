@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from ida_re_mcp.config import (
     LOG_ROOT_ENV,
     AppConfig,
     ConfigError,
+    RuntimeConfig,
     RuntimePathError,
     RuntimePaths,
     load_config,
@@ -50,6 +52,11 @@ idle_seconds = 120
 [storage]
 quota_gib = 40
 retained_revisions = 5
+
+[runtime]
+data_root = "C:/runtime/ida-re-mcp/data"
+log_root = "C:/runtime/ida-re-mcp/logs"
+ida_dir = "C:/Program Files/IDA Professional 9.3"
 """.strip(),
         encoding="utf-8",
     )
@@ -59,6 +66,8 @@ retained_revisions = 5
     assert config.policy.debug_attach is True
     assert config.workers.analysis_limit == 2
     assert config.storage.quota_gib == 40
+    assert config.runtime.data_root == "C:/runtime/ida-re-mcp/data"
+    assert config.runtime.ida_dir == "C:/Program Files/IDA Professional 9.3"
 
 
 def test_shipped_example_is_valid_config() -> None:
@@ -177,11 +186,95 @@ def test_runtime_paths_accept_explicit_host_roots(tmp_path: Path) -> None:
             DATA_ROOT_ENV: str(data_root),
             LOG_ROOT_ENV: str(log_root),
         },
+        session_id="session_test",
     )
 
     assert paths.data_root == data_root.resolve()
-    assert paths.log_root == log_root.resolve()
+    assert paths.log_root == log_root.resolve() / "sessions" / "session_test"
     assert paths.workspace_root == data_root.resolve() / "workspaces"
+    assert paths.session_data_root == data_root.resolve() / "sessions" / "session_test"
+    assert paths.checkout_root == paths.session_data_root / "checkouts"
+    assert paths.operation_root == paths.session_data_root / "operations"
+    assert paths.change_root == paths.session_data_root / "change-sets"
+
+
+def test_runtime_paths_share_persistent_roots_and_isolate_sessions(tmp_path: Path) -> None:
+    working_tree = tmp_path / "repository"
+    runtime = RuntimeConfig(
+        data_root=str(tmp_path / "runtime" / "data"),
+        log_root=str(tmp_path / "runtime" / "logs"),
+    )
+
+    first = RuntimePaths.discover(
+        runtime=runtime,
+        working_tree=working_tree,
+        environment={},
+        session_id="session_first",
+    )
+    second = RuntimePaths.discover(
+        runtime=runtime,
+        working_tree=working_tree,
+        environment={},
+        session_id="session_second",
+    )
+
+    assert first.data_root == second.data_root
+    assert first.workspace_root == second.workspace_root
+    assert first.artifact_root == second.artifact_root
+    assert first.session_data_root != second.session_data_root
+    assert first.checkout_root != second.checkout_root
+    assert first.temp_root != second.temp_root
+    assert first.log_root != second.log_root
+    assert first.cursor_key_path != second.cursor_key_path
+
+
+@pytest.mark.parametrize(
+    "log_relative",
+    [
+        None,
+        "artifacts",
+        "artifacts/reports",
+        "session-leases",
+        "sessions/session_other",
+        "worker-slots/analysis",
+        "workspaces/ws_other",
+    ],
+)
+def test_runtime_paths_reject_log_root_in_reserved_data_tree(
+    tmp_path: Path,
+    log_relative: str | None,
+) -> None:
+    data_root = tmp_path / "runtime" / "data"
+    log_root = data_root if log_relative is None else data_root / log_relative
+
+    with pytest.raises(RuntimePathError, match=r"相同|保留树"):
+        RuntimePaths.discover(
+            runtime=RuntimeConfig(
+                data_root=str(data_root),
+                log_root=str(log_root),
+            ),
+            working_tree=tmp_path / "repository",
+            environment={},
+        )
+
+
+def test_runtime_paths_allow_dedicated_log_tree_inside_data_root(tmp_path: Path) -> None:
+    data_root = tmp_path / "runtime" / "data"
+
+    paths = RuntimePaths.discover(
+        runtime=RuntimeConfig(data_root=str(data_root)),
+        working_tree=tmp_path / "repository",
+        environment={},
+        session_id="session_test",
+    )
+
+    assert paths.log_root == data_root.resolve() / "logs" / "sessions" / "session_test"
+
+
+@pytest.mark.parametrize("field", ["data_root", "log_root", "ida_dir"])
+def test_runtime_config_paths_must_be_absolute(field: str) -> None:
+    with pytest.raises(ValueError, match="绝对路径"):
+        RuntimeConfig.model_validate({field: "relative/path"}, strict=True)
 
 
 @pytest.mark.parametrize(
@@ -221,3 +314,40 @@ def test_supervisor_storage_opens_with_soft_quota(tmp_path: Path) -> None:
     assert usage.total_bytes == 0
     assert usage.quota_bytes == 20 * 1024**3
     assert usage.over_soft_quota is False
+
+
+def test_storage_usage_ignores_file_removed_between_enumeration_and_stat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = RuntimePaths(
+        data_root=tmp_path / "data",
+        log_root=tmp_path / "logs",
+        workspace_root=tmp_path / "data" / "workspaces",
+        artifact_root=tmp_path / "data" / "artifacts",
+        checkout_root=tmp_path / "data" / "checkouts",
+        temp_root=tmp_path / "data" / "temp",
+    )
+    storage = SupervisorStorage.open(config=AppConfig(), paths=paths)
+    disappearing = paths.temp_root / "vanishing.tmp"
+    disappearing.write_bytes(b"temporary")
+    original_stat = Path.stat
+    calls = 0
+
+    def disappearing_stat(
+        path: Path,
+        *,
+        follow_symlinks: bool = True,
+    ) -> os.stat_result:
+        nonlocal calls
+        if path == disappearing:
+            calls += 1
+            if calls >= 2:
+                raise FileNotFoundError(path)
+        return original_stat(path, follow_symlinks=follow_symlinks)
+
+    monkeypatch.setattr(Path, "stat", disappearing_stat)
+    usage = storage.usage()
+
+    assert calls >= 2
+    assert usage.total_bytes == 0

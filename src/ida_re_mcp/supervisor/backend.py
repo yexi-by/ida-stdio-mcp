@@ -14,6 +14,9 @@ from typing import Protocol, cast
 from ida_re_mcp.supervisor.workers import WorkerKind, WorkerProcess
 from ida_re_mcp.worker.ipc import JsonObject, JsonValue
 
+_PROBE_TIMEOUT_SECONDS = 30.0
+_PROBE_TERMINATE_SECONDS = 2.0
+
 
 class DebugRequestCancelled(asyncio.CancelledError):
     """调用方取消后, 携带 DebugWorker 最终观察到的真实状态。"""
@@ -134,12 +137,13 @@ class _ProcessAnalysisBackend:
         try:
             return await asyncio.shield(execution)
         except asyncio.CancelledError:
-            await asyncio.to_thread(self._process.abort)
-            await asyncio.gather(execution, return_exceptions=True)
+            cleanup = asyncio.create_task(_abort_worker_and_wait(self._process, execution))
+            await _await_cleanup(cleanup)
             raise
 
     async def close(self) -> None:
-        await asyncio.to_thread(self._process.close)
+        closing = asyncio.create_task(asyncio.to_thread(self._process.close))
+        await _await_cleanup(closing)
 
 
 class _ProcessDebugBackend:
@@ -185,15 +189,22 @@ class _ProcessDebugBackend:
             raise DebugRequestCancelled(operation, result) from cancellation
 
     async def close(self) -> None:
-        await asyncio.to_thread(self._process.close)
+        closing = asyncio.create_task(asyncio.to_thread(self._process.close))
+        await _await_cleanup(closing)
 
 
 class SubprocessIdaBackend:
     """使用认证本机 IPC 的默认 worker 后端。"""
 
-    def __init__(self, *, log_root: Path) -> None:
+    def __init__(
+        self,
+        *,
+        log_root: Path,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
         self._log_root = log_root.resolve()
         self._log_root.mkdir(parents=True, exist_ok=True)
+        self._environment = dict(environment or {})
 
     async def bootstrap(
         self,
@@ -289,17 +300,38 @@ class SubprocessIdaBackend:
 
     async def doctor(self) -> JsonObject:
         environment = os.environ.copy()
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "ida_re_mcp.worker",
-            "probe",
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=environment,
+        environment.update(self._environment)
+        launch = asyncio.create_task(
+            asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "ida_re_mcp.worker",
+                "probe",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=environment,
+            )
         )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+        try:
+            process = await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            process = await _settle_cancelled_probe_launch(launch)
+            if process is not None:
+                communication = asyncio.create_task(process.communicate())
+                cleanup = asyncio.create_task(_terminate_and_reap_probe(process, communication))
+                await _await_cleanup(cleanup)
+            raise
+        communication = asyncio.create_task(process.communicate())
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                asyncio.shield(communication),
+                timeout=_PROBE_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            cleanup = asyncio.create_task(_terminate_and_reap_probe(process, communication))
+            await _await_cleanup(cleanup)
+            raise
         if process.returncode != 0:
             return {
                 "available": False,
@@ -349,11 +381,12 @@ class SubprocessIdaBackend:
         try:
             return await asyncio.shield(execution)
         except asyncio.CancelledError:
-            await asyncio.to_thread(process.abort)
-            await asyncio.gather(execution, return_exceptions=True)
+            cleanup = asyncio.create_task(_abort_worker_and_wait(process, execution))
+            await _await_cleanup(cleanup)
             raise
         finally:
-            await asyncio.to_thread(process.close)
+            closing = asyncio.create_task(asyncio.to_thread(process.close))
+            await _await_cleanup(closing)
 
     async def _launch(
         self,
@@ -375,12 +408,111 @@ class SubprocessIdaBackend:
                 sample=sample,
                 revision=revision,
                 allow_attach=allow_attach,
+                environment=self._environment,
             )
         )
         try:
             return await asyncio.shield(launch)
         except asyncio.CancelledError:
-            outcome = (await asyncio.gather(launch, return_exceptions=True))[0]
-            if isinstance(outcome, WorkerProcess):
-                await asyncio.to_thread(outcome.abort)
+            outcome = await _settle_cancelled_worker_launch(launch)
+            if outcome is not None:
+                cleanup = asyncio.create_task(asyncio.to_thread(outcome.abort))
+                await _await_cleanup(cleanup)
             raise
+
+
+async def _settle_cancelled_worker_launch(
+    launch: asyncio.Task[WorkerProcess],
+) -> WorkerProcess | None:
+    """等待取消窗口中的 IDA worker 启动落定, 并吸收启动自身的失败。"""
+
+    while not launch.done():
+        try:
+            await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    if launch.cancelled():
+        return None
+    try:
+        return launch.result()
+    except BaseException:
+        return None
+
+
+async def _settle_cancelled_probe_launch(
+    launch: asyncio.Task[asyncio.subprocess.Process],
+) -> asyncio.subprocess.Process | None:
+    """等待取消窗口中的 probe 启动落定, 并吸收启动自身的失败。"""
+
+    while not launch.done():
+        try:
+            await asyncio.shield(launch)
+        except asyncio.CancelledError:
+            continue
+        except BaseException:
+            break
+    if launch.cancelled():
+        return None
+    try:
+        return launch.result()
+    except BaseException:
+        return None
+
+
+async def _terminate_and_reap_probe(
+    process: asyncio.subprocess.Process,
+    communication: asyncio.Task[tuple[bytes, bytes]],
+) -> None:
+    """终止并回收被取消或超时的 probe, 确保调用方不会先释放 worker slot。"""
+
+    if process.returncode is None:
+        try:
+            process.terminate()
+        except OSError:
+            pass
+    reaping = asyncio.create_task(process.wait())
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(reaping),
+            timeout=_PROBE_TERMINATE_SECONDS,
+        )
+    except TimeoutError:
+        if process.returncode is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+        await reaping
+    finally:
+        await asyncio.gather(communication, return_exceptions=True)
+
+
+async def _abort_worker_and_wait(
+    process: WorkerProcess,
+    execution: asyncio.Task[JsonObject],
+) -> None:
+    """终止 worker 并等待阻塞执行线程观察到进程退出。"""
+
+    try:
+        await asyncio.to_thread(process.abort)
+    finally:
+        await asyncio.gather(execution, return_exceptions=True)
+
+
+async def _await_cleanup(cleanup: asyncio.Task[None]) -> None:
+    """记录重复取消, 等清理真正完成后再向调用方传播。"""
+
+    cancellation: asyncio.CancelledError | None = None
+    while True:
+        try:
+            await asyncio.shield(cleanup)
+            break
+        except asyncio.CancelledError as exc:
+            if cleanup.cancelled():
+                raise
+            cancellation = exc
+            continue
+    if cancellation is not None:
+        raise cancellation

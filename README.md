@@ -45,10 +45,36 @@ ida-re-mcp gc --apply
 [config.example.toml](config.example.toml)。workspace、日志、artifact、checkout、
 staging、临时文件和虚拟环境都位于工作树外。
 
-同一个 data root 同时只能由一个 Supervisor 占用。多个 MCP host 若需同时启用，必须
-使用 `IDA_RE_MCP_DATA_ROOT` 指定互不重叠的绝对路径；可用
-`IDA_RE_MCP_LOG_ROOT` 单独指定日志目录。否则第二个进程会在读取或修改运行状态前失败。
-两个 override 都不得指向文件系统根目录，也不得位于工作树内或包含工作树。
+`[runtime]` 可在一份服务配置中声明 `data_root`、`log_root` 与 `ida_dir`。环境变量
+`IDA_RE_MCP_DATA_ROOT`、`IDA_RE_MCP_LOG_ROOT` 仍可覆盖前两项，但不再要求每个 MCP
+host 手工分配不同目录。
+
+每条 stdio 连接拥有随机、独立的 session 目录。operation、change set、cursor 私钥、
+checkout、临时文件、IPC、worker 日志、调试会话和 Supervisor owner lease 都只属于
+当前连接；workspace、不可变 revision 与 artifact 则在同一个 data root 下受控共享。
+因此 Codex、OpenCode 或同一 host 的多个 Agent 可以同时接入：同一 workspace 仍由
+跨进程 lease 严格串行，不同 workspace 才能按 worker 上限并行。一个会话的 operation、
+change set、cursor 或 debug session 不能在另一个会话中复用。
+
+这里的“会话”严格指一条标准 MCP stdio 连接，也就是一个 server 进程。标准协议不会
+携带 Codex/OpenCode 内部的逻辑 Agent 身份；如果某个 host 主动把多个逻辑 Agent
+复用到同一条 stdio 连接，它们按协议就属于同一个会话。正常的“一条连接启动一个
+server”模式无需额外参数。
+
+`workers.analysis_limit` 与 `workers.debug_limit` 通过共享 data root 下的跨进程 slot
+lease 全局执行，不是每个 Agent 各算一遍。空闲 worker、one-shot mutation/refine/
+Expert/bootstrap、doctor 与完整 debug session 都占用对应 slot。在正常启动、取消、
+超时和有序关闭路径中，只有 IDA worker 真正退出后才释放 slot。Supervisor 被强制结束
+时操作系统会回收文件 lease，但已进入 handler 的孤儿 worker 仍可能短暂运行到观察到
+IPC 断开；强杀场景不能当作实际进程数的硬上限证明。
+
+stdio MCP host 应把服务进程的 `cwd` 明确设置为目标项目根目录。Codex 使用
+`mcp_servers.<name>.cwd`，OpenCode 本地 MCP 使用 `cwd`。这只决定服务从哪个项目启动；
+会话隔离不依赖 `cwd`，所以同一项目的并行 Agent 不会再次撞到同一个 owner lease。
+
+运行目录不得指向文件系统根目录，也不得位于当前 Git 工作树内或包含工作树。session
+owner lease 位于 session 数据树外；`gc` 按数据与日志树的最后活动时间回收遗留目录，
+并在同一 lease 内完成删除。活动 session 和未超过 operation 保留期的 session 不会被删。
 
 ## Agent 工作流
 

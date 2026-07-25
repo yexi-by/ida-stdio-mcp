@@ -245,6 +245,67 @@ def test_official_sdk_client_negotiates_real_stdio(tmp_path: Path) -> None:
     asyncio.run(_official_client_scenario(tmp_path))
 
 
+def test_two_stdio_agents_share_artifacts_and_isolate_runtime_sessions(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        text_uri, binary_uri, _, _ = _seed_resources(tmp_path)
+        ready = (asyncio.Event(), asyncio.Event())
+        release = asyncio.Event()
+
+        async def connect(index: int) -> set[str]:
+            parameters = StdioServerParameters(
+                command=sys.executable,
+                args=["-m", "ida_re_mcp", "serve"],
+                env=_environment(tmp_path),
+                cwd=Path.cwd(),
+            )
+            error_path = tmp_path / f"multi-agent-{index}.stderr.log"
+            with error_path.open("w+", encoding="utf-8") as error_log:
+                async with stdio_client(parameters, errlog=error_log) as streams:
+                    async with ClientSession(
+                        *streams,
+                        client_info=types.Implementation(
+                            name=f"ida-re-mcp-agent-{index}",
+                            version="1",
+                        ),
+                    ) as client:
+                        await client.initialize()
+                        resources = await client.list_resources()
+                        ready[index].set()
+                        await release.wait()
+                        return {str(item.uri) for item in resources.resources}
+
+        tasks = (
+            asyncio.create_task(connect(0)),
+            asyncio.create_task(connect(1)),
+        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*(event.wait() for event in ready)),
+                timeout=15,
+            )
+            session_root = tmp_path / "runtime-data" / "sessions"
+            sessions = sorted(path for path in session_root.iterdir() if path.is_dir())
+            assert len(sessions) == 2
+            assert sessions[0] != sessions[1]
+            lease_root = tmp_path / "runtime-data" / "session-leases"
+            assert all((lease_root / f"{path.name}.lease.lock").is_file() for path in sessions)
+            cursor_keys = [(path / "cursor.key").read_bytes() for path in sessions]
+            assert len(set(cursor_keys)) == 2
+
+            log_sessions = sorted(
+                path for path in (tmp_path / "runtime-logs" / "sessions").iterdir() if path.is_dir()
+            )
+            assert [path.name for path in log_sessions] == [path.name for path in sessions]
+        finally:
+            release.set()
+            listed = await asyncio.gather(*tasks)
+        assert listed == [{text_uri, binary_uri}, {text_uri, binary_uri}]
+
+    asyncio.run(scenario())
+
+
 def test_real_stdio_cancel_notification_cancels_inflight_request(tmp_path: Path) -> None:
     async def scenario() -> None:
         state_path = tmp_path / "cancel-state.txt"

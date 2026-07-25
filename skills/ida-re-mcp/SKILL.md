@@ -79,9 +79,12 @@ revision 改变后重新发起分页查询，不复用 cursor。
 ## 运行与 Expert 边界
 
 - 服务运行时只接受 Python 3.13；不要用其他 Python 次版本启动 CLI 或 worker。
-- 同一个 data root 同时只有一个 Supervisor owner；`serve` 运行时不要启动指向同一
-  data root 的 `doctor` 或 `gc`。
-- 不同 workspace 可在 worker 上限内并行，同一 workspace 始终串行。
+- 同一个 data root 可由多个 MCP 连接共享；每条连接的 operation、change set、cursor、
+  checkout、temp、日志与 debug session 相互隔离，不跨连接复用这些标识。
+- 同一 workspace 的 worker lifecycle 仍由跨进程 lease 严格串行；`gc` 会跳过活动
+  workspace 和活动 session。
+- 不同 workspace 可在 worker 上限内并行，同一 workspace 始终串行。analysis/debug
+  worker 上限通过共享 data root 的 slot lease 对所有 stdio 连接全局生效。
 - AnalysisWorker 会按 workspace/revision 复用私有 checkout；不要把 worker 热状态当作
   持久证据，只有已发布 revision 和冷验证结果可作为稳定依据。
 - `expert.execute` 默认不在工具目录。若操作者启用，它仍是开放世界 IDAPython；即使在

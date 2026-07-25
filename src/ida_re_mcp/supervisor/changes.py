@@ -7,7 +7,7 @@ import re
 import shutil
 import tempfile
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Literal, Self, cast
@@ -417,9 +417,14 @@ class ChangeSetStore:
         self,
         *,
         retained_scopes: set[tuple[str, str]],
+        retained_revision_provider: Callable[[str], set[str]] | None = None,
         dry_run: bool = True,
     ) -> ChangeSetGarbageCollectionResult:
-        """回收不可达计划与无活动 worker 的未发布 staging。"""
+        """回收不可达计划与无活动 worker 的未发布 staging。
+
+        实时 revision 解析器在 workspace lifecycle lease 内调用, 防止并行 Supervisor
+        使用过期 retained scope 快照清理刚发布 revision 的 ChangeSet。
+        """
 
         if self.workspace_lease_root is None:
             raise ValueError("ChangeSet GC 必须配置 workspace lifecycle lease 目录")
@@ -444,12 +449,21 @@ class ChangeSetStore:
                 skipped.append(workspace_id)
                 continue
             try:
+                workspace_retained_scopes = checked_scopes
+                if retained_revision_provider is not None:
+                    workspace_retained_scopes = {
+                        (
+                            workspace_id,
+                            validate_identifier(revision, field="revision"),
+                        )
+                        for revision in retained_revision_provider(workspace_id)
+                    }
                 with self._lock:
                     self._validate_workspace_root(workspace_root)
                     workspace_change_sets, workspace_staging = self._gc_candidates(
                         workspace_root=workspace_root,
                         workspace_id=workspace_id,
-                        retained_scopes=checked_scopes,
+                        retained_scopes=workspace_retained_scopes,
                     )
                     change_set_candidates.extend(workspace_change_sets)
                     staging_candidates.extend(workspace_staging)

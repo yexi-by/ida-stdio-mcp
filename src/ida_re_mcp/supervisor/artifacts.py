@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -136,6 +137,8 @@ class ArtifactStore:
             workspace_lease_root.resolve() if workspace_lease_root is not None else None
         )
         self.root.mkdir(parents=True, exist_ok=True)
+        self._gc_lease_root = self.root / ".gc-locks"
+        self._gc_lease_root.mkdir(exist_ok=True)
         self._lock = threading.RLock()
 
     def put_bytes(
@@ -481,24 +484,52 @@ class ArtifactStore:
                 self.root.glob("*/*/art_*"),
                 key=lambda path: path.as_posix(),
             )
-            result: list[ArtifactMetadata] = []
-            for directory in directories:
-                relative = directory.relative_to(self.root)
-                if len(relative.parts) != 3:
-                    continue
-                workspace_id, revision, artifact_id = relative.parts
-                metadata = self._read_manifest(workspace_id, revision, artifact_id)
-                if metadata.listed:
-                    result.append(metadata)
-            return tuple(result)
+        result: list[ArtifactMetadata] = []
+        for directory in directories:
+            relative = directory.relative_to(self.root)
+            if len(relative.parts) != 3:
+                continue
+            workspace_id, revision, artifact_id = relative.parts
+            gc_lease = interprocess_file_lock(self._gc_lease_root / f"{workspace_id}.lease.lock")
+            gc_lease.acquire()
+            try:
+                with self._lock:
+                    try:
+                        mode = directory.lstat().st_mode
+                    except FileNotFoundError:
+                        continue
+                    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                        raise ArtifactIntegrityError("artifact 根目录包含非法条目")
+                    try:
+                        metadata = self._read_manifest(
+                            workspace_id,
+                            revision,
+                            artifact_id,
+                        )
+                    except ArtifactNotFoundError as exc:
+                        if not directory.exists():
+                            continue
+                        raise ArtifactIntegrityError(
+                            f"artifact manifest 缺失: {artifact_id}"
+                        ) from exc
+                    if metadata.listed:
+                        result.append(metadata)
+            finally:
+                gc_lease.release()
+        return tuple(result)
 
     def collect_garbage(
         self,
         *,
         retained_scopes: set[tuple[str, str]],
+        retained_revision_provider: Callable[[str], set[str]] | None = None,
         dry_run: bool = True,
     ) -> ArtifactGarbageCollectionResult:
-        """只回收已不属于任何保留 revision 的完整 artifact scope。"""
+        """只回收已不属于任何保留 revision 的完整 artifact scope。
+
+        多 Supervisor 共享 data root 时, 调用方可提供实时 revision 解析器。解析发生在
+        对应 workspace lifecycle lease 内, 避免旧快照误删刚发布 revision 的 artifact。
+        """
 
         checked_scopes = {
             _validate_scope(workspace_id, revision) for workspace_id, revision in retained_scopes
@@ -507,27 +538,51 @@ class ArtifactStore:
         skipped: list[str] = []
         reclaimed = 0
         with self._lock:
-            for workspace_root in sorted(self.root.iterdir(), key=lambda item: item.name):
-                if workspace_root.is_symlink() or not workspace_root.is_dir():
-                    raise ArtifactIntegrityError("artifact 根目录包含非法条目")
-                try:
-                    workspace_id = validate_identifier(
-                        workspace_root.name,
-                        field="workspace_id",
-                    )
-                except ValueError as exc:
-                    raise ArtifactIntegrityError("artifact workspace 目录名无效") from exc
-                if workspace_root.resolve(strict=True).parent != self.root:
-                    raise ArtifactIntegrityError("artifact workspace 路径越界")
-                lease = (
-                    interprocess_file_lock(self.workspace_lease_root / f"{workspace_id}.lease.lock")
-                    if self.workspace_lease_root is not None
-                    else None
+            workspace_roots = sorted(self.root.iterdir(), key=lambda item: item.name)
+        for workspace_root in workspace_roots:
+            try:
+                mode = workspace_root.lstat().st_mode
+            except FileNotFoundError:
+                continue
+            if workspace_root == self._gc_lease_root:
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                    raise ArtifactIntegrityError("artifact GC lease 根目录类型无效")
+                continue
+            if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                raise ArtifactIntegrityError("artifact 根目录包含非法条目")
+            try:
+                workspace_id = validate_identifier(
+                    workspace_root.name,
+                    field="workspace_id",
                 )
-                if lease is not None and not lease.try_acquire():
-                    skipped.append(workspace_id)
-                    continue
-                try:
+            except ValueError as exc:
+                raise ArtifactIntegrityError("artifact workspace 目录名无效") from exc
+            if workspace_root.resolve(strict=True).parent != self.root:
+                raise ArtifactIntegrityError("artifact workspace 路径越界")
+            workspace_lease = (
+                interprocess_file_lock(self.workspace_lease_root / f"{workspace_id}.lease.lock")
+                if self.workspace_lease_root is not None
+                else None
+            )
+            if workspace_lease is not None and not workspace_lease.try_acquire():
+                skipped.append(workspace_id)
+                continue
+            try:
+                workspace_retained_scopes = checked_scopes
+                if retained_revision_provider is not None:
+                    workspace_retained_scopes = {
+                        (
+                            workspace_id,
+                            validate_identifier(revision, field="revision"),
+                        )
+                        for revision in retained_revision_provider(workspace_id)
+                    }
+                gc_lease = interprocess_file_lock(
+                    self._gc_lease_root / f"{workspace_id}.lease.lock"
+                )
+                with gc_lease, self._lock:
+                    if not workspace_root.exists():
+                        continue
                     workspace_candidates: list[Path] = []
                     for revision_root in sorted(
                         workspace_root.iterdir(),
@@ -548,7 +603,7 @@ class ArtifactStore:
                             strict=True
                         ):
                             raise ArtifactIntegrityError("artifact revision 路径越界")
-                        if (workspace_id, revision) not in checked_scopes:
+                        if (workspace_id, revision) not in workspace_retained_scopes:
                             _validate_artifact_scope(revision_root)
                             workspace_candidates.append(revision_root)
                         else:
@@ -566,10 +621,10 @@ class ArtifactStore:
                                 )
                             else:
                                 _remove_artifact_scope(candidate, self.root)
-                finally:
-                    if lease is not None:
-                        lease.release()
-            unique = tuple(sorted(set(candidates), key=str))
+            finally:
+                if workspace_lease is not None:
+                    workspace_lease.release()
+        unique = tuple(sorted(set(candidates), key=str))
         return ArtifactGarbageCollectionResult(
             dry_run=dry_run,
             removed_paths=unique,

@@ -171,6 +171,7 @@ def _launch(
     kind: str = "analysis",
     process: ProcessHandle | None = None,
     client: _Client | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> tuple[WorkerProcess, _Launcher, _Client]:
     checkout, sample, working_tree, log_root = _files(tmp_path)
     actual_process = process or _Process()
@@ -187,6 +188,7 @@ def _launch(
             endpoint_factory=_endpoint,
             client_factory=lambda _endpoint_value: actual_client,
             sleeper=lambda _seconds: None,
+            environment=environment,
         )
     elif kind == "debug":
         worker = WorkerProcess.launch(
@@ -199,6 +201,7 @@ def _launch(
             endpoint_factory=_endpoint,
             client_factory=lambda _endpoint_value: actual_client,
             sleeper=lambda _seconds: None,
+            environment=environment,
         )
     else:
         worker = WorkerProcess.launch(
@@ -210,6 +213,7 @@ def _launch(
             endpoint_factory=_endpoint,
             client_factory=lambda _endpoint_value: actual_client,
             sleeper=lambda _seconds: None,
+            environment=environment,
         )
     return worker, launcher, actual_client
 
@@ -257,6 +261,16 @@ def test_connect_retries_without_restarting_process(tmp_path: Path) -> None:
 
     assert actual_client.connect_calls == 3
     assert len(launcher.launches) == 1
+    worker.close()
+
+
+def test_launch_applies_server_config_environment_to_worker(tmp_path: Path) -> None:
+    worker, launcher, _ = _launch(
+        tmp_path,
+        environment={"IDADIR": "C:/Program Files/IDA Professional 9.3"},
+    )
+
+    assert launcher.launches[0].environment["IDADIR"] == ("C:/Program Files/IDA Professional 9.3")
     worker.close()
 
 
