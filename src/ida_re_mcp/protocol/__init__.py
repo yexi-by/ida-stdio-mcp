@@ -1,25 +1,9 @@
-"""MCP 2026-07-28 current-only stdio 协议入口。"""
+"""基于官方 Python SDK 的 MCP stdio 边界。"""
 
-from ida_re_mcp.protocol.dispatch import (
-    INTERNAL_ERROR,
-    INVALID_PARAMS,
-    INVALID_REQUEST,
-    METHOD_NOT_FOUND,
-    PARSE_ERROR,
-    UNSUPPORTED_PROTOCOL_VERSION,
-    CurrentProtocol,
-)
-from ida_re_mcp.protocol.handlers import CancellationHandler, ProtocolHandler, RequestContext
+from ida_re_mcp.protocol.handlers import McpHandler
+from ida_re_mcp.protocol.server import McpRuntime
 
 __all__ = [
-    "INTERNAL_ERROR",
-    "INVALID_PARAMS",
-    "INVALID_REQUEST",
-    "METHOD_NOT_FOUND",
-    "PARSE_ERROR",
-    "UNSUPPORTED_PROTOCOL_VERSION",
-    "CancellationHandler",
-    "CurrentProtocol",
-    "ProtocolHandler",
-    "RequestContext",
+    "McpHandler",
+    "McpRuntime",
 ]

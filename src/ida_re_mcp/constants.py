@@ -4,8 +4,10 @@ from typing import Final
 
 PRODUCT_NAME: Final = "ida-re-mcp"
 PRODUCT_VERSION: Final = "1.0.0.dev0"
-PROTOCOL_VERSION: Final = "2026-07-28"
-IL2CPP_SCHEMA_VERSION: Final = "2026-07-28"
+CONFIG_SCHEMA_VERSION: Final = "1"
+STORAGE_SCHEMA_VERSION: Final = "1"
+CHUNKED_ARTIFACT_SCHEMA_VERSION: Final = "1"
+IL2CPP_SCHEMA_VERSION: Final = "1"
 IL2CPP_MEDIA_TYPE: Final = "application/vnd.ida-re.il2cpp-bundle+ndjson"
 
 DEFAULT_PAGE_SIZE: Final = 50

@@ -121,7 +121,7 @@ def test_application_aclose_releases_owner_lease_after_cleanup_failure(
 ) -> None:
     paths = _runtime_paths(tmp_path)
     config_path = tmp_path / "config.toml"
-    config_path.write_text('schema_version = "2026-07-28"\n', encoding="utf-8")
+    config_path.write_text('schema_version = "1"\n', encoding="utf-8")
     first = Application.open(config_path, paths=paths)
     monkeypatch.setattr(
         first,
@@ -141,7 +141,7 @@ def test_application_owner_lease_precedes_operation_recovery_and_survives_crash(
 ) -> None:
     paths = _runtime_paths(tmp_path)
     config_path = tmp_path / "config.toml"
-    config_path.write_text('schema_version = "2026-07-28"\n', encoding="utf-8")
+    config_path.write_text('schema_version = "1"\n', encoding="utf-8")
     ready = tmp_path / "owner.ready"
     crash = tmp_path / "owner.crash"
     process = _start_owner(config_path, paths, ready=ready, crash=crash)
@@ -151,12 +151,12 @@ def test_application_owner_lease_precedes_operation_recovery_and_survives_crash(
         record_path = paths.data_root / "operations" / f"{operation_id}.json"
         original_record = record_path.read_bytes()
 
-        record_path.write_bytes(b"deliberately invalid while current owner is alive")
+        record_path.write_bytes(b"deliberately invalid while active owner is alive")
         started = time.monotonic()
         with pytest.raises(SupervisorAlreadyRunningError, match="Supervisor"):
             Application.open(config_path, paths=paths)
         assert time.monotonic() - started < 1
-        assert record_path.read_bytes() == b"deliberately invalid while current owner is alive"
+        assert record_path.read_bytes() == b"deliberately invalid while active owner is alive"
         record_path.write_bytes(original_record)
 
         stdout, stderr = _finish_process(process, crash)

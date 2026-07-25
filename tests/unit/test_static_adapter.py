@@ -6,7 +6,7 @@ import pytest
 from pydantic import ValidationError
 
 from ida_re_mcp.domain.address import DatabaseAddress, RuntimeAddress
-from ida_re_mcp.domain.base import current_json_schema
+from ida_re_mcp.domain.base import tool_json_schema
 from ida_re_mcp.domain.tools import (
     AddressInspectInput,
     AddressInspectOutput,
@@ -71,7 +71,7 @@ def _database(ea: str) -> DatabaseAddress:
 
 
 def test_operand_view_is_closed_and_rejects_undeclared_fields() -> None:
-    schema = current_json_schema(OperandView)
+    schema = tool_json_schema(OperandView)
     assert schema["additionalProperties"] is False
     with pytest.raises(ValidationError):
         OperandView.model_validate(

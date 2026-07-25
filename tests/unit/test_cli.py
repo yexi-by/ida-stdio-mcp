@@ -8,30 +8,16 @@ from ida_re_mcp.cli import ApplicationLike, main
 from ida_re_mcp.domain.base import JsonObject
 
 
-def _wire_result(request_id: object) -> bytes:
-    return (
-        json.dumps(
-            {"jsonrpc": "2.0", "id": request_id, "result": {"ok": True}},
-            separators=(",", ":"),
-        ).encode("utf-8")
-        + b"\n"
-    )
-
-
-class _Protocol:
-    async def handle_line(self, line: bytes | str) -> bytes | None:
-        assert isinstance(line, bytes)
-        request = json.loads(line)
-        return _wire_result(request["id"])
-
-
 class _Application:
     def __init__(self, *, healthy: bool = True, doctor_error: Exception | None = None) -> None:
-        self.protocol = _Protocol()
         self.healthy = healthy
         self.doctor_error = doctor_error
         self.closed = False
+        self.served = False
         self.gc_apply: list[bool] = []
+
+    async def serve(self) -> None:
+        self.served = True
 
     async def doctor(self) -> tuple[bool, JsonObject]:
         if self.doctor_error is not None:
@@ -56,7 +42,7 @@ class _Factory:
         return self.application
 
 
-def test_serve_writes_only_protocol_messages_and_closes() -> None:
+def test_serve_delegates_to_application_and_closes() -> None:
     application = _Application()
     factory = _Factory(application)
     stdout = io.BytesIO()
@@ -65,15 +51,14 @@ def test_serve_writes_only_protocol_messages_and_closes() -> None:
     exit_code = main(
         ["serve"],
         application_factory=factory,
-        stdin=io.BytesIO(b'{"jsonrpc":"2.0","id":5}\n'),
         stdout=stdout,
         stderr=stderr,
     )
 
     assert exit_code == 0
-    assert json.loads(stdout.getvalue())["id"] == 5
-    assert len(stdout.getvalue().splitlines()) == 1
+    assert stdout.getvalue() == b""
     assert stderr.getvalue() == ""
+    assert application.served
     assert application.closed
 
 
@@ -83,15 +68,14 @@ def test_doctor_uses_explicit_config_and_nonzero_for_unhealthy() -> None:
     stdout = io.BytesIO()
 
     exit_code = main(
-        ["doctor", "--config", "C:/runtime/current.toml"],
+        ["doctor", "--config", "C:/runtime/service.toml"],
         application_factory=factory,
-        stdin=io.BytesIO(),
         stdout=stdout,
         stderr=io.StringIO(),
     )
 
     assert exit_code == 1
-    assert factory.config_paths == [Path("C:/runtime/current.toml")]
+    assert factory.config_paths == [Path("C:/runtime/service.toml")]
     assert json.loads(stdout.getvalue())["healthy"] is False
     assert application.closed
 
@@ -107,7 +91,6 @@ def test_gc_requires_an_explicit_mode(flag: str, expected_apply: bool) -> None:
     exit_code = main(
         ["gc", flag],
         application_factory=_Factory(application),
-        stdin=io.BytesIO(),
         stdout=stdout,
         stderr=io.StringIO(),
     )
@@ -123,7 +106,6 @@ def test_gc_without_mode_is_usage_error() -> None:
         main(
             ["gc"],
             application_factory=_Factory(_Application()),
-            stdin=io.BytesIO(),
             stdout=io.BytesIO(),
             stderr=io.StringIO(),
         )
@@ -139,7 +121,6 @@ def test_command_failure_is_stderr_only_and_still_closes() -> None:
     exit_code = main(
         ["doctor"],
         application_factory=_Factory(application),
-        stdin=io.BytesIO(),
         stdout=stdout,
         stderr=stderr,
     )

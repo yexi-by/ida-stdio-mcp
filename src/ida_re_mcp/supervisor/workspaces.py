@@ -18,7 +18,7 @@ from typing import Literal, Self
 
 from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, model_validator
 
-from ida_re_mcp.constants import DEFAULT_RETAINED_REVISIONS, PROTOCOL_VERSION
+from ida_re_mcp.constants import DEFAULT_RETAINED_REVISIONS, STORAGE_SCHEMA_VERSION
 from ida_re_mcp.supervisor._fs import (
     atomic_write_json,
     sha256_file,
@@ -144,7 +144,7 @@ class GarbageCollectionResult:
 class _WorkspaceManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["2026-07-28"]
+    schema_version: Literal["1"]
     workspace_id: str
     sample_name: str
     sample_sha256: str
@@ -158,7 +158,7 @@ class _WorkspaceManifest(BaseModel):
 class _RevisionManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["2026-07-28"]
+    schema_version: Literal["1"]
     workspace_id: str
     revision: str
     parent_revision: str | None
@@ -185,7 +185,7 @@ class _RevisionManifest(BaseModel):
 class _StagingManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["2026-07-28"]
+    schema_version: Literal["1"]
     workspace_id: str
     staging_id: str
     candidate_revision: str
@@ -254,7 +254,7 @@ class WorkspaceRegistry:
                 raise StorageCorruptionError("原样本在复制期间发生变化")
             sample_name = _validate_sample_name(source.name)
             manifest = _WorkspaceManifest(
-                schema_version=PROTOCOL_VERSION,
+                schema_version=STORAGE_SCHEMA_VERSION,
                 workspace_id=workspace_id,
                 sample_name=sample_name,
                 sample_sha256=copied_sha256,
@@ -427,7 +427,7 @@ class WorkspaceRegistry:
                 (path / _REVISION_MANIFEST_NAME).unlink(missing_ok=True)
 
             stage_manifest = _StagingManifest(
-                schema_version=PROTOCOL_VERSION,
+                schema_version=STORAGE_SCHEMA_VERSION,
                 workspace_id=workspace_id,
                 staging_id=staging_id,
                 candidate_revision=candidate_revision,
@@ -510,7 +510,7 @@ class WorkspaceRegistry:
             database_sha256 = actual_hashes[_DATABASE_NAME]
 
             revision_manifest = _RevisionManifest(
-                schema_version=PROTOCOL_VERSION,
+                schema_version=STORAGE_SCHEMA_VERSION,
                 workspace_id=workspace_id,
                 revision=staging.candidate_revision,
                 parent_revision=staging.expected_revision,

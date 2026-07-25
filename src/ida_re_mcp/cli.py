@@ -12,7 +12,6 @@ from typing import BinaryIO, Literal, Protocol, TextIO, cast
 
 from ida_re_mcp.constants import PRODUCT_NAME
 from ida_re_mcp.domain.base import JsonObject
-from ida_re_mcp.protocol.stdio import LineProtocol, serve_stdio
 
 type CommandName = Literal["serve", "doctor", "gc"]
 
@@ -20,8 +19,7 @@ type CommandName = Literal["serve", "doctor", "gc"]
 class ApplicationLike(Protocol):
     """CLI 与 Supervisor 应用对象之间的窄接口。"""
 
-    @property
-    def protocol(self) -> LineProtocol: ...
+    async def serve(self) -> None: ...
 
     async def doctor(self) -> tuple[bool, JsonObject]: ...
 
@@ -52,16 +50,16 @@ def _parser() -> argparse.ArgumentParser:
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
 
-    serve = subcommands.add_parser("serve", help="通过 current-only stdio 提供 MCP 服务")
-    serve.add_argument("--config", type=Path, help="当前 schema 的 TOML 配置")
+    serve = subcommands.add_parser("serve", help="通过标准 stdio 提供 MCP 服务")
+    serve.add_argument("--config", type=Path, help="TOML 配置路径")
     serve.set_defaults(apply=False)
 
     doctor = subcommands.add_parser("doctor", help="检查运行目录与 IDA worker")
-    doctor.add_argument("--config", type=Path, help="当前 schema 的 TOML 配置")
+    doctor.add_argument("--config", type=Path, help="TOML 配置路径")
     doctor.set_defaults(apply=False)
 
     gc = subcommands.add_parser("gc", help="检查或执行不可变数据回收")
-    gc.add_argument("--config", type=Path, help="当前 schema 的 TOML 配置")
+    gc.add_argument("--config", type=Path, help="TOML 配置路径")
     mode = gc.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_false", dest="apply", help="只报告可回收数据")
     mode.add_argument("--apply", action="store_true", dest="apply", help="执行安全回收")
@@ -107,19 +105,12 @@ async def _run(
     arguments: _Arguments,
     *,
     application_factory: ApplicationFactory,
-    stdin: BinaryIO,
     stdout: BinaryIO,
-    stderr: TextIO,
 ) -> int:
     application = application_factory(arguments.config_path)
     try:
         if arguments.command == "serve":
-            await serve_stdio(
-                application.protocol,
-                stdin=stdin,
-                stdout=stdout,
-                stderr=stderr,
-            )
+            await application.serve()
             return 0
         if arguments.command == "doctor":
             healthy, report = await application.doctor()
@@ -136,14 +127,12 @@ def main(
     argv: Sequence[str] | None = None,
     *,
     application_factory: ApplicationFactory = _default_application_factory,
-    stdin: BinaryIO | None = None,
     stdout: BinaryIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
     """解析命令并在单一 asyncio 生命周期内运行 Application。"""
 
     arguments = _parse_args(argv)
-    binary_stdin = stdin if stdin is not None else cast(BinaryIO, sys.stdin.buffer)
     binary_stdout = stdout if stdout is not None else cast(BinaryIO, sys.stdout.buffer)
     text_stderr = stderr if stderr is not None else sys.stderr
     try:
@@ -151,9 +140,7 @@ def main(
             _run(
                 arguments,
                 application_factory=application_factory,
-                stdin=binary_stdin,
                 stdout=binary_stdout,
-                stderr=text_stderr,
             )
         )
     except KeyboardInterrupt:

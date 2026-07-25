@@ -1,4 +1,4 @@
-schema_version = "2026-07-28"
+schema_version = "1"
 
 [policy]
 # 允许事务化 IDB 写回。
@@ -17,6 +17,6 @@ debug_limit = 1
 idle_seconds = 300
 
 [storage]
-# 软配额不会删除 current revision 或 pinned export。
+# 软配额不会删除 HEAD revision 或 pinned export。
 quota_gib = 20
 retained_revisions = 3

@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from types import MappingProxyType
 from typing import Final
 
-from ida_re_mcp.domain.base import JsonObject, StrictModel, current_json_schema
+from ida_re_mcp.domain.base import StrictModel
 from ida_re_mcp.domain.tools import (
     AddressInspectInput,
     AddressInspectOutput,
@@ -72,21 +71,6 @@ class ToolSpec:
     destructive: bool
     idempotent: bool
     open_world: bool
-
-    def as_wire_definition(self) -> JsonObject:
-        return {
-            "name": self.name,
-            "title": self.title,
-            "description": self.description,
-            "inputSchema": current_json_schema(self.input_model),
-            "outputSchema": current_json_schema(self.output_model),
-            "annotations": {
-                "readOnlyHint": self.read_only,
-                "destructiveHint": self.destructive,
-                "idempotentHint": self.idempotent,
-                "openWorldHint": self.open_world,
-            },
-        }
 
 
 def _spec(
@@ -314,7 +298,7 @@ _STANDARD_SPECS: Final = (
     _spec(
         "workspace.get",
         "读取工作区",
-        "读取 workspace 当前 revision、样本身份与可用 revision 元数据。",
+        "读取 workspace 当前 revision、样本身份与分页 revision 元数据。",
         WorkspaceGetInput,
         WorkspaceGetOutput,
         read_only=True,
@@ -396,4 +380,3 @@ def build_tool_catalog(
 
 
 TOOL_CATALOG: Final = build_tool_catalog()
-TOOL_CATALOG_BY_NAME: Final = MappingProxyType({spec.name: spec for spec in TOOL_CATALOG})

@@ -15,7 +15,8 @@ classifiers = [
 ]
 dependencies = [
     "idapro==0.0.7",
-    "mcp-types==2.0.0b2",
+    "jsonschema>=4.26,<5",
+    "mcp==1.28.0",
     "platformdirs>=4.3,<5",
     "pydantic>=2.12,<3",
 ]
@@ -31,7 +32,6 @@ build-backend = "uv_build"
 dev = [
     "basedpyright>=1.39,<2",
     "hypothesis>=6.140,<7",
-    "mcp==2.0.0b2",
     "pytest>=9,<10",
     "pytest-cov>=7,<8",
     "ruff>=0.14,<0.15",
@@ -39,6 +39,7 @@ dev = [
 
 [tool.uv]
 package = true
+prerelease = "disallow"
 
 [tool.ruff]
 target-version = "py313"

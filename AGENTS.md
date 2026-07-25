@@ -9,7 +9,8 @@
 
 ## 协议与进程
 
-- 只实现 MCP `2026-07-28` 的 UTF-8 单行 JSON-RPC stdio 边界。
+- 使用官方稳定 Python MCP SDK 实现标准 initialize/initialized 生命周期与 stdio transport。
+- 协议版本协商由官方 SDK 负责；项目不得自建版本分支、JSON-RPC parser 或 lifecycle。
 - stdout 只输出协议消息；诊断写入 stderr 或平台日志目录。
 - 工具目录在启动时固定，只广告 tools 和不可变 resources。
 - Supervisor 不导入 IDA；IDA API 只在独立 worker 的 owner 线程调用。

@@ -13,7 +13,7 @@ from pydantic import JsonValue
 
 from ida_re_mcp.application import Application
 from ida_re_mcp.config import AppConfig, RuntimePaths
-from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES, PROTOCOL_VERSION
+from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES
 from ida_re_mcp.domain.address import DatabaseAddress
 from ida_re_mcp.domain.base import JsonObject
 from ida_re_mcp.domain.errors import BusinessErrorCode, ToolExecutionError
@@ -37,11 +37,11 @@ from ida_re_mcp.domain.tools import (
     RenameOperation,
     WorkspaceExportInput,
     WorkspaceExportOutput,
+    WorkspaceGetInput,
+    WorkspaceGetOutput,
     WorkspaceListInput,
     WorkspaceListOutput,
 )
-from ida_re_mcp.protocol.handlers import RequestContext
-from ida_re_mcp.protocol.models import ClientCapabilities
 from ida_re_mcp.supervisor.artifacts import ArtifactNotFoundError, parse_artifact_uri
 from ida_re_mcp.supervisor.backend import AnalysisBackend, DebugBackend
 from ida_re_mcp.supervisor.changes import ChangeSetStore
@@ -420,15 +420,6 @@ def _application(
     return application, workspace, sample_bytes, backend
 
 
-def _context() -> RequestContext:
-    return RequestContext(
-        protocol_version=PROTOCOL_VERSION,
-        client_info=None,
-        client_capabilities=ClientCapabilities(),
-        request_id="application-change-test",
-    )
-
-
 def _prepare(workspace: WorkspaceSnapshot) -> ChangePrepareInput:
     assert workspace.current_revision is not None
     return ChangePrepareInput(
@@ -455,10 +446,9 @@ def test_change_prepare_apply_and_inverse_preserve_all_revision_invariants(
             workspace.workspace_id,
             base_revision,
         )
-        prepared = await application.call_tool(
+        prepared = await application.execute_tool(
             "change.prepare",
             _prepare(workspace),
-            _context(),
         )
         assert isinstance(prepared, ChangePrepareOutput)
         assert prepared.base_revision == base_revision
@@ -467,7 +457,7 @@ def test_change_prepare_apply_and_inverse_preserve_all_revision_invariants(
         assert after_prepare.current_revision == base_revision
         assert base.database_path.read_bytes() == b"cold-base"
 
-        applied = await application.call_tool(
+        applied = await application.execute_tool(
             "change.apply",
             ChangeApplyInput(
                 workspace_id=workspace.workspace_id,
@@ -475,7 +465,6 @@ def test_change_prepare_apply_and_inverse_preserve_all_revision_invariants(
                 change_set_id=prepared.change_set_id,
                 digest=prepared.digest,
             ),
-            _context(),
         )
         assert isinstance(applied, ChangeApplyOutput)
         assert backend.mutation_calls == 2
@@ -489,18 +478,17 @@ def test_change_prepare_apply_and_inverse_preserve_all_revision_invariants(
         assert changed.database_path.read_bytes().endswith(b"|mutation-2")
         assert base.database_path.read_bytes() == b"cold-base"
 
-        inverse = await application.call_tool(
+        inverse = await application.execute_tool(
             "change.prepare",
             ChangePrepareInput(
                 workspace_id=workspace.workspace_id,
                 base_revision=applied.revision,
                 inverse_of_change_id=applied.change_id,
             ),
-            _context(),
         )
         assert isinstance(inverse, ChangePrepareOutput)
         assert inverse.impact.renamed_entities == 0
-        restored = await application.call_tool(
+        restored = await application.execute_tool(
             "change.apply",
             ChangeApplyInput(
                 workspace_id=workspace.workspace_id,
@@ -508,7 +496,6 @@ def test_change_prepare_apply_and_inverse_preserve_all_revision_invariants(
                 change_set_id=inverse.change_set_id,
                 digest=inverse.digest,
             ),
-            _context(),
         )
         assert isinstance(restored, ChangeApplyOutput)
         restored_revision = application.storage.workspaces.get_revision(
@@ -562,10 +549,9 @@ def test_change_prepare_stores_oversized_conflicts_as_artifact(
             "ida_re_mcp.application.parse_preflight_impact",
             oversized_impact,
         )
-        output = await application.call_tool(
+        output = await application.execute_tool(
             "change.prepare",
             _prepare(workspace),
-            _context(),
         )
         assert isinstance(output, ChangePrepareOutput)
         assert output.impact.conflicts == []
@@ -601,15 +587,14 @@ def test_change_apply_worker_failure_keeps_head_sample_and_base_unchanged(
             workspace.workspace_id,
             base_revision,
         )
-        prepared = await application.call_tool(
+        prepared = await application.execute_tool(
             "change.prepare",
             _prepare(workspace),
-            _context(),
         )
         assert isinstance(prepared, ChangePrepareOutput)
 
         with pytest.raises(RuntimeError, match="injected mutation failure"):
-            await application.call_tool(
+            await application.execute_tool(
                 "change.apply",
                 ChangeApplyInput(
                     workspace_id=workspace.workspace_id,
@@ -617,7 +602,6 @@ def test_change_apply_worker_failure_keeps_head_sample_and_base_unchanged(
                     change_set_id=prepared.change_set_id,
                     digest=prepared.digest,
                 ),
-                _context(),
             )
 
         current = application.storage.workspaces.get(workspace.workspace_id)
@@ -648,15 +632,14 @@ def test_change_apply_cold_identity_mismatch_keeps_head_sample_and_base_unchange
             workspace.workspace_id,
             base_revision,
         )
-        prepared = await application.call_tool(
+        prepared = await application.execute_tool(
             "change.prepare",
             _prepare(workspace),
-            _context(),
         )
         assert isinstance(prepared, ChangePrepareOutput)
 
         with pytest.raises(RuntimeError, match="原样本 SHA-256"):
-            await application.call_tool(
+            await application.execute_tool(
                 "change.apply",
                 ChangeApplyInput(
                     workspace_id=workspace.workspace_id,
@@ -664,7 +647,6 @@ def test_change_apply_cold_identity_mismatch_keeps_head_sample_and_base_unchange
                     change_set_id=prepared.change_set_id,
                     digest=prepared.digest,
                 ),
-                _context(),
             )
 
         current = application.storage.workspaces.get(workspace.workspace_id)
@@ -693,10 +675,9 @@ def test_static_cursor_binds_query_and_automatically_shrinks_oversized_page(
             text_query="match",
             page_size=50,
         )
-        first = await application.call_tool(
+        first = await application.execute_tool(
             "program.search",
             query,
-            _context(),
         )
         assert isinstance(first, ProgramSearchOutput)
         assert first.matches == []
@@ -712,10 +693,9 @@ def test_static_cursor_binds_query_and_automatically_shrinks_oversized_page(
         assert full_first.next_cursor == first.next_cursor
 
         backend.search_requests.clear()
-        second = await application.call_tool(
+        second = await application.execute_tool(
             "program.search",
             query.model_copy(update={"cursor": first.next_cursor}),
-            _context(),
         )
         assert isinstance(second, ProgramSearchOutput)
         assert backend.search_requests == [(50, 50)]
@@ -730,10 +710,9 @@ def test_static_cursor_binds_query_and_automatically_shrinks_oversized_page(
         last = first.next_cursor[-1]
         tampered = first.next_cursor[:-1] + ("A" if last != "A" else "B")
         with pytest.raises(ToolExecutionError):
-            await application.call_tool(
+            await application.execute_tool(
                 "program.search",
                 query.model_copy(update={"cursor": tampered}),
-                _context(),
             )
         await application.aclose()
 
@@ -749,14 +728,13 @@ def test_oversized_unpaged_overview_preserves_full_requested_result_in_artifact(
             large_overview_count=100,
         )
         assert workspace.current_revision is not None
-        result = await application.call_tool(
+        result = await application.execute_tool(
             "program.overview",
             ProgramOverviewInput(
                 workspace_id=workspace.workspace_id,
                 revision=workspace.current_revision,
                 include=["functions"],
             ),
-            _context(),
         )
         assert isinstance(result, ProgramOverviewOutput)
         assert result.functions == []
@@ -784,10 +762,9 @@ def test_workspace_list_shrinks_page_to_inline_byte_budget(tmp_path: Path) -> No
         cursor: str | None = None
         seen: list[str] = []
         while True:
-            output = await application.call_tool(
+            output = await application.execute_tool(
                 "workspace.list",
                 WorkspaceListInput(cursor=cursor, page_size=200),
-                _context(),
             )
             assert isinstance(output, WorkspaceListOutput)
             serialized = json.dumps(
@@ -809,6 +786,97 @@ def test_workspace_list_shrinks_page_to_inline_byte_budget(tmp_path: Path) -> No
     asyncio.run(scenario())
 
 
+def test_workspace_get_paginates_revisions_with_inline_budget(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, workspace, _sample_bytes, _backend = _application(tmp_path)
+        current_revision = workspace.current_revision
+        assert current_revision is not None
+        application.storage.workspaces.pin_revision(
+            workspace.workspace_id,
+            current_revision,
+        )
+        for index in range(200):
+            staging = application.storage.workspaces.begin_staging(
+                workspace.workspace_id,
+                expected_revision=current_revision,
+            )
+            staging.database_path.write_bytes(f"revision-{index}".encode())
+            receipt = ColdValidationReceipt.create(
+                validator="fake_ida_9_3_headless",
+                component_hashes=hash_staging_payload(staging),
+            )
+            published = application.storage.workspaces.publish_staging(
+                staging,
+                receipt=receipt,
+                change_id=f"change_{index:08d}",
+            )
+            current_revision = published.revision
+            application.storage.workspaces.pin_revision(
+                workspace.workspace_id,
+                current_revision,
+            )
+
+        expected = [
+            item.revision
+            for item in application.storage.workspaces.get(workspace.workspace_id).revisions
+        ]
+        assert len(expected) == 201
+        requested_page_size = 200
+        cursor: str | None = None
+        pages: list[WorkspaceGetOutput] = []
+        seen: list[str] = []
+        while True:
+            output = await application.execute_tool(
+                "workspace.get",
+                WorkspaceGetInput(
+                    workspace_id=workspace.workspace_id,
+                    cursor=cursor,
+                    page_size=requested_page_size,
+                ),
+            )
+            assert isinstance(output, WorkspaceGetOutput)
+            serialized = json.dumps(
+                output.model_dump(mode="json"),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            assert len(serialized) <= MAX_INLINE_RESULT_BYTES
+            assert 0 < len(output.revisions) <= requested_page_size
+            pages.append(output)
+            seen.extend(item.revision for item in output.revisions)
+            cursor = output.next_cursor
+            if cursor is None:
+                break
+
+        assert len(pages[0].revisions) < requested_page_size
+        assert pages[0].next_cursor is not None
+        assert seen == expected
+        assert len(seen) == len(set(seen))
+        assert current_revision in seen
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_text_resource_decode_failure_remains_an_internal_failure(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, workspace, _sample_bytes, _backend = _application(tmp_path)
+        assert workspace.current_revision is not None
+        artifact = application.storage.artifacts.put_bytes(
+            workspace_id=workspace.workspace_id,
+            revision=workspace.current_revision,
+            data=b"\xff",
+            media_type="text/plain",
+            name="invalid-utf8.txt",
+        )
+
+        with pytest.raises(UnicodeDecodeError):
+            await application.read_resource(artifact.uri)
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_analysis_worker_and_private_checkout_are_reused_until_application_close(
     tmp_path: Path,
 ) -> None:
@@ -820,8 +888,8 @@ def test_analysis_worker_and_private_checkout_are_reused_until_application_close
             revision=workspace.current_revision,
             include=[],
         )
-        first = await application.call_tool("program.overview", request, _context())
-        second = await application.call_tool("program.overview", request, _context())
+        first = await application.execute_tool("program.overview", request)
+        second = await application.execute_tool("program.overview", request)
         assert isinstance(first, ProgramOverviewOutput)
         assert isinstance(second, ProgramOverviewOutput)
         assert backend.analysis_open_count == 1
@@ -842,20 +910,18 @@ def test_workspace_export_pins_revision_and_returns_chunk_index(
     async def scenario() -> None:
         application, workspace, _sample_bytes, _backend = _application(tmp_path)
         assert workspace.current_revision is not None
-        started = await application.call_tool(
+        started = await application.execute_tool(
             "workspace.export",
             WorkspaceExportInput(
                 workspace_id=workspace.workspace_id,
                 revision=workspace.current_revision,
                 format="idb",
             ),
-            _context(),
         )
         assert isinstance(started, WorkspaceExportOutput)
-        completed = await application.call_tool(
+        completed = await application.execute_tool(
             "operation.wait",
             OperationWaitInput(operation_id=started.operation_id, wait_ms=1_000),
-            _context(),
         )
         assert isinstance(completed, OperationWaitOutput)
         assert completed.state == "succeeded"
@@ -941,10 +1007,9 @@ def test_workspace_list_restores_failed_initialization_state_after_restart(
             cursors=CursorCodec(paths.data_root / "cursor.key"),
             backend=_FakeIdaBackend(workspace.sample_sha256),
         )
-        result = await application.call_tool(
+        result = await application.execute_tool(
             "workspace.list",
             WorkspaceListInput(),
-            _context(),
         )
         assert isinstance(result, WorkspaceListOutput)
         assert len(result.workspaces) == 1
@@ -977,7 +1042,7 @@ def test_worker_failures_use_stable_public_business_codes(
         )
         assert workspace.current_revision is not None
         with pytest.raises(ToolExecutionError) as raised:
-            await application.call_tool(
+            await application.execute_tool(
                 "program.search",
                 ProgramSearchInput(
                     workspace_id=workspace.workspace_id,
@@ -985,53 +1050,8 @@ def test_worker_failures_use_stable_public_business_codes(
                     domains=["name"],
                     text_query="match",
                 ),
-                _context(),
             )
         assert raised.value.code is expected_code
-        await application.aclose()
-
-    asyncio.run(scenario())
-
-
-def test_unexpected_application_exception_is_sanitized_as_jsonrpc_internal_error(
-    tmp_path: Path,
-) -> None:
-    async def scenario() -> None:
-        application, workspace, _sample_bytes, _backend = _application(
-            tmp_path,
-            analysis_runtime_error=True,
-        )
-        assert workspace.current_revision is not None
-        request = {
-            "jsonrpc": "2.0",
-            "id": "internal-error-test",
-            "method": "tools/call",
-            "params": {
-                "_meta": {
-                    "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
-                    "io.modelcontextprotocol/clientInfo": {
-                        "name": "application-error-test",
-                        "version": "1.0",
-                    },
-                    "io.modelcontextprotocol/clientCapabilities": {},
-                },
-                "name": "program.search",
-                "arguments": {
-                    "workspace_id": workspace.workspace_id,
-                    "revision": workspace.current_revision,
-                    "domains": ["name"],
-                    "text_query": "match",
-                },
-            },
-        }
-        encoded = await application.protocol.handle_line(
-            json.dumps(request, separators=(",", ":")).encode("utf-8")
-        )
-        assert encoded is not None
-        response = json.loads(encoded)
-        assert response["error"] == {"code": -32603, "message": "Internal error"}
-        assert "sensitive" not in encoded.decode("utf-8")
-        assert "RuntimeError" not in encoded.decode("utf-8")
         await application.aclose()
 
     asyncio.run(scenario())
@@ -1051,31 +1071,28 @@ def test_operation_cancel_aborts_refine_and_preserves_current_revision(
             workspace.workspace_id,
             base_revision,
         )
-        started = await application.call_tool(
+        started = await application.execute_tool(
             "analysis.refine",
             AnalysisRefineInput(
                 workspace_id=workspace.workspace_id,
                 revision=base_revision,
                 actions=["autoanalysis"],
             ),
-            _context(),
         )
         assert isinstance(started, AnalysisRefineOutput)
         assert await asyncio.to_thread(backend.refine_started.wait, 1)
 
-        requested = await application.call_tool(
+        requested = await application.execute_tool(
             "operation.cancel",
             OperationCancelInput(operation_id=started.operation_id),
-            _context(),
         )
         assert isinstance(requested, OperationCancelOutput)
         assert requested.state == "cancel_requested"
         assert requested.cancellation_requested
 
-        completed = await application.call_tool(
+        completed = await application.execute_tool(
             "operation.wait",
             OperationWaitInput(operation_id=started.operation_id, wait_ms=1_000),
-            _context(),
         )
         assert isinstance(completed, OperationWaitOutput)
         assert completed.state == "cancelled"
@@ -1087,6 +1104,41 @@ def test_operation_cancel_aborts_refine_and_preserves_current_revision(
             application.storage.paths.workspace_root / workspace.workspace_id / ".staging"
         )
         assert not tuple(staging_root.iterdir())
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_operation_waits_do_not_exhaust_thread_pool(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, _workspace, _sample_bytes, _backend = _application(tmp_path)
+        operation = application.storage.operations.create("wait_probe")
+        application.storage.operations.start(operation.operation_id)
+        waiters = [
+            asyncio.create_task(
+                application.execute_tool(
+                    "operation.wait",
+                    OperationWaitInput(
+                        operation_id=operation.operation_id,
+                        wait_ms=30_000,
+                    ),
+                )
+            )
+            for _index in range(64)
+        ]
+        await asyncio.sleep(0.2)
+        for waiter in waiters:
+            waiter.cancel()
+        results = await asyncio.gather(*waiters, return_exceptions=True)
+
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        assert (
+            await asyncio.wait_for(
+                asyncio.to_thread(lambda: "thread-pool-responsive"),
+                timeout=1,
+            )
+            == "thread-pool-responsive"
+        )
         await application.aclose()
 
     asyncio.run(scenario())
@@ -1122,39 +1174,35 @@ def test_operation_cancel_during_publish_waits_for_commit_and_reports_success(
             blocked_publish,
         )
         try:
-            started = await application.call_tool(
+            started = await application.execute_tool(
                 "analysis.refine",
                 AnalysisRefineInput(
                     workspace_id=workspace.workspace_id,
                     revision=base_revision,
                     actions=["autoanalysis"],
                 ),
-                _context(),
             )
             assert isinstance(started, AnalysisRefineOutput)
             assert await asyncio.to_thread(publish_entered.wait, 2)
 
-            requested = await application.call_tool(
+            requested = await application.execute_tool(
                 "operation.cancel",
                 OperationCancelInput(operation_id=started.operation_id),
-                _context(),
             )
             assert isinstance(requested, OperationCancelOutput)
             assert requested.state == "cancel_requested"
 
-            still_running = await application.call_tool(
+            still_running = await application.execute_tool(
                 "operation.wait",
                 OperationWaitInput(operation_id=started.operation_id, wait_ms=0),
-                _context(),
             )
             assert isinstance(still_running, OperationWaitOutput)
             assert still_running.state == "cancel_requested"
 
             allow_publish.set()
-            completed = await application.call_tool(
+            completed = await application.execute_tool(
                 "operation.wait",
                 OperationWaitInput(operation_id=started.operation_id, wait_ms=1_000),
-                _context(),
             )
             assert isinstance(completed, OperationWaitOutput)
             assert completed.state == "succeeded"

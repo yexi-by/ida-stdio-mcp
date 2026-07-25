@@ -48,7 +48,7 @@ class MetadataBinding(StrictModel):
 
 class ManifestRecord(StrictModel):
     kind: Literal["manifest"]
-    schema_version: Literal["2026-07-28"] = Field(alias="schema")
+    schema_version: Literal["1"] = Field(alias="schema")
     media_type: Literal["application/vnd.ida-re.il2cpp-bundle+ndjson"]
     native: NativeBinding
     metadata: MetadataBinding

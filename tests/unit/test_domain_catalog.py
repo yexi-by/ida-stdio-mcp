@@ -4,6 +4,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import cast
 
+from ida_re_mcp.domain.base import tool_json_schema
 from ida_re_mcp.domain.catalog import TOOL_CATALOG, build_tool_catalog
 
 EXPECTED_CORE_TOOLS = {
@@ -71,9 +72,8 @@ def test_authoring_and_debug_facets_are_startup_catalog_switches() -> None:
 
 def test_all_tool_schemas_are_closed_json_schema_2020_12() -> None:
     for spec in build_tool_catalog(enable_expert=True):
-        definition = spec.as_wire_definition()
-        for schema_name in ("inputSchema", "outputSchema"):
-            schema = definition[schema_name]
+        for model_type in (spec.input_model, spec.output_model):
+            schema = tool_json_schema(model_type)
             assert isinstance(schema, dict)
             assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
             assert schema["type"] == "object"

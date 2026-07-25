@@ -6,6 +6,8 @@ import pytest
 
 import ida_re_mcp.config as config_module
 from ida_re_mcp.config import (
+    DATA_ROOT_ENV,
+    LOG_ROOT_ENV,
     AppConfig,
     ConfigError,
     RuntimePathError,
@@ -28,11 +30,11 @@ def test_default_policy_is_constrained_autonomy() -> None:
     assert config.storage.quota_gib == 20
 
 
-def test_load_current_toml_schema(tmp_path: Path) -> None:
+def test_load_toml_schema(tmp_path: Path) -> None:
     path = tmp_path / "config.toml"
     path.write_text(
         """
-schema_version = "2026-07-28"
+schema_version = "1"
 
 [policy]
 authoring = true
@@ -59,7 +61,7 @@ retained_revisions = 5
     assert config.storage.quota_gib == 40
 
 
-def test_shipped_example_is_valid_current_config() -> None:
+def test_shipped_example_is_valid_config() -> None:
     project_root = Path(__file__).resolve().parents[2]
 
     config = load_config(project_root / "config.example.toml")
@@ -70,12 +72,12 @@ def test_shipped_example_is_valid_current_config() -> None:
 @pytest.mark.parametrize(
     "content",
     [
-        'schema_version = "2026-07-28"\nunknown = true\n',
-        'schema_version = "2026-07-28"\n[workers]\nanalysis_limit = "1"\n',
+        'schema_version = "1"\nunknown = true\n',
+        'schema_version = "1"\n[workers]\nanalysis_limit = "1"\n',
         "[policy]\nauthoring = true\n",
     ],
 )
-def test_config_rejects_everything_outside_current_schema(
+def test_config_rejects_everything_outside_schema(
     tmp_path: Path,
     content: str,
 ) -> None:
@@ -116,6 +118,30 @@ def test_runtime_paths_reject_working_tree(
         RuntimePaths.discover(working_tree=tmp_path)
 
 
+def test_runtime_paths_reject_working_tree_ancestor(tmp_path: Path) -> None:
+    working_tree = tmp_path / "repository"
+
+    with pytest.raises(RuntimePathError, match="包含关系"):
+        RuntimePaths.discover(
+            working_tree=working_tree,
+            environment={
+                DATA_ROOT_ENV: str(tmp_path),
+                LOG_ROOT_ENV: str(tmp_path / "logs"),
+            },
+        )
+
+
+def test_runtime_paths_reject_filesystem_anchor(tmp_path: Path) -> None:
+    with pytest.raises(RuntimePathError, match="根目录"):
+        RuntimePaths.discover(
+            working_tree=tmp_path / "repository",
+            environment={
+                DATA_ROOT_ENV: tmp_path.anchor,
+                LOG_ROOT_ENV: str(tmp_path / "logs"),
+            },
+        )
+
+
 def test_runtime_paths_create_only_declared_directories(tmp_path: Path) -> None:
     paths = RuntimePaths(
         data_root=tmp_path / "data",
@@ -138,6 +164,44 @@ def test_runtime_paths_create_only_declared_directories(tmp_path: Path) -> None:
             paths.temp_root,
         )
     )
+
+
+def test_runtime_paths_accept_explicit_host_roots(tmp_path: Path) -> None:
+    working_tree = tmp_path / "repository"
+    data_root = tmp_path / "hosts" / "codex"
+    log_root = tmp_path / "logs" / "codex"
+
+    paths = RuntimePaths.discover(
+        working_tree=working_tree,
+        environment={
+            DATA_ROOT_ENV: str(data_root),
+            LOG_ROOT_ENV: str(log_root),
+        },
+    )
+
+    assert paths.data_root == data_root.resolve()
+    assert paths.log_root == log_root.resolve()
+    assert paths.workspace_root == data_root.resolve() / "workspaces"
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        (DATA_ROOT_ENV, ""),
+        (DATA_ROOT_ENV, "relative/data"),
+        (LOG_ROOT_ENV, "relative/logs"),
+    ],
+)
+def test_runtime_path_overrides_must_be_absolute(
+    tmp_path: Path,
+    name: str,
+    value: str,
+) -> None:
+    with pytest.raises(RuntimePathError):
+        RuntimePaths.discover(
+            working_tree=tmp_path / "repository",
+            environment={name: value},
+        )
 
 
 def test_supervisor_storage_opens_with_soft_quota(tmp_path: Path) -> None:

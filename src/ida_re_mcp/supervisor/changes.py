@@ -21,7 +21,7 @@ from pydantic import (
     model_validator,
 )
 
-from ida_re_mcp.constants import MAX_IL2CPP_TYPE_RESOLUTIONS, PROTOCOL_VERSION
+from ida_re_mcp.constants import MAX_IL2CPP_TYPE_RESOLUTIONS, STORAGE_SCHEMA_VERSION
 from ida_re_mcp.domain.address import RevisionAddress
 from ida_re_mcp.domain.tools import ByteHex, CanonicalTypeRef, Sha256
 from ida_re_mcp.il2cpp.models import NativeBinding
@@ -221,7 +221,7 @@ class _PlanInput(_StrictModel):
 
 
 class _ChangeSetFile(_StrictModel):
-    schema_version: Literal["2026-07-28"]
+    schema_version: Literal["1"]
     change_set_id: str
     workspace_id: str
     base_revision: str
@@ -322,7 +322,7 @@ class ChangeSetStore:
         digest = _plan_digest(plan)
         change_set_id = f"cset_{digest}"
         model = _ChangeSetFile(
-            schema_version=PROTOCOL_VERSION,
+            schema_version=STORAGE_SCHEMA_VERSION,
             change_set_id=change_set_id,
             workspace_id=plan.workspace_id,
             base_revision=plan.base_revision,
@@ -731,7 +731,7 @@ def _plan_digest(plan: _PlanInput) -> str:
             operation.model_dump(mode="json", exclude_none=False) for operation in plan.operations
         ],
         "preimage": plan.preimage.model_dump(mode="json", exclude_none=False),
-        "schema_version": PROTOCOL_VERSION,
+        "schema_version": STORAGE_SCHEMA_VERSION,
         "workspace_id": plan.workspace_id,
     }
     return sha256_bytes(canonical_json_bytes(cast(dict[str, object], material)))

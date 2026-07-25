@@ -40,8 +40,6 @@ class ResourcePage(StrictModel):
 
     resources: list[ResourceDescriptor] = Field(max_length=200)
     next_cursor: Cursor | None = None
-    ttl_ms: int = Field(default=0, ge=0, le=3_600_000)
-    cache_scope: Literal["private", "public"] = "private"
 
 
 class TextResourceData(StrictModel):
@@ -89,5 +87,3 @@ class ResourceRead(StrictModel):
     """Supervisor 返回给协议层的资源读取结果。"""
 
     contents: list[ResourceData] = Field(min_length=1, max_length=64)
-    ttl_ms: int = Field(default=0, ge=0, le=3_600_000)
-    cache_scope: Literal["private", "public"] = "private"

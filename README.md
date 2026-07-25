@@ -2,33 +2,21 @@
 
 `ida-re-mcp` 是面向 AI Agent 的 IDA Pro 9.3+ headless stdio MCP 服务。它以显式
 workspace、不可变 revision 和进程隔离 worker 为基础，提供 Native 静态逆向、
-Unity IL2CPP 原生类型/符号注解、事务化 IDB 写回，以及 Windows 本机 x64 动态调试。
+Unity IL2CPP 原生注解、事务化 IDB 写回，以及 Windows 本机 x64 动态调试。
 
-当前版本为 `1.0.0.dev0`，用于开发和验收，不用于生产发布。`1.0.0` 必须同时满足：
-
-- MCP `2026-07-28` 正式规范已经发布并完成差异审计；
-- Python MCP SDK `2.0.0` 稳定版已经锁定；
-- current-only stdio、wheel 安装、IDA 静态分析与 Windows x64 debugger 的全部硬门禁通过。
-
-开发版本精确锁定 MCP SDK v2 beta 的类型，但不使用会协商多个协议版本的默认 runner。
-服务只广告 tools 与不可变 resources；长操作通过显式 operation 句柄管理。
+当前版本为 `1.0.0.dev0`。服务使用官方 Python MCP SDK 的标准生命周期与 stdio
+transport，工具目录在启动时固定，只广告 tools 与不可变 resources。项目不实现自有
+协议协商、JSON-RPC parser、Tasks、prompts、sampling、completions 或交互式审批。
 
 ## 环境要求
 
-- Python `3.13`，不支持其他 Python 次版本；
+- Python `3.13`；
 - `uv`；
 - IDA Pro `9.3+` 及对应许可证；
-- LLVM/LLD `22.1.8`，仅在重建测试 fixture 时需要；
-- Windows x64，动态调试验收的唯一目标平台。
+- Windows x64，用于动态调试；
+- LLVM/LLD `22.1.8`，仅在重建测试 fixture 时需要。
 
-Supervisor 与 IDA worker 位于独立进程，只通过本地鉴权 JSON IPC 通信。IDA API 只在
-worker 的 owner 线程调用。同一个 data root 同时只允许一个 Supervisor owner；
-`serve`、`doctor` 与 `gc` 获取同一 owner lease，不能并行运行。单个 Supervisor 内仍按
-worker 上限并行处理不同 workspace，同一 workspace 始终串行。
-
-## 开发环境
-
-虚拟环境和运行数据必须位于 Git 工作树外：
+开发虚拟环境与运行数据必须位于 Git 工作树外：
 
 ```powershell
 $env:UV_PROJECT_ENVIRONMENT = "$env:LOCALAPPDATA\ida-re-mcp\dev-venv"
@@ -36,8 +24,8 @@ uv python install 3.13
 uv sync --locked
 ```
 
-IDA 安装目录由 `idapro` 的运行环境解析。开发机可按 IDA 安装要求设置 `IDADIR`，然后先
-执行诊断：
+IDA 安装目录由 `idapro` 运行环境解析。开发机可按 IDA 安装要求设置 `IDADIR`，然后
+执行：
 
 ```powershell
 ida-re-mcp doctor
@@ -54,41 +42,42 @@ ida-re-mcp gc --apply
 ```
 
 配置使用严格 TOML schema，示例见
-[config.example.toml](config.example.toml)。默认数据、日志、checkout、artifact 和临时
-文件都写入当前用户的平台应用数据目录。`workspace.create` 会复制样本并校验 SHA-256，
-任何 IDB 写入都只发布为新的 revision。运行 `doctor` 或 `gc` 前必须先停止占用同一
-data root 的 `serve`；`gc --dry-run` 只报告候选，`gc --apply` 才回收未保留 revision、
-孤立 artifact/change set/staging 与过期 operation，且不会删除 current 或 pinned
-revision。
+[config.example.toml](config.example.toml)。workspace、日志、artifact、checkout、
+staging、临时文件和虚拟环境都位于工作树外。
 
-## MCP 工作流
+同一个 data root 同时只能由一个 Supervisor 占用。多个 MCP host 若需同时启用，必须
+使用 `IDA_RE_MCP_DATA_ROOT` 指定互不重叠的绝对路径；可用
+`IDA_RE_MCP_LOG_ROOT` 单独指定日志目录。否则第二个进程会在读取或修改运行状态前失败。
+两个 override 都不得指向文件系统根目录，也不得位于工作树内或包含工作树。
 
-1. 调用 `workspace.create`，再用 `operation.wait` 等待首次分析发布 revision。
-2. 使用显式 `workspace_id` 与 `revision` 调用静态查询。
-3. `program.search` 的文本域是 `function`、`name`、`string`，显式空
-   `text_query=""` 表示确定性枚举；`bytes` 域只使用独立的 `bytes_query`。
+## Agent 工作流
+
+1. 调用 `workspace.create`，保存 `workspace_id` 与 `analysis_operation_id`。
+2. 用 `operation.wait` 等待首次分析，取得不可变 revision。
+3. 使用显式 `workspace_id` 与 `revision` 调用静态查询。
 4. 检查结果中的 `coverage` 与 `provenance`，不要把分析缺口推断为确定事实。
 5. 通过 `change.prepare` 与 `change.apply` 执行事务化写回。
-6. `report.build` 生成 Markdown/JSON 报告；`workspace.export` 当前只导出 IDB。
-7. 动态调试时保存 `debug_session_id`，并只在当前 suspended `stop_id` 上读取快照。
-   `debug.establish`、控制动作与 `debug.finish` 返回完成类型、证据来源和已观察事件
-   sequence，调用方应据此关联 `debug.events`。
-8. 大结果返回 chunk index artifact；按索引中的 `ida-re://...` URI 逐块读取，每个
-   resource chunk 最大 1 MiB。
+6. 用 `report.build` 或 `workspace.export` 生成不可变 artifact，并通过
+   `ida-re://...` resource URI 读取。
+7. 动态调试时保存 `debug_session_id`，只在当前 suspended `stop_id` 上读取寄存器、
+   线程、栈和内存。
 
-完整工具边界和验收状态见 [能力矩阵](docs/能力矩阵.md)，进程与 revision 设计见
-[架构](docs/架构.md)，可复现门禁见 [验证记录](docs/验证记录.md)。
+`program.search` 的文本域为 `function`、`name`、`string`；显式空
+`text_query=""` 表示确定性枚举。`bytes` 域使用独立的 `bytes_query`。
 
-## 安全边界
+## 安全与一致性
 
-动态调试会执行目标程序。Job Object 只负责回收服务启动的进程树，不提供文件、注册表、
-网络或系统调用隔离。不要在未隔离的主机上运行不可信样本。
+- 原始样本只读，`workspace.create` 会复制并校验 SHA-256。
+- AnalysisWorker 与 DebugWorker 使用私有 checkout，关闭时不保存。
+- 所有 IDB 写入都在 staging 中完成，经过回读、冷验证和 CAS 后发布为新 revision。
+- mutation 失败、取消或 worker 崩溃不得改变旧 revision、HEAD 或样本摘要。
+- 调试会执行目标程序；Job Object 负责回收服务启动的进程树，但不是恶意样本沙箱。
+- `expert.execute` 默认不注册。启用后仍是可访问文件、网络和子进程的开放世界
+  IDAPython。
 
-`expert.execute` 默认不注册。操作者启用后，它会在 disposable staging worker 中执行
-inline IDAPython，并把写入发布为新 revision；这是开放世界能力，服务不能阻止 Python
-访问文件、网络或启动子进程。
+项目不提供进程内存写入、远程调试、普通 .NET/Mono workspace、通用调用捕获或外部
+分析器执行链。
 
-截至 2026-07-25，验收环境中的 MCP Inspector `0.21.2` 发送的协议版本不是
-`2026-07-28`，严格入口会以 `-32602` 拒绝。项目不会为 Inspector 增加其他协议分支；
-能够使用正式 current 协议的 Inspector、正式规范和稳定 Python SDK 都是 `1.0.0`
-发布前的外部门禁。
+完整边界见 [架构](docs/架构.md)，能力状态见
+[能力矩阵](docs/能力矩阵.md)，可复现门禁见
+[验证记录](docs/验证记录.md)。

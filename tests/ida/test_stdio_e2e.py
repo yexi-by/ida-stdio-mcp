@@ -4,16 +4,17 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
-import os
 import shutil
 import sys
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 from typing import cast
 
 import pytest
-
-from ida_re_mcp.constants import PROTOCOL_VERSION
+from mcp import ClientSession, StdioServerParameters, types
+from mcp.client.stdio import stdio_client
 
 JsonObject = dict[str, object]
 
@@ -39,72 +40,73 @@ def _environment(base: dict[str, str], runtime: Path) -> dict[str, str]:
     return environment
 
 
-def _meta() -> JsonObject:
-    return {
-        "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
-        "io.modelcontextprotocol/clientInfo": {
-            "name": "ida-re-mcp-full-chain-e2e",
-            "version": "1.0",
-        },
-        "io.modelcontextprotocol/clientCapabilities": {},
-    }
+@asynccontextmanager
+async def _official_session(
+    *,
+    environment: dict[str, str],
+    stderr_path: Path,
+) -> AsyncGenerator[ClientSession]:
+    parameters = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "ida_re_mcp", "serve"],
+        env=environment,
+        cwd=Path(__file__).resolve().parents[2],
+    )
+    stderr_path.parent.mkdir(parents=True, exist_ok=True)
+    with stderr_path.open("w+", encoding="utf-8") as error_log:
+        try:
+            async with stdio_client(parameters, errlog=error_log) as streams:
+                async with ClientSession(
+                    *streams,
+                    read_timeout_seconds=timedelta(seconds=180),
+                    client_info=types.Implementation(
+                        name="ida-re-mcp-ida-e2e",
+                        version="1",
+                    ),
+                ) as client:
+                    initialized = await client.initialize()
+                    assert initialized.serverInfo.name == "ida-re-mcp"
+                    assert initialized.capabilities.tools is not None
+                    assert initialized.capabilities.resources is not None
+                    yield client
+        finally:
+            error_log.flush()
+            error_log.seek(0)
+            stderr = error_log.read()
+            assert stderr == "", stderr
 
 
 async def _call_tool(
-    process: asyncio.subprocess.Process,
+    client: ClientSession,
     *,
-    request_id: int,
     name: str,
     arguments: JsonObject,
     timeout: float = 180,
 ) -> JsonObject:
-    assert process.stdin is not None
-    assert process.stdout is not None
-    request = {
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "tools/call",
-        "params": {
-            "_meta": _meta(),
-            "name": name,
-            "arguments": arguments,
-        },
-    }
-    process.stdin.write(
-        json.dumps(request, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
+    result = await client.call_tool(
+        name,
+        arguments,
+        read_timeout_seconds=timedelta(seconds=timeout),
     )
-    await process.stdin.drain()
-    raw = await asyncio.wait_for(process.stdout.readline(), timeout=timeout)
-    if not raw:
-        stderr = (
-            await process.stderr.read() if process.stderr is not None else b"stderr unavailable"
-        )
-        pytest.fail(f"stdio 服务提前退出: {stderr.decode(errors='replace')}")
-    response = cast(JsonObject, json.loads(raw))
-    assert response.get("id") == request_id
-    assert "error" not in response, response
-    result = cast(JsonObject, response["result"])
-    assert result.get("isError") is False, result
-    return cast(JsonObject, result["structuredContent"])
+    assert result.isError is False, result
+    assert result.structuredContent is not None, result
+    return cast(JsonObject, result.structuredContent)
 
 
 async def _wait_operation(
-    process: asyncio.subprocess.Process,
+    client: ClientSession,
     *,
-    request_id: int,
     operation_id: str,
-) -> tuple[int, JsonObject]:
+) -> JsonObject:
     while True:
         output = await _call_tool(
-            process,
-            request_id=request_id,
+            client,
             name="operation.wait",
             arguments={"operation_id": operation_id, "wait_ms": 30_000},
         )
-        request_id += 1
         state = output["state"]
         if state == "succeeded":
-            return request_id, cast(JsonObject, output["result"])
+            return cast(JsonObject, output["result"])
         if state in {"failed", "cancelled"}:
             pytest.fail(f"长操作未成功: {output}")
 
@@ -120,38 +122,25 @@ def test_real_stdio_static_and_transaction_chain(
         sample = tmp_path / "native_pe_x64.dll"
         shutil.copyfile(fixture_directory / sample.name, sample)
         runtime = tmp_path / "runtime"
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "ida_re_mcp",
-            "serve",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_environment(ida_environment, runtime),
-            creationflags=subprocess_creation_flags(),
-        )
-        request_id = 1
-        try:
+        async with _official_session(
+            environment=_environment(ida_environment, runtime),
+            stderr_path=tmp_path / "static-stdio-stderr.log",
+        ) as client:
             created = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="workspace.create",
                 arguments={"sample_path": str(sample)},
             )
-            request_id += 1
             workspace_id = cast(str, created["workspace_id"])
             operation_id = cast(str, created["analysis_operation_id"])
-            request_id, initialized = await _wait_operation(
-                process,
-                request_id=request_id,
+            initialized = await _wait_operation(
+                client,
                 operation_id=operation_id,
             )
             revision = cast(str, initialized["revision"])
 
             searched = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="program.search",
                 arguments={
                     "workspace_id": workspace_id,
@@ -161,15 +150,13 @@ def test_real_stdio_static_and_transaction_chain(
                     "page_size": 50,
                 },
             )
-            request_id += 1
             matches = cast(list[JsonObject], searched["matches"])
             assert matches
             target = cast(JsonObject, matches[0]["address"])
             assert target["kind"] == "database"
 
             prepared = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="change.prepare",
                 arguments={
                     "workspace_id": workspace_id,
@@ -183,10 +170,8 @@ def test_real_stdio_static_and_transaction_chain(
                     ],
                 },
             )
-            request_id += 1
             applied = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="change.apply",
                 arguments={
                     "workspace_id": workspace_id,
@@ -195,13 +180,11 @@ def test_real_stdio_static_and_transaction_chain(
                     "digest": prepared["digest"],
                 },
             )
-            request_id += 1
             next_revision = cast(str, applied["revision"])
             assert next_revision != revision
 
             verified = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="program.search",
                 arguments={
                     "workspace_id": workspace_id,
@@ -215,19 +198,6 @@ def test_real_stdio_static_and_transaction_chain(
                 "agent_verified_entry" in cast(str, item["preview"])
                 for item in cast(list[JsonObject], verified["matches"])
             )
-        finally:
-            if process.stdin is not None:
-                process.stdin.close()
-                await process.stdin.wait_closed()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=30)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
-                pytest.fail("stdio 服务未在 stdin EOF 后退出")
-            stderr = await process.stderr.read() if process.stderr is not None else b""
-            assert process.returncode == 0, stderr.decode(errors="replace")
-            assert stderr == b""
         assert _tree_identity(fixture_directory) == fixture_before
 
     asyncio.run(scenario())
@@ -244,37 +214,24 @@ def test_real_stdio_debug_chain(
         fixture_before = _tree_identity(fixture_directory)
         sample = tmp_path / "debug_target_x64.exe"
         shutil.copyfile(fixture_directory / sample.name, sample)
-        process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "ida_re_mcp",
-            "serve",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_environment(ida_environment, tmp_path / "runtime"),
-            creationflags=subprocess_creation_flags(),
-        )
-        request_id = 1
-        try:
+        async with _official_session(
+            environment=_environment(ida_environment, tmp_path / "runtime"),
+            stderr_path=tmp_path / "debug-stdio-stderr.log",
+        ) as client:
             created = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="workspace.create",
                 arguments={"sample_path": str(sample)},
             )
-            request_id += 1
             workspace_id = cast(str, created["workspace_id"])
             sample_sha256 = cast(str, created["sample_sha256"])
-            request_id, initialized = await _wait_operation(
-                process,
-                request_id=request_id,
+            initialized = await _wait_operation(
+                client,
                 operation_id=cast(str, created["analysis_operation_id"]),
             )
             revision = cast(str, initialized["revision"])
             established = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="debug.establish",
                 arguments={
                     "workspace_id": workspace_id,
@@ -287,14 +244,12 @@ def test_real_stdio_debug_chain(
                     "timeout_ms": 30_000,
                 },
             )
-            request_id += 1
             session_id = cast(str, established["debug_session_id"])
             stop_id = cast(str, established["stop_id"])
             assert established["state"] == "suspended"
 
             initial_events = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="debug.events",
                 arguments={
                     "debug_session_id": session_id,
@@ -303,11 +258,9 @@ def test_real_stdio_debug_chain(
                     "limit": 200,
                 },
             )
-            request_id += 1
             cursor = cast(int, initial_events["last_sequence"])
             breakpoint_result = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="debug.breakpoints",
                 arguments={
                     "debug_session_id": session_id,
@@ -324,14 +277,12 @@ def test_real_stdio_debug_chain(
                     ],
                 },
             )
-            request_id += 1
             breakpoints = cast(list[JsonObject], breakpoint_result["breakpoints"])
             assert len(breakpoints) == 1
             assert breakpoints[0]["state"] == "active"
 
             controlled = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="debug.control",
                 arguments={
                     "debug_session_id": session_id,
@@ -340,13 +291,11 @@ def test_real_stdio_debug_chain(
                     "timeout_ms": 30_000,
                 },
             )
-            request_id += 1
             cursor = max(cursor, cast(int, controlled["observed_event_sequence"]))
             hit_stop_id: str | None = None
             for _attempt in range(6):
                 events_output = await _call_tool(
-                    process,
-                    request_id=request_id,
+                    client,
                     name="debug.events",
                     arguments={
                         "debug_session_id": session_id,
@@ -355,7 +304,6 @@ def test_real_stdio_debug_chain(
                         "limit": 200,
                     },
                 )
-                request_id += 1
                 events = cast(list[JsonObject], events_output["events"])
                 for event in events:
                     if event["kind"] == "breakpoint":
@@ -367,8 +315,7 @@ def test_real_stdio_debug_chain(
             assert hit_stop_id is not None
 
             threads_snapshot = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="debug.inspect",
                 arguments={
                     "debug_session_id": session_id,
@@ -376,12 +323,10 @@ def test_real_stdio_debug_chain(
                     "views": ["threads"],
                 },
             )
-            request_id += 1
             assert threads_snapshot["state"] == "suspended"
             assert cast(list[object], threads_snapshot["threads"])
             register_snapshot = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="debug.inspect",
                 arguments={
                     "debug_session_id": session_id,
@@ -389,15 +334,13 @@ def test_real_stdio_debug_chain(
                     "views": ["registers"],
                 },
             )
-            request_id += 1
             register_names = {
                 cast(str, register["name"])
                 for register in cast(list[JsonObject], register_snapshot["registers"])
             }
             assert {"RIP", "RSP"}.issubset(register_names)
             stack_snapshot = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="debug.inspect",
                 arguments={
                     "debug_session_id": session_id,
@@ -405,12 +348,10 @@ def test_real_stdio_debug_chain(
                     "views": ["stack"],
                 },
             )
-            request_id += 1
             assert cast(list[object], stack_snapshot["stack"])
 
             finished = await _call_tool(
-                process,
-                request_id=request_id,
+                client,
                 name="debug.finish",
                 arguments={
                     "debug_session_id": session_id,
@@ -419,25 +360,6 @@ def test_real_stdio_debug_chain(
                 },
             )
             assert finished["state"] == "exited"
-        finally:
-            if process.stdin is not None:
-                process.stdin.close()
-                await process.stdin.wait_closed()
-            try:
-                await asyncio.wait_for(process.wait(), timeout=30)
-            except TimeoutError:
-                process.kill()
-                await process.wait()
-                pytest.fail("debug stdio 服务未在 stdin EOF 后退出")
-            stderr = await process.stderr.read() if process.stderr is not None else b""
-            assert process.returncode == 0, stderr.decode(errors="replace")
-            assert stderr == b""
         assert _tree_identity(fixture_directory) == fixture_before
 
     asyncio.run(scenario())
-
-
-def subprocess_creation_flags() -> int:
-    if os.name == "nt":
-        return 0x08000000  # CREATE_NO_WINDOW
-    return 0

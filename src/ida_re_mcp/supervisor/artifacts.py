@@ -18,7 +18,11 @@ from urllib.parse import quote, unquote, urlsplit
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
-from ida_re_mcp.constants import PROTOCOL_VERSION, RESOURCE_CHUNK_BYTES
+from ida_re_mcp.constants import (
+    CHUNKED_ARTIFACT_SCHEMA_VERSION,
+    RESOURCE_CHUNK_BYTES,
+    STORAGE_SCHEMA_VERSION,
+)
 from ida_re_mcp.supervisor._fs import (
     atomic_write_json,
     canonical_json_bytes,
@@ -106,7 +110,7 @@ class ArtifactGarbageCollectionResult:
 class _ArtifactManifest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["2026-07-28"]
+    schema_version: Literal["1"]
     workspace_id: str
     revision: str
     artifact_id: str
@@ -358,7 +362,7 @@ class ArtifactStore:
                 content_sha256 = digest.hexdigest()
                 index_payload = canonical_json_bytes(
                     {
-                        "schema_version": PROTOCOL_VERSION,
+                        "schema_version": CHUNKED_ARTIFACT_SCHEMA_VERSION,
                         "kind": "chunked_artifact",
                         "content": {
                             "media_type": media_type,
@@ -929,7 +933,7 @@ def _artifact_id(
 
 def _manifest_dict(metadata: ArtifactMetadata) -> dict[str, object]:
     return {
-        "schema_version": PROTOCOL_VERSION,
+        "schema_version": STORAGE_SCHEMA_VERSION,
         "workspace_id": metadata.workspace_id,
         "revision": metadata.revision,
         "artifact_id": metadata.artifact_id,

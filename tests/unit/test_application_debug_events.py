@@ -11,7 +11,7 @@ from pydantic import JsonValue
 
 from ida_re_mcp.application import Application
 from ida_re_mcp.config import AppConfig, RuntimePaths
-from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES, PROTOCOL_VERSION
+from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES
 from ida_re_mcp.domain.address import ImageAddress
 from ida_re_mcp.domain.base import JsonObject
 from ida_re_mcp.domain.tools import (
@@ -26,8 +26,6 @@ from ida_re_mcp.domain.tools import (
     DebugEventsOutput,
     DebugLaunchTarget,
 )
-from ida_re_mcp.protocol.handlers import RequestContext
-from ida_re_mcp.protocol.models import ClientCapabilities
 from ida_re_mcp.supervisor.artifacts import parse_artifact_uri
 from ida_re_mcp.supervisor.backend import AnalysisBackend, DebugBackend
 from ida_re_mcp.supervisor.changes import ChangeSetStore
@@ -223,43 +221,7 @@ def _paths(tmp_path: Path) -> RuntimePaths:
     )
 
 
-def _context(request_id: str) -> RequestContext:
-    return RequestContext(
-        protocol_version=PROTOCOL_VERSION,
-        client_info=None,
-        client_capabilities=ClientCapabilities(),
-        request_id=request_id,
-    )
-
-
-def _protocol_request(arguments: JsonObject) -> bytes:
-    return (
-        json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "id": "debug-events-wire",
-                "method": "tools/call",
-                "params": {
-                    "_meta": {
-                        "io.modelcontextprotocol/protocolVersion": PROTOCOL_VERSION,
-                        "io.modelcontextprotocol/clientCapabilities": {},
-                        "io.modelcontextprotocol/clientInfo": {
-                            "name": "debug-events-test",
-                            "version": "1.0.0",
-                        },
-                    },
-                    "name": "debug.events",
-                    "arguments": arguments,
-                },
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8")
-        + b"\n"
-    )
-
-
-def test_application_pages_all_debug_events_within_protocol_budget(tmp_path: Path) -> None:
+def test_application_pages_all_debug_events_within_inline_budget(tmp_path: Path) -> None:
     async def scenario() -> None:
         config = AppConfig()
         paths = _paths(tmp_path)
@@ -286,7 +248,7 @@ def test_application_pages_all_debug_events_within_protocol_budget(tmp_path: Pat
             backend=backend,
         )
         try:
-            established = await application.call_tool(
+            established = await application.execute_tool(
                 "debug.establish",
                 DebugEstablishInput(
                     workspace_id=workspace.workspace_id,
@@ -296,37 +258,21 @@ def test_application_pages_all_debug_events_within_protocol_budget(tmp_path: Pat
                         stop_on_entry=True,
                     ),
                 ),
-                _context("establish"),
             )
             assert isinstance(established, DebugEstablishOutput)
             assert established.debug_session_id == _SESSION_ID
             assert established.stop_id == _STOP_ID
 
-            wire_response = await application.protocol.handle_line(
-                _protocol_request(
-                    {
-                        "debug_session_id": _SESSION_ID,
-                        "after_sequence": 0,
-                        "wait_ms": 0,
-                        "limit": 200,
-                    }
-                )
-            )
-            assert wire_response is not None
-            decoded = cast(JsonObject, json.loads(wire_response))
-            assert "error" not in decoded
-
             cursor = 0
             collected: list[int] = []
             while cursor < 206:
-                output = await application.call_tool(
+                output = await application.execute_tool(
                     "debug.events",
                     DebugEventsInput(
                         debug_session_id=_SESSION_ID,
                         after_sequence=cursor,
                         limit=200,
                     ),
-                    _context(f"events-{cursor}"),
                 )
                 assert isinstance(output, DebugEventsOutput)
                 serialized = json.dumps(
@@ -345,14 +291,13 @@ def test_application_pages_all_debug_events_within_protocol_budget(tmp_path: Pat
             assert collected == list(range(1, 207))
             assert len(collected) == len(set(collected))
 
-            controlled = await application.call_tool(
+            controlled = await application.execute_tool(
                 "debug.control",
                 DebugControlInput(
                     debug_session_id=_SESSION_ID,
                     action="continue",
                     stop_id=_STOP_ID,
                 ),
-                _context("continue"),
             )
             assert isinstance(controlled, DebugControlOutput)
             assert controlled.state == "running"
@@ -396,14 +341,13 @@ def test_application_stores_oversized_breakpoint_result_as_artifact(
             backend=backend,
         )
         try:
-            established = await application.call_tool(
+            established = await application.execute_tool(
                 "debug.establish",
                 DebugEstablishInput(
                     workspace_id=workspace.workspace_id,
                     revision=revision.revision,
                     target=DebugLaunchTarget(kind="launch", stop_on_entry=True),
                 ),
-                _context("establish-breakpoints"),
             )
             assert isinstance(established, DebugEstablishOutput)
             image_id = f"image~{workspace.sample_sha256}"
@@ -436,14 +380,13 @@ def test_application_stores_oversized_breakpoint_result_as_artifact(
                 )
 
             monkeypatch.setattr(application, "_apply_breakpoint_plan", fake_apply)
-            output = await application.call_tool(
+            output = await application.execute_tool(
                 "debug.breakpoints",
                 DebugBreakpointsInput(
                     debug_session_id=_SESSION_ID,
                     stop_id=_STOP_ID,
                     replace=specifications,
                 ),
-                _context("replace-breakpoints"),
             )
             assert isinstance(output, DebugBreakpointsOutput)
             assert output.breakpoints == []

@@ -243,6 +243,7 @@ def test_unknown_fields_and_missing_schema_fail_closed(tmp_path: Path) -> None:
     record_path = prepared.storage_path / "change-set.json"
     hash_path = prepared.storage_path / "change-set.sha256"
     parsed = cast(dict[str, object], json.loads(record_path.read_bytes()))
+    assert parsed["schema_version"] == "1"
     parsed.pop("schema_version")
     parsed["extra"] = "rejected"
     tampered = canonical_json_bytes(parsed)

@@ -5,7 +5,11 @@ from pathlib import Path
 
 import pytest
 
-from ida_re_mcp.constants import RESOURCE_CHUNK_BYTES
+from ida_re_mcp.constants import (
+    CHUNKED_ARTIFACT_SCHEMA_VERSION,
+    RESOURCE_CHUNK_BYTES,
+    STORAGE_SCHEMA_VERSION,
+)
 from ida_re_mcp.supervisor import (
     ArtifactFileInput,
     ArtifactIntegrityError,
@@ -93,7 +97,7 @@ def test_large_file_is_exported_as_reconstructable_immutable_resources(
     )
 
     index = json.loads(store.read_all("ws_one", "rev_one", exported.index.artifact_id))
-    assert index["schema_version"] == "2026-07-28"
+    assert index["schema_version"] == CHUNKED_ARTIFACT_SCHEMA_VERSION
     assert index["kind"] == "chunked_artifact"
     assert index["content"] == {
         "media_type": "application/vnd.hex-rays.idb",
@@ -181,6 +185,7 @@ def test_artifact_manifest_uses_strict_current_schema(tmp_path: Path) -> None:
     )
     manifest_path = root / "ws_one" / "rev_one" / metadata.artifact_id / "artifact.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == STORAGE_SCHEMA_VERSION
     manifest["unexpected"] = True
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 

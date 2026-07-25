@@ -10,20 +10,20 @@ from ida_re_mcp.domain.address import (
     U64Hex,
     address_ref_adapter,
 )
-from ida_re_mcp.domain.base import JsonObject, StrictModel, current_json_schema
+from ida_re_mcp.domain.base import JsonObject, StrictModel, tool_json_schema
 from ida_re_mcp.domain.catalog import (
     AUTHORING_TOOL_SPECS,
     CORE_TOOL_SPECS,
     DEBUG_TOOL_SPECS,
     EXPERT_TOOL_SPEC,
     TOOL_CATALOG,
-    TOOL_CATALOG_BY_NAME,
     ToolSpec,
     build_tool_catalog,
 )
 from ida_re_mcp.domain.common import Coverage, Evidence, Provenance, StaticQuery
 from ida_re_mcp.domain.errors import (
     BusinessErrorCode,
+    ResourceNotFoundError,
     ResourceRequestError,
     ToolExecutionError,
 )
@@ -43,7 +43,6 @@ __all__ = [
     "DEBUG_TOOL_SPECS",
     "EXPERT_TOOL_SPEC",
     "TOOL_CATALOG",
-    "TOOL_CATALOG_BY_NAME",
     "AddressRef",
     "ArtifactUri",
     "BinaryResourceData",
@@ -57,6 +56,7 @@ __all__ = [
     "Provenance",
     "ResourceData",
     "ResourceDescriptor",
+    "ResourceNotFoundError",
     "ResourcePage",
     "ResourceRead",
     "ResourceRequestError",
@@ -70,5 +70,5 @@ __all__ = [
     "U64Hex",
     "address_ref_adapter",
     "build_tool_catalog",
-    "current_json_schema",
+    "tool_json_schema",
 ]

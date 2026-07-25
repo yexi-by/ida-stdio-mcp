@@ -1,9 +1,10 @@
-"""current-only MCP、外部存储与隔离 IDA worker 的应用编排。"""
+"""标准 MCP、外部存储与隔离 IDA worker 的应用编排。"""
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import json
 import shutil
 import tempfile
@@ -21,6 +22,7 @@ from ida_re_mcp.domain.base import JsonObject, StrictModel
 from ida_re_mcp.domain.catalog import build_tool_catalog
 from ida_re_mcp.domain.errors import (
     BusinessErrorCode,
+    ResourceNotFoundError,
     ResourceRequestError,
     ToolExecutionError,
 )
@@ -30,6 +32,7 @@ from ida_re_mcp.domain.resources import (
     ResourceDescriptor,
     ResourcePage,
     ResourceRead,
+    TextResourceData,
 )
 from ida_re_mcp.domain.tools import (
     AddressInspectOutput,
@@ -82,9 +85,7 @@ from ida_re_mcp.domain.tools import (
     WorkspaceSummary,
 )
 from ida_re_mcp.il2cpp.models import NativeBinding
-from ida_re_mcp.protocol import CurrentProtocol
-from ida_re_mcp.protocol.handlers import RequestContext
-from ida_re_mcp.protocol.models import RequestId
+from ida_re_mcp.protocol import McpRuntime
 from ida_re_mcp.supervisor._fs import canonical_json_bytes
 from ida_re_mcp.supervisor._process_lock import (
     AsyncInterprocessFileLock,
@@ -227,6 +228,14 @@ _DEBUG_TOOL_NAMES = frozenset(
 )
 _WORKER_TIMEOUT_SECONDS = 120.0
 _MAX_RESOURCE_CONTENTS = 64
+_OPERATION_WAIT_POLL_SECONDS = 0.05
+_TERMINAL_OPERATION_STATES = frozenset(
+    {
+        OperationState.SUCCEEDED,
+        OperationState.FAILED,
+        OperationState.CANCELLED,
+    }
+)
 _WORKER_BUSINESS_ERRORS: dict[str, BusinessErrorCode] = {
     "ambiguous_reference": BusinessErrorCode.AMBIGUOUS_REFERENCE,
     "capability_unavailable": BusinessErrorCode.CAPABILITY_UNAVAILABLE,
@@ -238,6 +247,23 @@ _WORKER_BUSINESS_ERRORS: dict[str, BusinessErrorCode] = {
     "worker_crashed": BusinessErrorCode.WORKER_CRASHED,
     "worker_timeout": BusinessErrorCode.WORKER_CRASHED,
 }
+
+
+def _is_utf8_resource(media_type: str) -> bool:
+    """判断 artifact 是否应以 MCP 文本 resource 返回。"""
+
+    normalized = media_type.partition(";")[0].strip().lower()
+    return (
+        normalized.startswith("text/")
+        or normalized
+        in {
+            "application/json",
+            "application/javascript",
+            "application/x-ndjson",
+            "application/xml",
+        }
+        or normalized.endswith(("+json", "+ndjson", "+xml"))
+    )
 
 
 @dataclass(slots=True)
@@ -310,7 +336,8 @@ class Application:
             enable_debug=config.policy.debug_launch or config.policy.debug_attach,
             enable_expert=config.policy.expert,
         )
-        self._protocol = CurrentProtocol(self, catalog=catalog)
+        self._catalog_by_name = {spec.name: spec for spec in catalog}
+        self._mcp = McpRuntime(self, catalog=catalog)
         self._operation_tasks: dict[str, asyncio.Task[None]] = {}
         self._cancellable_operations: set[str] = set()
         self._workspace_operations: dict[str, str] = {}
@@ -320,7 +347,6 @@ class Application:
         self._workspace_locks: dict[str, AsyncInterprocessFileLock] = {}
         self._analysis_slots = asyncio.Semaphore(config.workers.analysis_limit)
         self._debug_slots = asyncio.Semaphore(config.workers.debug_limit)
-        self._inflight: dict[RequestId, asyncio.Task[object]] = {}
         self._closed = False
 
     @classmethod
@@ -356,20 +382,18 @@ class Application:
             owner_lease.release()
             raise
 
-    @property
-    def protocol(self) -> CurrentProtocol:
-        return self._protocol
+    async def serve(self) -> None:
+        """通过官方 MCP stdio transport 运行服务。"""
 
-    async def call_tool(
+        self._require_open()
+        await self._mcp.serve_stdio()
+
+    async def execute_tool(
         self,
         name: str,
         arguments: StrictModel,
-        context: RequestContext,
     ) -> StrictModel | JsonObject:
         self._require_open()
-        current = asyncio.current_task()
-        if current is not None:
-            self._inflight[context.request_id] = cast(asyncio.Task[object], current)
         try:
             if name == "operation.wait":
                 return await self._operation_wait(cast(OperationWaitInput, arguments))
@@ -410,20 +434,11 @@ class Application:
             if translated is None:
                 raise
             raise translated from exc
-        finally:
-            self._inflight.pop(context.request_id, None)
-
-    async def cancel_request(self, request_id: RequestId, _reason: str | None) -> None:
-        task = self._inflight.get(request_id)
-        if task is not None and not task.done():
-            task.cancel()
 
     async def list_resources(
         self,
         cursor: str | None,
-        context: RequestContext,
     ) -> ResourcePage:
-        del context
         artifacts = await asyncio.to_thread(self.storage.artifacts.list)
         digest = query_digest("\n".join(item.uri for item in artifacts).encode("utf-8"))
         offset = 0
@@ -458,20 +473,19 @@ class Application:
                 for item in page_items
             ],
             next_cursor=next_cursor,
-            ttl_ms=0,
-            cache_scope="private",
         )
 
     async def read_resource(
         self,
         uri: str,
-        context: RequestContext,
     ) -> ResourceRead:
-        del context
         contents: list[ResourceData] = []
         offset = 0
         try:
             workspace_id, revision, artifact_id = parse_artifact_uri(uri)
+        except ValueError as exc:
+            raise ResourceRequestError("resource URI 无效", uri=uri) from exc
+        try:
             metadata = await asyncio.to_thread(
                 self.storage.artifacts.get,
                 workspace_id,
@@ -479,31 +493,47 @@ class Application:
                 artifact_id,
                 verify=True,
             )
+            text_decoder = (
+                codecs.getincrementaldecoder("utf-8")(errors="strict")
+                if _is_utf8_resource(metadata.media_type)
+                else None
+            )
             while len(contents) < _MAX_RESOURCE_CONTENTS:
                 chunk = await asyncio.to_thread(
                     self.storage.artifacts.read_verified_chunk,
                     metadata,
                     offset=offset,
+                    limit=(
+                        RESOURCE_CHUNK_BYTES - 4
+                        if text_decoder is not None
+                        else RESOURCE_CHUNK_BYTES
+                    ),
                 )
-                contents.append(
-                    BinaryResourceData(
-                        kind="blob",
-                        uri=uri,
-                        mime_type=chunk.metadata.media_type,
-                        blob=base64.b64encode(chunk.data).decode("ascii"),
+                if text_decoder is None:
+                    contents.append(
+                        BinaryResourceData(
+                            kind="blob",
+                            uri=uri,
+                            mime_type=chunk.metadata.media_type,
+                            blob=base64.b64encode(chunk.data).decode("ascii"),
+                        )
                     )
-                )
+                else:
+                    contents.append(
+                        TextResourceData(
+                            kind="text",
+                            uri=uri,
+                            mime_type=chunk.metadata.media_type,
+                            text=text_decoder.decode(chunk.data, final=chunk.eof),
+                        )
+                    )
                 if chunk.eof:
-                    return ResourceRead(
-                        contents=contents,
-                        ttl_ms=3_600_000,
-                        cache_scope="private",
-                    )
+                    return ResourceRead(contents=contents)
                 assert chunk.next_offset is not None
                 offset = chunk.next_offset
-        except (ArtifactIntegrityError, ArtifactNotFoundError, ValueError) as exc:
-            raise ResourceRequestError("artifact 不存在或 URI 无效", uri=uri) from exc
-        raise ResourceRequestError("artifact 超过单次 resource 读取上限", uri=uri)
+        except ArtifactNotFoundError as exc:
+            raise ResourceNotFoundError(uri=uri) from exc
+        raise RuntimeError("artifact 超过单次 resource 读取上限")
 
     async def doctor(self) -> tuple[bool, JsonObject]:
         self._require_open()
@@ -512,7 +542,7 @@ class Application:
         report: JsonObject = {
             "healthy": bool(worker.get("available")),
             "python": "3.13",
-            "protocol": "2026-07-28",
+            "mcp": self._mcp.protocol_report(),
             "runtime_paths": {
                 "data": str(self.storage.paths.data_root),
                 "logs": str(self.storage.paths.log_root),
@@ -630,12 +660,25 @@ class Application:
                 owner_lease.release()
 
     async def _operation_wait(self, arguments: OperationWaitInput) -> OperationWaitOutput:
-        snapshot = await asyncio.to_thread(
-            self.storage.operations.wait,
-            arguments.operation_id,
-            wait_ms=arguments.wait_ms,
-        )
-        return _operation_output(snapshot)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + (arguments.wait_ms / 1000)
+        while True:
+            snapshot = await asyncio.to_thread(
+                self.storage.operations.get,
+                arguments.operation_id,
+            )
+            if (
+                snapshot.state in _TERMINAL_OPERATION_STATES
+                or arguments.wait_ms == 0
+                or loop.time() >= deadline
+            ):
+                return _operation_output(snapshot)
+            await asyncio.sleep(
+                min(
+                    _OPERATION_WAIT_POLL_SECONDS,
+                    max(0.0, deadline - loop.time()),
+                )
+            )
 
     async def _operation_cancel(
         self,
@@ -775,6 +818,34 @@ class Application:
                     BusinessErrorCode.EXECUTION_FAILED,
                     "workspace 首次分析尚未成功发布 revision",
                 )
+            revision_summaries = [
+                RevisionSummary(
+                    revision=item.revision,
+                    parent_revision=item.parent_revision,
+                    idb_sha256=item.database_sha256,
+                    reason=item.change_id or "initial_analysis",
+                    pinned=item.pinned,
+                )
+                for item in workspace.revisions
+            ]
+            digest = query_digest(
+                canonical_json_bytes(
+                    {
+                        "revisions": [
+                            summary.model_dump(mode="json") for summary in revision_summaries
+                        ]
+                    }
+                )
+            )
+            offset = 0
+            if arguments.cursor is not None:
+                offset = self.cursors.decode(
+                    arguments.cursor,
+                    scope="workspace.get",
+                    workspace_id=workspace.workspace_id,
+                    revision=workspace.current_revision,
+                    query_digest=digest,
+                ).offset
             overview = await self._static_query_unlocked(
                 "program.overview",
                 ProgramOverviewInput(
@@ -785,7 +856,9 @@ class Application:
             )
         typed_overview = cast(ProgramOverviewOutput, overview)
         image = typed_overview.image
-        return WorkspaceGetOutput(
+        available = revision_summaries[offset : offset + arguments.page_size]
+        selected: list[RevisionSummary] = []
+        output = WorkspaceGetOutput(
             workspace_id=workspace.workspace_id,
             current_revision=workspace.current_revision,
             sample_name=workspace.sample_name,
@@ -793,17 +866,43 @@ class Application:
             architecture=image.architecture,
             bitness=image.bitness,
             endian=image.endian,
-            revisions=[
-                RevisionSummary(
-                    revision=item.revision,
-                    parent_revision=item.parent_revision,
-                    idb_sha256=item.database_sha256,
-                    reason=item.change_id or "initial_analysis",
-                    pinned=item.pinned,
-                )
-                for item in workspace.revisions
-            ],
+            revisions=[],
+            next_cursor=None,
         )
+        for summary in available:
+            candidate_revisions = [*selected, summary]
+            next_offset = offset + len(candidate_revisions)
+            next_cursor = (
+                self.cursors.encode(
+                    CursorPosition(
+                        "workspace.get",
+                        workspace.workspace_id,
+                        workspace.current_revision,
+                        digest,
+                        next_offset,
+                    )
+                )
+                if next_offset < len(revision_summaries)
+                else None
+            )
+            candidate = WorkspaceGetOutput(
+                workspace_id=workspace.workspace_id,
+                current_revision=workspace.current_revision,
+                sample_name=workspace.sample_name,
+                sample_sha256=workspace.sample_sha256,
+                architecture=image.architecture,
+                bitness=image.bitness,
+                endian=image.endian,
+                revisions=candidate_revisions,
+                next_cursor=next_cursor,
+            )
+            if _inline_model_size(candidate) > MAX_INLINE_RESULT_BYTES:
+                break
+            selected = candidate_revisions
+            output = candidate
+        if available and not selected:
+            raise RuntimeError("单个 revision 摘要超过 inline 上限")
+        return output
 
     async def _workspace_export(
         self,
@@ -1225,9 +1324,7 @@ class Application:
         revision: str,
         extra: Mapping[str, JsonValue],
     ) -> StrictModel:
-        from ida_re_mcp.domain.catalog import TOOL_CATALOG_BY_NAME
-
-        spec = TOOL_CATALOG_BY_NAME[name]
+        spec = self._catalog_by_name[name]
         arguments = spec.input_model.model_validate(
             {
                 "workspace_id": workspace_id,

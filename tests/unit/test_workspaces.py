@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -31,6 +33,11 @@ def test_workspace_copies_and_hashes_original_without_overwriting(tmp_path: Path
     assert workspace.sample_path.read_bytes() == original
     assert workspace.current_revision is None
     assert workspace.revisions == ()
+    manifest = cast(
+        dict[str, object],
+        json.loads((workspace.sample_path.parent / "workspace.json").read_text(encoding="utf-8")),
+    )
+    assert manifest["schema_version"] == "1"
     assert registry.list() == (registry.get(workspace.workspace_id),)
 
 

@@ -340,6 +340,7 @@ def test_cold_reopen_rejects_corrupt_revision_commit_manifest(
         dict[str, object],
         json.loads(manifest_path.read_text(encoding="utf-8")),
     )
+    assert manifest["schema_version"] == "1"
     if corruption == "missing-result":
         manifest["operation_result"] = None
     else:

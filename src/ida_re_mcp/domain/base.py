@@ -18,7 +18,7 @@ class StrictModel(BaseModel):
     )
 
 
-def current_json_schema(model_type: type[StrictModel]) -> JsonObject:
+def tool_json_schema(model_type: type[StrictModel]) -> JsonObject:
     """为 MCP 工具生成显式的 JSON Schema 2020-12。"""
 
     schema = model_type.model_json_schema(

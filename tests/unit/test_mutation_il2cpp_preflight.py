@@ -128,7 +128,7 @@ def _bundle(symbol_kind: Literal["function", "data"]) -> Bundle:
     manifest = ManifestRecord.model_validate(
         {
             "kind": "manifest",
-            "schema": "2026-07-28",
+            "schema": "1",
             "media_type": "application/vnd.ida-re.il2cpp-bundle+ndjson",
             "native": native,
             "metadata": MetadataBinding(sha256="bb" * 32, size=1024),

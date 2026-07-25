@@ -7,11 +7,12 @@ description: 使用 ida-re-mcp 调用 IDA Pro 9.3+ headless MCP，完成 Native 
 
 ## 建立上下文
 
-1. 读取 `server/discover` 或 `tools/list`，只使用当前目录实际提供的工具。
+1. 调用 `tools/list`，只使用当前目录实际提供的工具。
 2. 调用 `workspace.create`，保存 `workspace_id`、`sample_sha256` 和
    `analysis_operation_id`。
 3. 用 `operation.wait` 等待首次分析；从成功结果中取得 revision。
-4. 调用 `workspace.get`，核对样本摘要、架构与 current revision。
+4. 调用 `workspace.get`，核对样本摘要、架构与 current revision；按 `next_cursor`
+   逐页读取 revision 摘要。
 
 不要猜测活动 workspace。每次静态查询都显式传 `workspace_id` 和目标 `revision`。
 revision 改变后重新发起分页查询，不复用 cursor。

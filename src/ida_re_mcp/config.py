@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Self
@@ -11,12 +13,15 @@ from platformdirs import PlatformDirs
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ida_re_mcp.constants import (
+    CONFIG_SCHEMA_VERSION,
     DEFAULT_RETAINED_REVISIONS,
     DEFAULT_STORAGE_GIB,
     DEFAULT_WORKER_IDLE_SECONDS,
     PRODUCT_NAME,
-    PROTOCOL_VERSION,
 )
+
+DATA_ROOT_ENV = "IDA_RE_MCP_DATA_ROOT"
+LOG_ROOT_ENV = "IDA_RE_MCP_LOG_ROOT"
 
 
 class ConfigError(ValueError):
@@ -66,7 +71,7 @@ class AppConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
-    schema_version: Literal["2026-07-28"] = PROTOCOL_VERSION
+    schema_version: Literal["1"] = CONFIG_SCHEMA_VERSION
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
     workers: WorkerConfig = Field(default_factory=WorkerConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
@@ -84,21 +89,41 @@ class RuntimePaths:
     temp_root: Path
 
     @classmethod
-    def discover(cls, *, working_tree: Path | None = None) -> Self:
+    def discover(
+        cls,
+        *,
+        working_tree: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> Self:
         """解析平台目录, 并拒绝把运行数据放入当前 Git 工作树。"""
 
         dirs = PlatformDirs(PRODUCT_NAME, appauthor=False, roaming=False)
-        data_root = dirs.user_data_path.resolve()
-        log_root = dirs.user_log_path.resolve()
+        selected_environment = os.environ if environment is None else environment
+        data_override = selected_environment.get(DATA_ROOT_ENV)
+        log_override = selected_environment.get(LOG_ROOT_ENV)
+        data_root = _absolute_override(data_override, name=DATA_ROOT_ENV) or (
+            dirs.user_data_path.resolve()
+        )
+        log_root = _absolute_override(log_override, name=LOG_ROOT_ENV) or (
+            data_root / "logs" if data_override is not None else dirs.user_log_path.resolve()
+        )
         tree = (
             working_tree.resolve()
             if working_tree is not None
             else _find_working_tree(Path.cwd().resolve())
         )
         if tree is not None:
-            for candidate in (data_root, log_root):
-                if _is_within(candidate, tree):
-                    raise RuntimePathError(f"运行目录不得位于工作树内: {candidate}")
+            for name, candidate in (
+                (DATA_ROOT_ENV, data_root),
+                (LOG_ROOT_ENV, log_root),
+            ):
+                _validate_runtime_root(candidate, name=name, working_tree=tree)
+        else:
+            for name, candidate in (
+                (DATA_ROOT_ENV, data_root),
+                (LOG_ROOT_ENV, log_root),
+            ):
+                _validate_runtime_root(candidate, name=name, working_tree=None)
 
         return cls(
             data_root=data_root,
@@ -161,6 +186,31 @@ def _find_working_tree(start: Path) -> Path | None:
         if (candidate / ".git").exists():
             return candidate
     return None
+
+
+def _absolute_override(value: str | None, *, name: str) -> Path | None:
+    if value is None:
+        return None
+    if not value.strip():
+        raise RuntimePathError(f"{name} 不能为空")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        raise RuntimePathError(f"{name} 必须是绝对路径")
+    return candidate.resolve()
+
+
+def _validate_runtime_root(
+    candidate: Path,
+    *,
+    name: str,
+    working_tree: Path | None,
+) -> None:
+    if candidate == Path(candidate.anchor):
+        raise RuntimePathError(f"{name} 不得指向文件系统根目录")
+    if working_tree is not None and (
+        _is_within(candidate, working_tree) or _is_within(working_tree, candidate)
+    ):
+        raise RuntimePathError(f"{name} 不得与工作树形成包含关系: {candidate}")
 
 
 def _is_within(candidate: Path, parent: Path) -> bool:

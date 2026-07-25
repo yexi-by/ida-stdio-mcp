@@ -126,7 +126,7 @@ def _write_bundle(bundle_path: Path, metadata_path: Path) -> str:
     metadata_sha256 = hashlib.sha256(metadata_path.read_bytes()).hexdigest()
     manifest: JsonObject = {
         "kind": "manifest",
-        "schema": "2026-07-28",
+        "schema": "1",
         "media_type": "application/vnd.ida-re.il2cpp-bundle+ndjson",
         "native": {
             "sha256": NATIVE_SHA256,
@@ -343,7 +343,7 @@ def test_il2cpp_source_digest_and_artifact_scope_fail_closed(tmp_path: Path) -> 
         )
 
 
-def test_inverse_plan_only_restores_current_source_change_parent() -> None:
+def test_inverse_plan_only_restores_applied_change_parent() -> None:
     arguments = ChangePrepareInput(
         workspace_id=WORKSPACE_ID,
         base_revision=REVISION_ID,

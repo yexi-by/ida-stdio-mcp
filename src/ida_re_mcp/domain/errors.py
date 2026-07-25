@@ -43,9 +43,17 @@ class ToolExecutionError(Exception):
 
 
 class ResourceRequestError(Exception):
-    """资源 URI 无效或资源不存在。"""
+    """资源请求参数无效。"""
 
     def __init__(self, message: str, *, uri: str | None = None) -> None:
         super().__init__(message)
         self.message = message
+        self.uri = uri
+
+
+class ResourceNotFoundError(Exception):
+    """请求的不可变资源不存在。"""
+
+    def __init__(self, *, uri: str) -> None:
+        super().__init__("resource 不存在")
         self.uri = uri

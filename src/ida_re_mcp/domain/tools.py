@@ -151,6 +151,8 @@ class WorkspaceListOutput(StrictModel):
 
 class WorkspaceGetInput(StrictModel):
     workspace_id: WorkspaceId
+    cursor: Cursor | None = None
+    page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
 
 
 class RevisionSummary(StrictModel):
@@ -169,7 +171,8 @@ class WorkspaceGetOutput(StrictModel):
     architecture: str
     bitness: Literal[32, 64]
     endian: Literal["little", "big"]
-    revisions: list[RevisionSummary]
+    revisions: list[RevisionSummary] = Field(max_length=MAX_PAGE_SIZE)
+    next_cursor: Cursor | None = None
 
 
 class WorkspaceExportInput(StrictModel):
