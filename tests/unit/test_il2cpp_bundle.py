@@ -480,24 +480,18 @@ def test_rejects_reference_ids_with_the_wrong_record_kind(tmp_path: Path) -> Non
     _assert_bundle_rejected(tmp_path, records, "declaring_type_id")
 
 
-_REPOSITORY_ROOT = Path(__file__).parents[2]
 _FIXTURE_DIRECTORY = Path(__file__).parents[1] / "fixtures"
 _EXAMPLE_BUNDLE = _FIXTURE_DIRECTORY / "src" / "il2cpp_bundle_example.ndjson"
 _EXAMPLE_NATIVE = _FIXTURE_DIRECTORY / "bin" / "il2cpp_pe_x64.dll"
 _EXAMPLE_METADATA = _FIXTURE_DIRECTORY / "bin" / "il2cpp_metadata_fingerprint.bin"
-_FORMAT_REFERENCE = (
-    _REPOSITORY_ROOT / "skills" / "ida-re-mcp" / "references" / "il2cpp-bundle-format.md"
-)
 _EXAMPLE_NATIVE_SHA256 = "f7d61718ce407ed5ced0049c689aff5ee1a14332037f173d980604b2c0e97021"
 _EXAMPLE_METADATA_SHA256 = "d2f9bc026488660c94b9d49485ecd1070d92483df1bd08bf946bf300fee45ee4"
 _EXAMPLE_NATIVE_SIZE = 2560
 _EXAMPLE_IMAGE_SIZE = 0x5000
 _EXAMPLE_METADATA_SIZE = 206
-_DOCUMENTED_EXAMPLE_START = b"<!-- il2cpp-bundle-example:start -->\n```ndjson\n"
-_DOCUMENTED_EXAMPLE_END = b"```\n<!-- il2cpp-bundle-example:end -->"
 
 
-def test_documented_example_bundle_stays_parseable() -> None:
+def test_example_bundle_stays_parseable() -> None:
     """守护示例与真实 PE x64、metadata fixture 的绑定关系。"""
 
     assert hashlib.sha256(_EXAMPLE_NATIVE.read_bytes()).hexdigest() == _EXAMPLE_NATIVE_SHA256
@@ -541,7 +535,7 @@ def test_documented_example_bundle_stays_parseable() -> None:
     ]
 
 
-def test_documented_example_bundle_is_canonical_ndjson() -> None:
+def test_example_bundle_is_canonical_ndjson() -> None:
     payload = _EXAMPLE_BUNDLE.read_bytes()
     assert not payload.startswith(b"\xef\xbb\xbf")
     assert b"\r" not in payload
@@ -550,12 +544,3 @@ def test_documented_example_bundle_is_canonical_ndjson() -> None:
     # 逐行重新 canonical 编码必须与原字节一致, 且首行是 manifest.
     assert all(canonical_ndjson([parse_canonical_json(line)]) == line + b"\n" for line in lines)
     assert parse_canonical_json(lines[0])["kind"] == "manifest"
-
-
-def test_format_reference_embeds_the_exact_example_bundle() -> None:
-    reference = _FORMAT_REFERENCE.read_bytes()
-    prefix, separator, remainder = reference.partition(_DOCUMENTED_EXAMPLE_START)
-    assert separator and prefix
-    documented_bundle, separator, suffix = remainder.partition(_DOCUMENTED_EXAMPLE_END)
-    assert separator and suffix
-    assert documented_bundle == _EXAMPLE_BUNDLE.read_bytes()

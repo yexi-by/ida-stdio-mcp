@@ -1,201 +1,219 @@
 # ida-re-mcp
 
-`ida-re-mcp` 是面向 AI Agent 的 IDA Pro 9.3+ headless stdio MCP 服务。它以显式
-workspace、不可变 revision 和进程隔离 worker 为基础，提供 Native 静态逆向、
-Unity IL2CPP 原生注解、事务化 IDB 写回，以及 Windows 本机 x64 动态调试。
+`ida-re-mcp` 是面向 AI Agent 的 IDA Pro 9.3+ headless MCP 服务。它通过标准
+stdio transport 向 Codex、Claude Code、OpenCode 等 MCP Host 提供 Native
+静态逆向、Hex-Rays、Unity IL2CPP 原生注解、事务化 IDB 修改，以及 Windows
+本机 x64 动态调试能力。
 
-当前版本为 `1.0.0.dev0`。服务使用官方 Python MCP SDK 的标准生命周期与 stdio
-transport，工具目录在启动时固定，只广告 tools 与不可变 resources。项目不实现自有
-协议协商、JSON-RPC parser、Tasks、prompts、sampling、completions 或交互式审批。
+服务不会修改原始样本。分析结果保存在 workspace 的不可变 revision 中；所有 IDB
+写入先进入 staging，经过冷验证后才原子发布。
 
-## 环境要求
+## 快速开始
 
-- Python `3.13`；
-- `uv`；
-- IDA Pro `9.3+` 及对应许可证；
-- Windows x64，用于动态调试；
-- LLVM/LLD `22.1.8`，仅在重建测试 fixture 时需要。
+### 1. 准备环境
 
-开发虚拟环境与运行数据必须位于 Git 工作树外：
+需要：
+
+- IDA Pro 9.3+ 及有效许可证；
+- Python 3.13；
+- [uv](https://docs.astral.sh/uv/)；
+- Windows x64（仅动态调试需要）；
+- Hex-Rays Decompiler（仅伪代码和 microcode 能力需要）。
+
+克隆项目，并把开发环境放在工作树外：
 
 ```powershell
+git clone https://github.com/yexi-by/ida-re-mcp.git
+$repo = (Resolve-Path .\ida-re-mcp).Path
+Set-Location $repo
 $env:UV_PROJECT_ENVIRONMENT = "$env:LOCALAPPDATA\ida-re-mcp\dev-venv"
 uv python install 3.13
-uv sync --locked
+uv sync --locked --directory $repo
 ```
 
-IDA 安装目录由 `idapro` 运行环境解析。开发机可按 IDA 安装要求设置 `IDADIR`，然后
-执行：
+### 2. 配置 IDA 与运行目录
+
+编辑项目根目录的 `config.toml`，把 `[runtime]` 中的三个绝对路径改为本机路径：
+
+```toml
+schema_version = "1"
+
+[runtime]
+data_root = 'C:\Users\you\AppData\Local\ida-re-mcp\data'
+log_root = 'C:\Users\you\AppData\Local\ida-re-mcp\logs'
+ida_dir = 'C:\Program Files\IDA Professional 9.3'
+
+[policy]
+authoring = true
+debug_launch = true
+debug_attach = false
+expert = false
+
+[workers]
+analysis_limit = 1
+debug_limit = 1
+idle_seconds = 300
+
+[storage]
+quota_gib = 20
+retained_revisions = 3
+```
+
+`debug_attach` 允许附加到外部进程，`expert` 会开放可访问文件、网络和子进程的
+IDAPython 执行环境；只在明确需要并理解风险时启用。
+
+用同一份配置检查 Python、存储和 IDA worker：
 
 ```powershell
-ida-re-mcp doctor --config C:\path\to\config.toml
+uv run --locked --directory $repo ida-re-mcp doctor --config "$repo\config.toml"
 ```
 
-## CLI
+输出中的 `healthy` 和 `worker.available` 都应为 `true`。
 
-```powershell
-ida-re-mcp serve
-ida-re-mcp serve --config C:\path\to\config.toml
-ida-re-mcp doctor --config C:\path\to\config.toml
-ida-re-mcp gc --dry-run
-ida-re-mcp gc --apply
-```
+### 3. 接入 MCP Host
 
-配置使用严格 TOML schema。MCP host 应显式指向项目根目录中的
-[config.toml](config.toml)；克隆到其他机器后先按本机 IDA 安装位置和运行目录修改
-`[runtime]`。字段说明见 [config.example.toml](config.example.toml)。配置文件位于
-项目内，workspace、日志、artifact、checkout、staging、临时文件和虚拟环境仍位于
-工作树外。
+下面所有示例都直接从克隆的工作树运行，不依赖预先安装的 wheel。把示例路径替换为
+实际项目路径；如果 Host 找不到 `uv`，将 `command` 改为 `uv.exe` 的绝对路径。
 
-`[runtime]` 可在一份服务配置中声明 `data_root`、`log_root` 与 `ida_dir`。环境变量
-`IDA_RE_MCP_DATA_ROOT`、`IDA_RE_MCP_LOG_ROOT` 仍可覆盖前两项，但不再要求每个 MCP
-host 手工分配不同目录。
-
-每条 stdio 连接拥有随机、独立的 session 目录。operation、change set、cursor 私钥、
-checkout、临时文件、IPC、worker 日志、调试会话和 Supervisor owner lease 都只属于
-当前连接；workspace、不可变 revision 与 artifact 则在同一个 data root 下受控共享。
-因此 Codex、OpenCode 或同一 host 的多个 Agent 可以同时接入：同一 workspace 仍由
-跨进程 lease 严格串行，不同 workspace 才能按 worker 上限并行。一个会话的 operation、
-change set、cursor 或 debug session 不能在另一个会话中复用。
-
-这里的“会话”严格指一条标准 MCP stdio 连接，也就是一个 server 进程。标准协议不会
-携带 Codex/OpenCode 内部的逻辑 Agent 身份；如果某个 host 主动把多个逻辑 Agent
-复用到同一条 stdio 连接，它们按协议就属于同一个会话。正常的“一条连接启动一个
-server”模式无需额外参数。
-
-`workers.analysis_limit` 与 `workers.debug_limit` 通过共享 data root 下的跨进程 slot
-lease 全局执行，不是每个 Agent 各算一遍。空闲 worker、one-shot mutation/refine/
-Expert/bootstrap、doctor 与完整 debug session 都占用对应 slot。在正常启动、取消、
-超时和有序关闭路径中，只有 IDA worker 真正退出后才释放 slot。Supervisor 被强制结束
-时操作系统会回收文件 lease，但已进入 handler 的孤儿 worker 仍可能短暂运行到观察到
-IPC 断开；强杀场景不能当作实际进程数的硬上限证明。
-
-支持 `cwd` 的 stdio MCP host 应把服务进程的工作目录明确设为目标项目根目录。Codex
-使用 `mcp_servers.<name>.cwd`，OpenCode 本地 MCP 使用 `cwd`。Claude Code 的
-`.mcp.json` 没有 `cwd` 字段；项目级文件应放在项目根目录，Claude Code 会向子进程注入
-稳定的 `CLAUDE_PROJECT_DIR`，但不会因此保证实际工作目录已经切换。这只表示项目上下文；
-会话隔离不依赖工作目录，所以同一项目的并行 Agent 不会再次撞到同一个 owner lease。
-
-### 接入 MCP host
-
-以下配置均假设 `ida-re-mcp` 已安装到 `PATH`，并共用同一份服务配置。多个 host 可以
-同时指向同一个 `data_root`：workspace 与不可变 revision 共享，会话态相互隔离。
-
-Codex（`~/.codex/config.toml`）：
+Codex 的 `config.toml`：
 
 ```toml
 [mcp_servers.ida-re-mcp]
-command = "ida-re-mcp"
-args = ["serve", "--config", 'D:\path\to\your-project\config.toml']
-cwd = 'D:\path\to\your-project'
+command = "uv"
+args = ["run", "--locked", "--directory", 'D:\path\to\ida-re-mcp', "ida-re-mcp", "serve", "--config", 'D:\path\to\ida-re-mcp\config.toml']
+cwd = 'D:\path\to\ida-re-mcp'
+startup_timeout_sec = 240.0
+tool_timeout_sec = 3600.0
+enabled = true
+
+[mcp_servers.ida-re-mcp.env]
+UV_PROJECT_ENVIRONMENT = 'C:\Users\you\AppData\Local\ida-re-mcp\dev-venv'
+PYTHONDONTWRITEBYTECODE = "1"
+PYTHONUTF8 = "1"
 ```
 
-OpenCode stable（`opencode.json`）：
+Claude Code 项目根目录的 `.mcp.json`：
 
 ```json
 {
-  "mcp": {
+  "mcpServers": {
     "ida-re-mcp": {
-      "type": "local",
-      "command": ["ida-re-mcp", "serve", "--config", "D:\\path\\to\\your-project\\config.toml"],
-      "cwd": "D:\\path\\to\\your-project",
-      "enabled": true
-    }
-  }
-}
-```
-
-OpenCode V2 使用不同的 `mcp.servers` 层级，且没有 stable 的 `enabled` 字段：
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "mcp": {
-    "servers": {
-      "ida-re-mcp": {
-        "type": "local",
-        "command": ["ida-re-mcp", "serve", "--config", "D:\\path\\to\\your-project\\config.toml"],
-        "cwd": "D:\\path\\to\\your-project"
+      "type": "stdio",
+      "command": "uv",
+      "args": [
+        "run",
+        "--locked",
+        "--directory",
+        "D:\\path\\to\\ida-re-mcp",
+        "ida-re-mcp",
+        "serve",
+        "--config",
+        "D:\\path\\to\\ida-re-mcp\\config.toml"
+      ],
+      "env": {
+        "UV_PROJECT_ENVIRONMENT": "C:\\Users\\you\\AppData\\Local\\ida-re-mcp\\dev-venv",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUTF8": "1"
       }
     }
   }
 }
 ```
 
-不要把 stable 的 `mcp.<name>`/`enabled` 与 V2 的 `mcp.servers.<name>`/`disabled`
-写法混在同一份配置中。
+Claude Code 的 MCP schema 没有 `cwd` 字段，因此不要自行添加。
 
-Claude Code（项目根目录 `.mcp.json`）：
+OpenCode stable 的 `opencode.json`：
 
 ```json
 {
-  "mcpServers": {
+  "mcp": {
     "ida-re-mcp": {
-      "command": "ida-re-mcp",
-      "args": ["serve", "--config", "D:\\path\\to\\your-project\\config.toml"]
+      "type": "local",
+      "command": [
+        "uv",
+        "run",
+        "--locked",
+        "--directory",
+        "D:\\path\\to\\ida-re-mcp",
+        "ida-re-mcp",
+        "serve",
+        "--config",
+        "D:\\path\\to\\ida-re-mcp\\config.toml"
+      ],
+      "cwd": "D:\\path\\to\\ida-re-mcp",
+      "environment": {
+        "UV_PROJECT_ENVIRONMENT": "C:\\Users\\you\\AppData\\Local\\ida-re-mcp\\dev-venv",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUTF8": "1"
+      },
+      "enabled": true,
+      "timeout": 3600000
     }
   }
 }
 ```
 
-Claude Code 官方 schema 不提供 `cwd`，不要自行添加该字段。子进程可读取 Claude Code
-注入的 `CLAUDE_PROJECT_DIR` 获得稳定项目根，但不能据此假定实际工作目录已经切换。
+保存配置并重启 Host 后，确认 `ida-re-mcp` 工具目录可见。
 
-接入前先对 host 使用的同一配置执行：
+## Agent 的基本调用顺序
+
+1. 调用 `workspace.create` 导入 PE 或 ELF Native 样本，并保存
+   `workspace_id` 与 `analysis_operation_id`。
+2. 调用 `operation.wait` 等待首次分析完成，保存返回的不可变 `revision`。
+3. 所有静态查询都显式传入 `workspace_id` 和 `revision`。
+4. 修改 IDB 时先调用 `change.prepare`，再调用 `change.apply`；成功后改用新 revision。
+5. 用 `report.build` 或 `workspace.export` 生成 artifact。
+6. 动态调试时保存 `debug_session_id`；寄存器、线程、栈和内存读取必须使用当前
+   suspended stop 的 `stop_id`。
+
+查询结果中的 `coverage` 和 `provenance` 是结论可信度的一部分。`partial` 表示 IDA
+没有完整证据，不应由 Agent 擅自补成确定事实。
+
+IL2CPP 导入只接受项目定义的 canonical NDJSON，不直接消费 Il2CppDumper 或
+Il2CppInspector 的原始输出。可运行示例位于
+`tests/fixtures/src/il2cpp_bundle_example.ndjson`。
+
+## 能力边界
+
+- 静态分析覆盖 PE32+ 与 ELF64，包括函数、反汇编、交叉引用、字符串、导入导出、
+  类型、控制流、调用图和数据流查询。
+- 安装 Hex-Rays 时提供伪代码、ctree 与 microcode 查询。
+- IDB 修改采用 staging、冷验证和 CAS 发布；失败、取消或 worker 崩溃不会改写已发布
+  revision。
+- IL2CPP bundle 可事务化写入类型、方法、符号和注释。
+- 动态调试限定为 Windows 本机 x64，并依赖真实 IDA debugger 事件。
+- `expert.execute` 默认关闭；启用后属于开放世界 IDAPython，不是沙箱。
+
+项目不提供远程调试、普通 .NET/Mono workspace、进程内存写入、恶意样本沙箱、
+IL2CPP 转换器或外部分析器执行链。
+
+## 本地验证
+
+常规质量门禁全部在本机运行，不需要 GitHub Actions：
 
 ```powershell
-ida-re-mcp doctor --config D:\path\to\your-project\config.toml
+./scripts/run_quality.ps1
 ```
 
-确认运行目录与 IDA worker 可用后，再由 host 发起 `tools/list`。配置字段依据
-[Codex 配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)、
-[Claude Code MCP](https://code.claude.com/docs/en/mcp)、
-[OpenCode stable MCP](https://opencode.ai/docs/mcp-servers/) 与
-[OpenCode V2 MCP](https://v2.opencode.ai/docs/mcp-servers)；stable 与 V2 示例应按所用
-版本单独选择。
+该脚本依次执行锁文件检查、Ruff format/check、basedpyright strict、unit/integration
+pytest、fixture 可复现性检查、wheel 隔离安装和 stdio smoke；任一步失败都会立即以
+非零码退出。
 
-运行目录不得指向文件系统根目录，也不得位于当前 Git 工作树内或包含工作树。session
-owner lease 位于 session 数据树外；`gc` 按数据与日志树的最后活动时间回收遗留目录，
-并在同一 lease 内完成删除。活动 session 和未超过 operation 保留期的 session 不会被删。
+使用受许可的 IDA 9.3+ 运行真实静态、Hex-Rays 与 debugger 门禁：
 
-## Agent 工作流
+```powershell
+$env:IDADIR = 'C:\Program Files\IDA Professional 9.3'
+$env:UV_PROJECT_ENVIRONMENT = "$env:LOCALAPPDATA\ida-re-mcp\dev-venv"
+$gateRoot = Join-Path $env:TEMP ("ida-re-mcp-gate-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $gateRoot | Out-Null
 
-`workspace.create` 会先把用户提供的文件复制为私有候选副本，再对副本执行严格的
-PE/ELF Native 格式预检。调用方必须提供可由 IDA 直接加载的 Native 镜像；shell
-脚本、gzexe 和其他压缩包装器稳定返回 `unsupported`。服务不会解包或执行候选文件。
+uv run --locked pytest -q tests/ida -m "ida and not debugger" --basetemp "$gateRoot\static"
+uv run --locked pytest -q tests/ida -m "ida and debugger" --basetemp "$gateRoot\debugger"
+```
 
-1. 调用 `workspace.create`，保存 `workspace_id` 与 `analysis_operation_id`。
-2. 用 `operation.wait` 等待首次分析，取得不可变 revision。
-3. 使用显式 `workspace_id` 与 `revision` 调用静态查询。
-4. 检查结果中的 `coverage` 与 `provenance`，不要把分析缺口推断为确定事实。
-5. 通过 `change.prepare` 与 `change.apply` 执行事务化写回。
-6. 用 `report.build` 或 `workspace.export` 生成不可变 artifact，并通过
-   `ida-re://...` resource URI 读取。
-7. 动态调试时保存 `debug_session_id`，只在当前 suspended `stop_id` 上读取寄存器、
-   线程、栈和内存。
+IDA 门禁不会用 skip 伪装成功：缺少许可证、`IDADIR`、Hex-Rays 或真实 debugger
+事件时会明确失败。
 
-`program.search` 的文本域为 `function`、`name`、`string`；显式空
-`text_query=""` 表示确定性枚举。`bytes` 域使用独立的 `bytes_query`。
+## 许可证
 
-`import_il2cpp_bundle` 只接受本项目定义的 canonical NDJSON。服务不执行分析器或生成器，
-调用方需要先把 Il2CppDumper/Il2CppInspector 的输出转换为该格式；逐字段规范与可解析
-示例见
-[IL2CPP bundle 格式](skills/ida-re-mcp/references/il2cpp-bundle-format.md)。
-
-## 安全与一致性
-
-- 原始样本只读，`workspace.create` 会复制并校验 SHA-256，所有格式识别都发生在私有
-  候选副本上。
-- AnalysisWorker 与 DebugWorker 使用私有 checkout，关闭时不保存。
-- 所有 IDB 写入都在 staging 中完成，经过回读、冷验证和 CAS 后发布为新 revision。
-- mutation 失败、取消或 worker 崩溃不得改变旧 revision、HEAD 或样本摘要。
-- 调试会执行目标程序；Job Object 负责回收服务启动的进程树，但不是恶意样本沙箱。
-- `expert.execute` 默认不注册。启用后仍是可访问文件、网络和子进程的开放世界
-  IDAPython。
-
-项目不提供进程内存写入、远程调试、普通 .NET/Mono workspace、通用调用捕获或外部
-分析器执行链。
-
-完整边界见 [架构](docs/架构.md)，能力状态见
-[能力矩阵](docs/能力矩阵.md)，可复现门禁见
-[验证记录](docs/验证记录.md)。
+[MIT](LICENSE)

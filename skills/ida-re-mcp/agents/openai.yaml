@@ -1,4 +1,0 @@
-interface:
-  display_name: "IDA RE MCP"
-  short_description: "用显式 revision 和真实 IDA 事件执行 headless 逆向"
-  default_prompt: "使用 $ida-re-mcp 对目标样本执行基于 revision、coverage 和真实调试事件的 headless 逆向分析。"

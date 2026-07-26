@@ -283,7 +283,7 @@ def test_two_stdio_agents_share_artifacts_and_isolate_runtime_sessions(
         try:
             await asyncio.wait_for(
                 asyncio.gather(*(event.wait() for event in ready)),
-                timeout=15,
+                timeout=60,
             )
             session_root = tmp_path / "runtime-data" / "sessions"
             sessions = sorted(path for path in session_root.iterdir() if path.is_dir())

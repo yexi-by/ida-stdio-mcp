@@ -70,12 +70,16 @@ ida_dir = "C:/Program Files/IDA Professional 9.3"
     assert config.runtime.ida_dir == "C:/Program Files/IDA Professional 9.3"
 
 
-def test_shipped_example_is_valid_config() -> None:
+def test_shipped_config_is_valid() -> None:
     project_root = Path(__file__).resolve().parents[2]
 
-    config = load_config(project_root / "config.example.toml")
+    config = load_config(project_root / "config.toml")
 
-    assert config == AppConfig()
+    assert isinstance(config, AppConfig)
+    assert config.schema_version == "1"
+    assert config.runtime.data_root is not None
+    assert config.runtime.log_root is not None
+    assert config.runtime.ida_dir is not None
 
 
 @pytest.mark.parametrize(
