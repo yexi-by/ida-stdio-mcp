@@ -1,0 +1,21 @@
+schema_version = "1"
+
+[runtime]
+data_root = 'C:\Users\夜袭\AppData\Local\ida-re-mcp\hosts\codex\data'
+log_root = 'C:\Users\夜袭\AppData\Local\ida-re-mcp\hosts\codex\logs'
+ida_dir = 'C:\Program Files\IDA Professional 9.3'
+
+[policy]
+authoring = true
+debug_launch = true
+debug_attach = true
+expert = true
+
+[workers]
+analysis_limit = 1
+debug_limit = 1
+idle_seconds = 300
+
+[storage]
+quota_gib = 20
+retained_revisions = 3

@@ -41,9 +41,11 @@ ida-re-mcp gc --dry-run
 ida-re-mcp gc --apply
 ```
 
-配置使用严格 TOML schema，示例见
-[config.example.toml](config.example.toml)。workspace、日志、artifact、checkout、
-staging、临时文件和虚拟环境都位于工作树外。
+配置使用严格 TOML schema。MCP host 应显式指向项目根目录中的
+[config.toml](config.toml)；克隆到其他机器后先按本机 IDA 安装位置和运行目录修改
+`[runtime]`。字段说明见 [config.example.toml](config.example.toml)。配置文件位于
+项目内，workspace、日志、artifact、checkout、staging、临时文件和虚拟环境仍位于
+工作树外。
 
 `[runtime]` 可在一份服务配置中声明 `data_root`、`log_root` 与 `ida_dir`。环境变量
 `IDA_RE_MCP_DATA_ROOT`、`IDA_RE_MCP_LOG_ROOT` 仍可覆盖前两项，但不再要求每个 MCP
@@ -84,7 +86,7 @@ Codex（`~/.codex/config.toml`）：
 ```toml
 [mcp_servers.ida-re-mcp]
 command = "ida-re-mcp"
-args = ["serve", "--config", 'C:\Users\you\AppData\Roaming\ida-re-mcp\config.toml']
+args = ["serve", "--config", 'D:\path\to\your-project\config.toml']
 cwd = 'D:\path\to\your-project'
 ```
 
@@ -95,7 +97,7 @@ OpenCode stable（`opencode.json`）：
   "mcp": {
     "ida-re-mcp": {
       "type": "local",
-      "command": ["ida-re-mcp", "serve", "--config", "C:\\Users\\you\\AppData\\Roaming\\ida-re-mcp\\config.toml"],
+      "command": ["ida-re-mcp", "serve", "--config", "D:\\path\\to\\your-project\\config.toml"],
       "cwd": "D:\\path\\to\\your-project",
       "enabled": true
     }
@@ -112,7 +114,7 @@ OpenCode V2 使用不同的 `mcp.servers` 层级，且没有 stable 的 `enabled
     "servers": {
       "ida-re-mcp": {
         "type": "local",
-        "command": ["ida-re-mcp", "serve", "--config", "C:\\Users\\you\\AppData\\Roaming\\ida-re-mcp\\config.toml"],
+        "command": ["ida-re-mcp", "serve", "--config", "D:\\path\\to\\your-project\\config.toml"],
         "cwd": "D:\\path\\to\\your-project"
       }
     }
@@ -130,7 +132,7 @@ Claude Code（项目根目录 `.mcp.json`）：
   "mcpServers": {
     "ida-re-mcp": {
       "command": "ida-re-mcp",
-      "args": ["serve", "--config", "C:\\Users\\you\\AppData\\Roaming\\ida-re-mcp\\config.toml"]
+      "args": ["serve", "--config", "D:\\path\\to\\your-project\\config.toml"]
     }
   }
 }
@@ -142,7 +144,7 @@ Claude Code 官方 schema 不提供 `cwd`，不要自行添加该字段。子进
 接入前先对 host 使用的同一配置执行：
 
 ```powershell
-ida-re-mcp doctor --config C:\Users\you\AppData\Roaming\ida-re-mcp\config.toml
+ida-re-mcp doctor --config D:\path\to\your-project\config.toml
 ```
 
 确认运行目录与 IDA worker 可用后，再由 host 发起 `tools/list`。配置字段依据
