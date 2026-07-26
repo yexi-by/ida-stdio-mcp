@@ -31,8 +31,10 @@ from ida_re_mcp.supervisor.operations import (
 )
 from ida_re_mcp.supervisor.storage import StorageUsage, SupervisorStorage
 from ida_re_mcp.supervisor.workspaces import (
+    AnalysisOutcome,
     ColdValidationReceipt,
     GarbageCollectionResult,
+    ImageIdentity,
     RevisionCheckout,
     RevisionSnapshot,
     RevisionStaging,
@@ -42,6 +44,7 @@ from ida_re_mcp.supervisor.workspaces import (
 )
 
 __all__ = [
+    "AnalysisOutcome",
     "ArtifactChunk",
     "ArtifactFileInput",
     "ArtifactGarbageCollectionResult",
@@ -52,6 +55,7 @@ __all__ = [
     "ChunkedArtifact",
     "ColdValidationReceipt",
     "GarbageCollectionResult",
+    "ImageIdentity",
     "InvalidIdentifierError",
     "OperationCoordinator",
     "OperationFailure",

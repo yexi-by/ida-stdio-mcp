@@ -8,11 +8,25 @@ from pydantic import JsonValue
 from ida_re_mcp.config import AppConfig, RuntimePaths
 from ida_re_mcp.supervisor import (
     ColdValidationReceipt,
+    ImageIdentity,
     OperationState,
     SupervisorStorage,
     WorkspaceRegistry,
     hash_staging_payload,
 )
+
+
+def _pe_image_identity() -> ImageIdentity:
+    return ImageIdentity.model_validate(
+        {
+            "container": "pe",
+            "architecture": "x86_64",
+            "bitness": 64,
+            "endian": "little",
+            "image_size": 0x4000,
+        },
+        strict=True,
+    )
 
 
 def _runtime_paths(tmp_path: Path) -> RuntimePaths:
@@ -41,6 +55,7 @@ def _publish_without_operation(
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
     return workspaces.publish_staging(staging, receipt=receipt).revision
 
@@ -79,6 +94,7 @@ def test_storage_restart_recovers_current_revision_operation_receipt(
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
     result: dict[str, JsonValue] = {
         "workspace_id": workspace.workspace_id,

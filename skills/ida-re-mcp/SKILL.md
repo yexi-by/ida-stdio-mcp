@@ -48,7 +48,9 @@ revision 改变后重新发起分页查询，不复用 cursor。
 
 遇到 `revision_conflict` 时读取 workspace HEAD，重新收集 precondition 并 prepare。
 不要修改原始样本，也不要绕开 staging revision。IL2CPP 与写回事务规则见
-[references/authoring-il2cpp.md](references/authoring-il2cpp.md)。
+[references/authoring-il2cpp.md](references/authoring-il2cpp.md)；bundle 逐字段格式与
+可解析示例见
+[references/il2cpp-bundle-format.md](references/il2cpp-bundle-format.md)。
 
 ## Windows x64 动态调试
 
@@ -71,6 +73,10 @@ revision 改变后重新发起分页查询，不复用 cursor。
 - `capability_unavailable` 或 `unsupported` 表示当前 headless 链路不能完成请求；停止该
   路径并报告 remediation，不转向 GUI。
 - `ambiguous_reference` 要求保留候选并改用精确 `entity_id` 或地址。
+- `revision_conflict` 表示 CAS 写冲突：读取 workspace HEAD，重新收集 precondition 并
+  prepare。
+- `revision_not_found` 表示该 revision 不存在或已被 GC 回收，**不要重试同一 revision**；
+  改用 `workspace.get` 读取现存 revision 再继续。
 - `cursor_stale` 要求从第一页重新查询。
 - `debug_state_conflict` 要求重新读取事件和当前 stop。
 - inline 结果不足时读取 artifact resource；如果返回 chunk index，按索引 URI 逐块

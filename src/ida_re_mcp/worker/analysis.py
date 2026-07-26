@@ -325,6 +325,16 @@ class AnalysisWorker(OwnerThreadBound):
             },
         )
 
+    def _container(self, api: IdaModules) -> str:
+        """把 IDA 内部 filetype 枚举映射为稳定容器族; 非 ELF/PE 返回 other。"""
+
+        file_type = int(api.ida_ida.inf_get_filetype())
+        if file_type == int(api.ida_ida.f_ELF):
+            return "elf"
+        if file_type == int(api.ida_ida.f_PE):
+            return "pe"
+        return "other"
+
     def _resolve_address(self, api: IdaModules, raw: object) -> int:
         ref = _mapping(raw, "address")
         space = _text(ref.get("space"), "address.space")
@@ -525,6 +535,7 @@ class AnalysisWorker(OwnerThreadBound):
                 )
         raw_hash = api.ida_nalt.retrieve_input_file_sha256()
         input_hash = bytes(raw_hash).hex() if raw_hash is not None else ""
+        container = self._container(api)
         return {
             "image": {
                 "input_name": str(api.ida_nalt.get_root_filename()),
@@ -541,7 +552,7 @@ class AnalysisWorker(OwnerThreadBound):
                 if api.ida_ida.inf_is_32bit_exactly()
                 else 16,
                 "endianness": "big" if api.ida_ida.inf_is_be() else "little",
-                "file_type": int(api.ida_ida.inf_get_filetype()),
+                "container": container,
             },
             "segments": segments,
             "entry_points": entry_points,
@@ -566,6 +577,7 @@ class AnalysisWorker(OwnerThreadBound):
             "coverage": self._overview_coverage(
                 limit=limit,
                 selected=selected,
+                container=container,
                 segment_count=int(api.ida_segment.get_segm_qty()),
                 entry_point_count=entry_point_count,
                 export_count=export_count,
@@ -583,6 +595,7 @@ class AnalysisWorker(OwnerThreadBound):
         *,
         limit: int,
         selected: set[str],
+        container: str,
         segment_count: int,
         entry_point_count: int,
         export_count: int,
@@ -607,12 +620,20 @@ class AnalysisWorker(OwnerThreadBound):
             )
             if name in selected and count > limit
         ]
-        reasons = [f"overview_{section}_limit_reached" for section in truncated_sections]
+        truncation_reasons = [f"overview_{section}_limit_reached" for section in truncated_sections]
         if "strings" in selected and string_preview_truncated:
-            reasons.append("overview_string_preview_text_hard_limit_reached")
+            truncation_reasons.append("overview_string_preview_text_hard_limit_reached")
+        # unwind/exception 区域仅覆盖 PE/SEH 语义; ELF .eh_frame 不在当前契约内,
+        # 因此请求 unwind 时对 ELF 显式降级而不是谎报 complete 的零结果.
+        capability_reasons = (
+            ["unwind_unsupported_for_elf_eh_frame"]
+            if "unwind" in selected and container == "elf"
+            else []
+        )
+        reasons = [*truncation_reasons, *capability_reasons]
         return {
             "complete": not reasons,
-            "truncated": bool(reasons),
+            "truncated": bool(truncation_reasons),
             "reasons": reasons,
             "limit": limit,
         }

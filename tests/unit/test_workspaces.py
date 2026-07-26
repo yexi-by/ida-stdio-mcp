@@ -174,6 +174,14 @@ def test_workspace_gc_reclaims_expired_uninitialized_workspace_after_lease_relea
     source = tmp_path / "sample.bin"
     source.write_bytes(b"sample")
     workspace = registry.create(source)
+    registry.record_analysis_outcome(
+        workspace.workspace_id,
+        state="failed",
+        reason="长操作失败",
+    )
+    retained = registry.get(workspace.workspace_id)
+    assert retained.analysis_outcome is not None
+    assert retained.analysis_outcome.reason == "长操作失败"
     workspace_root = workspace.sample_path.parent
     manifest_path = workspace_root / "workspace.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

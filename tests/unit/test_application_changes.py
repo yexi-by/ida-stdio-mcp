@@ -9,10 +9,10 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from pydantic import JsonValue
+from pydantic import JsonValue, ValidationError
 
 from ida_re_mcp.application import Application
-from ida_re_mcp.config import AppConfig, RuntimePaths, WorkerConfig
+from ida_re_mcp.config import AppConfig, RuntimePaths, StorageConfig, WorkerConfig
 from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES
 from ida_re_mcp.domain.address import DatabaseAddress
 from ida_re_mcp.domain.base import JsonObject
@@ -26,6 +26,7 @@ from ida_re_mcp.domain.tools import (
     ChangeImpact,
     ChangePrepareInput,
     ChangePrepareOutput,
+    ImageSummary,
     OperationCancelInput,
     OperationCancelOutput,
     OperationWaitInput,
@@ -35,22 +36,31 @@ from ida_re_mcp.domain.tools import (
     ProgramSearchInput,
     ProgramSearchOutput,
     RenameOperation,
+    WorkspaceAnalysisOutcome,
     WorkspaceCreateInput,
+    WorkspaceCreateOutput,
     WorkspaceExportInput,
     WorkspaceExportOutput,
     WorkspaceGetInput,
     WorkspaceGetOutput,
     WorkspaceListInput,
     WorkspaceListOutput,
+    WorkspaceSummary,
 )
-from ida_re_mcp.supervisor._process_lock import AsyncInterprocessSlotLease
+from ida_re_mcp.supervisor._fs import atomic_write_json
+from ida_re_mcp.supervisor._process_lock import (
+    AsyncInterprocessFileLock,
+    AsyncInterprocessSlotLease,
+)
 from ida_re_mcp.supervisor.artifacts import ArtifactNotFoundError, parse_artifact_uri
 from ida_re_mcp.supervisor.backend import AnalysisBackend, DebugBackend
 from ida_re_mcp.supervisor.changes import ChangeSetStore
 from ida_re_mcp.supervisor.cursors import CursorCodec
+from ida_re_mcp.supervisor.native_formats import NativeImageIdentity, inspect_native_image
 from ida_re_mcp.supervisor.storage import SupervisorStorage
 from ida_re_mcp.supervisor.workspaces import (
     ColdValidationReceipt,
+    ImageIdentity,
     RevisionCheckout,
     RevisionSnapshot,
     WorkspaceSnapshot,
@@ -105,6 +115,7 @@ class _FakeIdaBackend:
         large_overview_count: int = 0,
         cold_sample_sha256: str | None = None,
         cold_mismatch_call: int | None = None,
+        cold_container: str | None = None,
     ) -> None:
         self.sample_sha256 = sample_sha256
         self.fail_mutation_call = fail_mutation_call
@@ -115,6 +126,7 @@ class _FakeIdaBackend:
         self.large_overview_count = large_overview_count
         self.cold_sample_sha256 = cold_sample_sha256
         self.cold_mismatch_call = cold_mismatch_call
+        self.cold_container = cold_container
         self.cold_analysis_calls = 0
         self.mutation_calls = 0
         self.search_requests: list[tuple[int, int]] = []
@@ -232,7 +244,18 @@ class _FakeIdaBackend:
                 "image_size": 0x3000,
                 "bitness": 64,
                 "endianness": "little",
-                "file_type": 11,
+                "container": (
+                    self.cold_container
+                    if (
+                        is_cold_staging
+                        and self.cold_container is not None
+                        and (
+                            self.cold_mismatch_call is None
+                            or self.cold_analysis_calls == self.cold_mismatch_call
+                        )
+                    )
+                    else "pe"
+                ),
             },
             "segments": [],
             "entry_points": [],
@@ -416,6 +439,12 @@ class _TestApplication(Application):
     async def acquire_global_analysis_slot_for_test(self) -> AsyncInterprocessSlotLease:
         return await self._analysis_worker_slots.acquire()
 
+    async def acquire_local_analysis_slot_for_test(self) -> None:
+        await self._analysis_slots.acquire()
+
+    def release_local_analysis_slot_for_test(self) -> None:
+        self._analysis_slots.release()
+
     def set_close_task_for_test(self, task: asyncio.Task[None] | None) -> None:
         self._close_task = task
 
@@ -465,6 +494,7 @@ def _application(
     large_overview_count: int = 0,
     cold_sample_sha256: str | None = None,
     cold_mismatch_call: int | None = None,
+    cold_container: str | None = None,
 ) -> tuple[_TestApplication, WorkspaceSnapshot, bytes, _FakeIdaBackend]:
     config = AppConfig()
     paths = _paths(tmp_path)
@@ -481,6 +511,13 @@ def _application(
     receipt = ColdValidationReceipt.create(
         validator="fake_ida_9_3_headless",
         component_hashes=hash_staging_payload(staging),
+        image_identity=ImageIdentity(
+            container="pe",
+            architecture="x86_64",
+            bitness=64,
+            endian="little",
+            image_size=0x3000,
+        ),
     )
     revision = storage.workspaces.publish_staging(staging, receipt=receipt)
     workspace = storage.workspaces.get(workspace.workspace_id)
@@ -495,6 +532,7 @@ def _application(
         large_overview_count=large_overview_count,
         cold_sample_sha256=cold_sample_sha256,
         cold_mismatch_call=cold_mismatch_call,
+        cold_container=cold_container,
     )
     application = _TestApplication(
         config=config,
@@ -790,6 +828,46 @@ def test_change_apply_cold_identity_mismatch_keeps_head_sample_and_base_unchange
     asyncio.run(scenario())
 
 
+def test_change_apply_cold_container_mismatch_keeps_head_unchanged(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        application, workspace, sample_bytes, _backend = _application(
+            tmp_path,
+            cold_container="elf",
+            cold_mismatch_call=2,
+        )
+        assert workspace.current_revision is not None
+        base_revision = workspace.current_revision
+        prepared = await application.execute_tool(
+            "change.prepare",
+            _prepare(workspace),
+        )
+        assert isinstance(prepared, ChangePrepareOutput)
+
+        with pytest.raises(RuntimeError, match="base revision"):
+            await application.execute_tool(
+                "change.apply",
+                ChangeApplyInput(
+                    workspace_id=workspace.workspace_id,
+                    expected_revision=base_revision,
+                    change_set_id=prepared.change_set_id,
+                    digest=prepared.digest,
+                ),
+            )
+
+        current = application.storage.workspaces.get(workspace.workspace_id)
+        assert current.current_revision == base_revision
+        assert workspace.sample_path.read_bytes() == sample_bytes
+        staging_root = (
+            application.storage.paths.workspace_root / workspace.workspace_id / ".staging"
+        )
+        assert not tuple(staging_root.iterdir())
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_static_cursor_binds_query_and_automatically_shrinks_oversized_page(
     tmp_path: Path,
 ) -> None:
@@ -932,6 +1010,13 @@ def test_workspace_get_paginates_revisions_with_inline_budget(tmp_path: Path) ->
             receipt = ColdValidationReceipt.create(
                 validator="fake_ida_9_3_headless",
                 component_hashes=hash_staging_payload(staging),
+                image_identity=ImageIdentity(
+                    container="pe",
+                    architecture="x86_64",
+                    bitness=64,
+                    endian="little",
+                    image_size=0x3000,
+                ),
             )
             published = application.storage.workspaces.publish_staging(
                 staging,
@@ -981,7 +1066,115 @@ def test_workspace_get_paginates_revisions_with_inline_budget(tmp_path: Path) ->
         assert seen == expected
         assert len(seen) == len(set(seen))
         assert current_revision in seen
+        assert {page.history_truncated for page in pages} == {False}
         await application.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "manifest_identity",
+    ["complete", "absent", "missing_container", "conflicting_legacy"],
+)
+def test_workspace_metadata_does_not_consume_analysis_slot_or_open_backend(
+    tmp_path: Path,
+    manifest_identity: str,
+) -> None:
+    async def scenario() -> None:
+        config = AppConfig(workers=WorkerConfig(analysis_limit=1))
+        paths = _paths(tmp_path)
+        storage = SupervisorStorage.open(config=config, paths=paths)
+        source = tmp_path / "native_pe_x64.dll"
+        source.write_bytes(
+            (Path(__file__).parents[1] / "fixtures" / "bin" / "native_pe_x64.dll").read_bytes()
+        )
+        workspace = storage.workspaces.create(source)
+        staging = storage.workspaces.begin_staging(
+            workspace.workspace_id,
+            expected_revision=None,
+        )
+        staging.database_path.write_bytes(b"cold-base")
+        receipt = ColdValidationReceipt.create(
+            validator="fake_ida_9_3_headless",
+            component_hashes=hash_staging_payload(staging),
+            image_identity=ImageIdentity(
+                container="pe",
+                architecture="x86_64",
+                bitness=64,
+                endian="little",
+                image_size=0x4000,
+            ),
+        )
+        published = storage.workspaces.publish_staging(staging, receipt=receipt)
+        manifest_path = published.path / "revision.json"
+        if manifest_identity != "complete":
+            raw = cast(
+                dict[str, object],
+                json.loads(manifest_path.read_text(encoding="utf-8")),
+            )
+            if manifest_identity == "absent":
+                raw.pop("image_identity")
+            else:
+                identity = cast(dict[str, object], raw["image_identity"])
+                identity.pop("container")
+                if manifest_identity == "conflicting_legacy":
+                    identity["architecture"] = "aarch64"
+            atomic_write_json(manifest_path, raw)
+        manifest_before = manifest_path.read_bytes()
+
+        reopened = SupervisorStorage.open(config=config, paths=paths)
+        backend = _FakeIdaBackend(workspace.sample_sha256)
+        application = _TestApplication(
+            config=config,
+            storage=reopened,
+            changes=ChangeSetStore(
+                paths.data_root / "change-sets",
+                workspace_lease_root=reopened.workspaces.lease_root,
+            ),
+            cursors=CursorCodec(paths.data_root / "cursor.key"),
+            backend=backend,
+        )
+        await application.acquire_local_analysis_slot_for_test()
+        try:
+            if manifest_identity == "conflicting_legacy":
+                with pytest.raises(ToolExecutionError) as raised:
+                    await asyncio.wait_for(
+                        application.execute_tool(
+                            "workspace.list",
+                            WorkspaceListInput(),
+                        ),
+                        timeout=2,
+                    )
+                assert raised.value.code is BusinessErrorCode.EXECUTION_FAILED
+                listed = None
+                details = None
+            else:
+                listed = await asyncio.wait_for(
+                    application.execute_tool("workspace.list", WorkspaceListInput()),
+                    timeout=2,
+                )
+                details = await asyncio.wait_for(
+                    application.execute_tool(
+                        "workspace.get",
+                        WorkspaceGetInput(workspace_id=workspace.workspace_id),
+                    ),
+                    timeout=2,
+                )
+        finally:
+            application.release_local_analysis_slot_for_test()
+            await application.aclose()
+
+        assert backend.analysis_open_count == 0
+        assert backend.cold_analysis_calls == 0
+        assert manifest_path.read_bytes() == manifest_before
+        if manifest_identity == "conflicting_legacy":
+            return
+        assert isinstance(listed, WorkspaceListOutput)
+        assert listed.workspaces[0].architecture == "x86_64"
+        assert isinstance(details, WorkspaceGetOutput)
+        assert details.architecture == "x86_64"
+        assert details.bitness == 64
+        assert details.endian == "little"
 
     asyncio.run(scenario())
 
@@ -1058,6 +1251,13 @@ def test_remote_waiter_preempts_idle_analysis_worker_across_sessions(
         receipt = ColdValidationReceipt.create(
             validator="fake_ida_9_3_headless",
             component_hashes=hash_staging_payload(staging),
+            image_identity=ImageIdentity(
+                container="pe",
+                architecture="x86_64",
+                bitness=64,
+                endian="little",
+                image_size=0x3000,
+            ),
         )
         published = first_storage.workspaces.publish_staging(staging, receipt=receipt)
         workspace = first_storage.workspaces.get(workspace.workspace_id)
@@ -1386,6 +1586,9 @@ def test_workspace_list_restores_failed_initialization_state_after_restart(
         assert len(result.workspaces) == 1
         assert result.workspaces[0].workspace_id == workspace.workspace_id
         assert result.workspaces[0].state == "failed"
+        assert result.workspaces[0].analysis_outcome is not None
+        assert result.workspaces[0].analysis_outcome.state == "failed"
+        assert result.workspaces[0].analysis_outcome.reason == "服务重启前的操作未完成"
         await application.aclose()
 
     asyncio.run(scenario())
@@ -1595,5 +1798,730 @@ def test_operation_cancel_during_publish_waits_for_commit_and_reports_success(
         finally:
             allow_publish.set()
             await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def _publish_cold_revision(
+    storage: SupervisorStorage,
+    workspace_id: str,
+    *,
+    expected_revision: str | None,
+    content: bytes,
+) -> str:
+    staging = storage.workspaces.begin_staging(
+        workspace_id,
+        expected_revision=expected_revision,
+    )
+    staging.database_path.write_bytes(content)
+    receipt = ColdValidationReceipt.create(
+        validator="cold.worker",
+        component_hashes=hash_staging_payload(staging),
+        image_identity=ImageIdentity(
+            container="pe",
+            architecture="x86_64",
+            bitness=64,
+            endian="little",
+            image_size=0x3000,
+        ),
+    )
+    return storage.workspaces.publish_staging(staging, receipt=receipt).revision
+
+
+def test_missing_revision_reports_revision_not_found_not_conflict(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, workspace, _sample_bytes, _backend = _application(tmp_path)
+        # 查询不存在(或已被 GC)的 revision 必须是 revision_not_found, 而非 CAS
+        # 语义的 revision_conflict, 否则会诱导 Agent 对不存在的 revision 无限重试。
+        with pytest.raises(ToolExecutionError) as raised:
+            await application.execute_tool(
+                "program.overview",
+                ProgramOverviewInput(
+                    workspace_id=workspace.workspace_id,
+                    revision="rev_00000000000000000000000000000000",
+                    include=[],
+                ),
+            )
+        assert raised.value.code is BusinessErrorCode.REVISION_NOT_FOUND
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_list_reports_unknown_without_proof_of_progress(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig()
+        paths = _paths(tmp_path)
+        storage = SupervisorStorage.open(config=config, paths=paths)
+        source = tmp_path / "pending.exe"
+        source.write_bytes(b"MZ" + b"\0" * 510)
+        workspace = storage.workspaces.create(source)
+        # 无 current revision、无持久化 analysis_outcome、无可见 operation:
+        # 服务无法证明它仍在分析, 只能诚实报告 unknown。
+        application = Application(
+            config=config,
+            storage=storage,
+            changes=ChangeSetStore(paths.data_root / "change-sets"),
+            cursors=CursorCodec(paths.data_root / "cursor.key"),
+            backend=_FakeIdaBackend(workspace.sample_sha256),
+        )
+        result = await application.execute_tool("workspace.list", WorkspaceListInput())
+        assert isinstance(result, WorkspaceListOutput)
+        assert len(result.workspaces) == 1
+        assert result.workspaces[0].state == "unknown"
+        assert result.workspaces[0].architecture is None
+        assert result.workspaces[0].analysis_outcome is None
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_get_flags_history_truncated_after_retention(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(storage=StorageConfig(retained_revisions=1))
+        paths = _paths(tmp_path)
+        storage = SupervisorStorage.open(config=config, paths=paths)
+        source = tmp_path / "sample.exe"
+        source.write_bytes(b"MZ" + b"\0" * 510)
+        workspace = storage.workspaces.create(source)
+        first = _publish_cold_revision(
+            storage,
+            workspace.workspace_id,
+            expected_revision=None,
+            content=b"cold idb 1",
+        )
+        second = _publish_cold_revision(
+            storage,
+            workspace.workspace_id,
+            expected_revision=first,
+            content=b"cold idb 2",
+        )
+        third = _publish_cold_revision(
+            storage,
+            workspace.workspace_id,
+            expected_revision=second,
+            content=b"cold idb 3",
+        )
+        application = Application(
+            config=config,
+            storage=storage,
+            changes=ChangeSetStore(paths.data_root / "change-sets"),
+            cursors=CursorCodec(paths.data_root / "cursor.key"),
+            backend=_FakeIdaBackend(workspace.sample_sha256),
+        )
+        result = await application.execute_tool(
+            "workspace.get",
+            WorkspaceGetInput(
+                workspace_id=workspace.workspace_id,
+                page_size=1,
+            ),
+        )
+        assert isinstance(result, WorkspaceGetOutput)
+        assert result.current_revision == third
+        assert result.next_cursor is not None
+        second_page = await application.execute_tool(
+            "workspace.get",
+            WorkspaceGetInput(
+                workspace_id=workspace.workspace_id,
+                cursor=result.next_cursor,
+                page_size=1,
+            ),
+        )
+        assert isinstance(second_page, WorkspaceGetOutput)
+        # retained_revisions=1 只保留 current 与 1 条历史(third、second), 丢弃 first;
+        # 最早保留的 second 的 parent 指向已回收的 first -> 历史被截断。
+        retained = {
+            revision.revision for page in (result, second_page) for revision in page.revisions
+        }
+        assert retained == {second, third}
+        assert first not in retained
+        assert result.history_truncated is True
+        assert second_page.history_truncated is True
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_get_detects_gap_before_pinned_history(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = AppConfig(storage=StorageConfig(retained_revisions=1))
+        paths = _paths(tmp_path)
+        storage = SupervisorStorage.open(config=config, paths=paths)
+        source = tmp_path / "sample.exe"
+        source.write_bytes(b"MZ" + b"\0" * 510)
+        workspace = storage.workspaces.create(source)
+        first = _publish_cold_revision(
+            storage,
+            workspace.workspace_id,
+            expected_revision=None,
+            content=b"cold idb 1",
+        )
+        storage.workspaces.pin_revision(workspace.workspace_id, first, pinned=True)
+        second = _publish_cold_revision(
+            storage,
+            workspace.workspace_id,
+            expected_revision=first,
+            content=b"cold idb 2",
+        )
+        third = _publish_cold_revision(
+            storage,
+            workspace.workspace_id,
+            expected_revision=second,
+            content=b"cold idb 3",
+        )
+        fourth = _publish_cold_revision(
+            storage,
+            workspace.workspace_id,
+            expected_revision=third,
+            content=b"cold idb 4",
+        )
+        application = Application(
+            config=config,
+            storage=storage,
+            changes=ChangeSetStore(paths.data_root / "change-sets"),
+            cursors=CursorCodec(paths.data_root / "cursor.key"),
+            backend=_FakeIdaBackend(workspace.sample_sha256),
+        )
+
+        result = await application.execute_tool(
+            "workspace.get",
+            WorkspaceGetInput(workspace_id=workspace.workspace_id),
+        )
+        assert isinstance(result, WorkspaceGetOutput)
+        assert {item.revision for item in result.revisions} == {first, third, fourth}
+        assert second not in {item.revision for item in result.revisions}
+        assert result.history_truncated is True
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+class _LifecycleBootstrapBackend(_FakeIdaBackend):
+    def __init__(
+        self,
+        sample_sha256: str,
+        *,
+        block_bootstrap: bool = False,
+        fail_bootstrap: bool = False,
+    ) -> None:
+        super().__init__(sample_sha256)
+        self.block_bootstrap = block_bootstrap
+        self.fail_bootstrap = fail_bootstrap
+        self.bootstrap_started = asyncio.Event()
+        self.allow_bootstrap = asyncio.Event()
+
+    async def bootstrap(
+        self,
+        *,
+        sample_path: Path,
+        staging_path: Path,
+        timeout_seconds: float,
+    ) -> JsonObject:
+        del sample_path, timeout_seconds
+        self.bootstrap_started.set()
+        if self.block_bootstrap:
+            await self.allow_bootstrap.wait()
+        if self.fail_bootstrap:
+            raise RuntimeError("sensitive bootstrap implementation detail")
+        staging_path.write_bytes(b"bootstrap idb")
+        return {"input_sha256": self.sample_sha256}
+
+
+class _LifecycleApplication(_TestApplication):
+    def schedule_initialization_for_test(
+        self,
+        workspace: WorkspaceSnapshot,
+        native_identity: NativeImageIdentity,
+    ) -> str:
+        return self._schedule_workspace_initialization(
+            workspace,
+            native_identity=native_identity,
+        )
+
+    async def acquire_workspace_lock_for_test(
+        self,
+        workspace_id: str,
+    ) -> AsyncInterprocessFileLock:
+        lock = self._workspace_lock(workspace_id)
+        await lock.acquire()
+        return lock
+
+    async def acquire_local_analysis_slot_for_test(self) -> None:
+        await self._analysis_slots.acquire()
+
+    def release_local_analysis_slot_for_test(self) -> None:
+        self._analysis_slots.release()
+
+    def workspace_summary_for_test(
+        self,
+        workspace: WorkspaceSnapshot,
+    ) -> WorkspaceSummary:
+        return self._workspace_summary(workspace)
+
+    async def close_runtime_resources_for_test(self) -> None:
+        await self._close_runtime_resources_once()
+
+
+def _lifecycle_application(
+    tmp_path: Path,
+    *,
+    paths: RuntimePaths | None = None,
+    block_bootstrap: bool = False,
+    fail_bootstrap: bool = False,
+) -> tuple[_LifecycleApplication, Path, _LifecycleBootstrapBackend]:
+    config = AppConfig(workers=WorkerConfig(analysis_limit=1))
+    runtime_paths = paths or _paths(tmp_path)
+    storage = SupervisorStorage.open(config=config, paths=runtime_paths)
+    source = tmp_path / f"lifecycle-{runtime_paths.session_data_root.name}.dll"
+    source.write_bytes(
+        (Path(__file__).parents[1] / "fixtures" / "bin" / "native_pe_x64.dll").read_bytes()
+    )
+    backend = _LifecycleBootstrapBackend(
+        hashlib.sha256(source.read_bytes()).hexdigest(),
+        block_bootstrap=block_bootstrap,
+        fail_bootstrap=fail_bootstrap,
+    )
+    application = _LifecycleApplication(
+        config=config,
+        storage=storage,
+        changes=ChangeSetStore(
+            runtime_paths.data_root / "change-sets",
+            workspace_lease_root=storage.workspaces.lease_root,
+        ),
+        cursors=CursorCodec(runtime_paths.data_root / "cursor.key"),
+        backend=backend,
+    )
+    return application, source, backend
+
+
+async def _wait_for_operation_state(
+    application: Application,
+    operation_id: str,
+    expected: str,
+) -> None:
+    async with asyncio.timeout(2):
+        while application.storage.operations.get(operation_id).state.value != expected:
+            await asyncio.sleep(0)
+
+
+async def _wait_for_analysis_outcome(
+    application: Application,
+    workspace_id: str,
+) -> None:
+    async with asyncio.timeout(2):
+        while application.storage.workspaces.get(workspace_id).analysis_outcome is None:
+            await asyncio.sleep(0)
+
+
+def test_workspace_summary_requires_consistent_analysis_outcome() -> None:
+    outcome = WorkspaceAnalysisOutcome(
+        state="cancelled",
+        reason="首次分析已取消",
+        recorded_at=1.0,
+    )
+
+    with pytest.raises(ValidationError, match="analysis_outcome"):
+        WorkspaceSummary.model_validate(
+            {
+                "workspace_id": "ws_test00",
+                "revision": None,
+                "sample_name": "sample.bin",
+                "sample_sha256": "0" * 64,
+                "architecture": None,
+                "state": "failed",
+            },
+            strict=True,
+        )
+    with pytest.raises(ValidationError, match="failed 状态"):
+        WorkspaceSummary(
+            workspace_id="ws_test00",
+            revision=None,
+            sample_name="sample.bin",
+            sample_sha256="0" * 64,
+            architecture=None,
+            state="unknown",
+            analysis_outcome=outcome,
+        )
+
+    schema = WorkspaceSummary.model_json_schema()
+    required = schema.get("required")
+    assert isinstance(required, list)
+    assert "analysis_outcome" in required
+
+    workspace_get_schema = WorkspaceGetOutput.model_json_schema()
+    workspace_get_required = workspace_get_schema.get("required")
+    assert isinstance(workspace_get_required, list)
+    assert "history_truncated" in workspace_get_required
+
+    image_schema = ImageSummary.model_json_schema()
+    format_schema = cast(dict[str, object], image_schema["properties"])["format"]
+    assert isinstance(format_schema, dict)
+    assert format_schema["enum"] == ["elf64", "pe32+", "unknown"]
+
+
+def test_workspace_create_queued_cancel_persists_public_outcome(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, source, backend = _lifecycle_application(tmp_path)
+        workspace = application.storage.workspaces.create(source)
+        operation_id = application.schedule_initialization_for_test(
+            workspace,
+            inspect_native_image(workspace.sample_path),
+        )
+
+        cancelled = application.storage.operations.cancel(operation_id)
+        assert cancelled.state.value == "cancelled"
+        await _wait_for_analysis_outcome(application, workspace.workspace_id)
+
+        summary = application.workspace_summary_for_test(
+            application.storage.workspaces.get(workspace.workspace_id)
+        )
+        assert summary.state == "failed"
+        assert summary.analysis_outcome is not None
+        assert summary.analysis_outcome.state == "cancelled"
+        assert summary.analysis_outcome.reason == "首次分析已取消"
+        assert backend.bootstrap_started.is_set() is False
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_create_cancel_while_waiting_for_workspace_lock(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        application, source, backend = _lifecycle_application(tmp_path)
+        workspace = application.storage.workspaces.create(source)
+        held_lock = await application.acquire_workspace_lock_for_test(workspace.workspace_id)
+        try:
+            operation_id = application.schedule_initialization_for_test(
+                workspace,
+                inspect_native_image(workspace.sample_path),
+            )
+            await _wait_for_operation_state(application, operation_id, "running")
+            cancelled = await application.execute_tool(
+                "operation.cancel",
+                OperationCancelInput(operation_id=operation_id),
+            )
+            assert isinstance(cancelled, OperationCancelOutput)
+            completed = await application.execute_tool(
+                "operation.wait",
+                OperationWaitInput(operation_id=operation_id, wait_ms=1_000),
+            )
+            assert isinstance(completed, OperationWaitOutput)
+            assert completed.state == "cancelled"
+        finally:
+            await held_lock.release()
+
+        outcome = application.storage.workspaces.get(workspace.workspace_id).analysis_outcome
+        assert outcome is not None
+        assert outcome.state == "cancelled"
+        assert outcome.reason == "首次分析已取消"
+        assert backend.bootstrap_started.is_set() is False
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_create_cancel_while_waiting_for_analysis_slot(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        application, source, backend = _lifecycle_application(tmp_path)
+        workspace = application.storage.workspaces.create(source)
+        await application.acquire_local_analysis_slot_for_test()
+        try:
+            operation_id = application.schedule_initialization_for_test(
+                workspace,
+                inspect_native_image(workspace.sample_path),
+            )
+            await _wait_for_operation_state(application, operation_id, "running")
+            cancelled = await application.execute_tool(
+                "operation.cancel",
+                OperationCancelInput(operation_id=operation_id),
+            )
+            assert isinstance(cancelled, OperationCancelOutput)
+            completed = await application.execute_tool(
+                "operation.wait",
+                OperationWaitInput(operation_id=operation_id, wait_ms=1_000),
+            )
+            assert isinstance(completed, OperationWaitOutput)
+            assert completed.state == "cancelled"
+        finally:
+            application.release_local_analysis_slot_for_test()
+
+        outcome = application.storage.workspaces.get(workspace.workspace_id).analysis_outcome
+        assert outcome is not None
+        assert outcome.state == "cancelled"
+        assert backend.bootstrap_started.is_set() is False
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_create_running_cancel_persists_cancelled_outcome(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        application, source, backend = _lifecycle_application(
+            tmp_path,
+            block_bootstrap=True,
+        )
+        started = await application.execute_tool(
+            "workspace.create",
+            WorkspaceCreateInput(sample_path=str(source)),
+        )
+        assert isinstance(started, WorkspaceCreateOutput)
+        await asyncio.wait_for(backend.bootstrap_started.wait(), timeout=2)
+
+        cancelled = await application.execute_tool(
+            "operation.cancel",
+            OperationCancelInput(operation_id=started.analysis_operation_id),
+        )
+        assert isinstance(cancelled, OperationCancelOutput)
+        assert cancelled.state == "cancel_requested"
+        completed = await application.execute_tool(
+            "operation.wait",
+            OperationWaitInput(operation_id=started.analysis_operation_id, wait_ms=1_000),
+        )
+        assert isinstance(completed, OperationWaitOutput)
+        assert completed.state == "cancelled"
+
+        summary = application.workspace_summary_for_test(
+            application.storage.workspaces.get(started.workspace_id)
+        )
+        assert summary.analysis_outcome is not None
+        assert summary.analysis_outcome.state == "cancelled"
+        assert summary.analysis_outcome.reason == "首次分析已取消"
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_create_service_close_persists_failed_outcome(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, source, backend = _lifecycle_application(
+            tmp_path,
+            block_bootstrap=True,
+        )
+        started = await application.execute_tool(
+            "workspace.create",
+            WorkspaceCreateInput(sample_path=str(source)),
+        )
+        assert isinstance(started, WorkspaceCreateOutput)
+        await asyncio.wait_for(backend.bootstrap_started.wait(), timeout=2)
+
+        await application.aclose()
+
+        operation = application.storage.operations.get(started.analysis_operation_id)
+        assert operation.state.value == "failed"
+        assert operation.failure is not None
+        assert operation.failure.message == "操作因服务关闭而中止"
+        outcome = application.storage.workspaces.get(started.workspace_id).analysis_outcome
+        assert outcome is not None
+        assert outcome.state == "failed"
+        assert outcome.reason == "操作因服务关闭而中止"
+
+    asyncio.run(scenario())
+
+
+def test_workspace_create_service_close_before_dispatch_is_failed(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        application, source, backend = _lifecycle_application(tmp_path)
+        workspace = application.storage.workspaces.create(source)
+        operation_id = application.schedule_initialization_for_test(
+            workspace,
+            inspect_native_image(workspace.sample_path),
+        )
+        assert application.storage.operations.get(operation_id).state.value == "queued"
+
+        # 直接执行关闭协程, 确保调度任务尚未获得事件循环时间片。
+        await application.close_runtime_resources_for_test()
+
+        operation = application.storage.operations.get(operation_id)
+        assert operation.state.value == "failed"
+        assert operation.failure is not None
+        assert operation.failure.code == "worker_crashed"
+        assert operation.failure.message == "操作因服务关闭而中止"
+        outcome = application.storage.workspaces.get(workspace.workspace_id).analysis_outcome
+        assert outcome is not None
+        assert outcome.state == "failed"
+        assert outcome.reason == "操作因服务关闭而中止"
+        assert backend.bootstrap_started.is_set() is False
+
+    asyncio.run(scenario())
+
+
+def test_workspace_create_late_cancel_after_publish_started_reports_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        application, source, _backend = _lifecycle_application(tmp_path)
+        publish_entered = threading.Event()
+        allow_publish = threading.Event()
+        original_publish = cast(
+            Callable[..., RevisionSnapshot],
+            application.storage.workspaces.publish_staging,
+        )
+
+        def blocked_publish(*args: object, **kwargs: object) -> RevisionSnapshot:
+            publish_entered.set()
+            if not allow_publish.wait(timeout=5):
+                raise TimeoutError("测试未释放首次分析 revision publish")
+            return original_publish(*args, **kwargs)
+
+        monkeypatch.setattr(
+            application.storage.workspaces,
+            "publish_staging",
+            blocked_publish,
+        )
+        try:
+            started = await application.execute_tool(
+                "workspace.create",
+                WorkspaceCreateInput(sample_path=str(source)),
+            )
+            assert isinstance(started, WorkspaceCreateOutput)
+            assert await asyncio.to_thread(publish_entered.wait, 2)
+
+            cancelled = await application.execute_tool(
+                "operation.cancel",
+                OperationCancelInput(operation_id=started.analysis_operation_id),
+            )
+            assert isinstance(cancelled, OperationCancelOutput)
+            assert cancelled.state == "cancel_requested"
+            allow_publish.set()
+
+            completed = await application.execute_tool(
+                "operation.wait",
+                OperationWaitInput(
+                    operation_id=started.analysis_operation_id,
+                    wait_ms=1_000,
+                ),
+            )
+            assert isinstance(completed, OperationWaitOutput)
+            assert completed.state == "succeeded"
+            workspace = application.storage.workspaces.get(started.workspace_id)
+            assert workspace.current_revision is not None
+            assert workspace.analysis_outcome is None
+            summary = application.workspace_summary_for_test(workspace)
+            assert summary.state == "ready"
+            assert summary.analysis_outcome is None
+        finally:
+            allow_publish.set()
+            await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_create_failure_is_sanitized_and_visible_across_sessions(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        first_paths = _session_paths(tmp_path, "session_first")
+        first, source, _backend = _lifecycle_application(
+            tmp_path,
+            paths=first_paths,
+            fail_bootstrap=True,
+        )
+        started = await first.execute_tool(
+            "workspace.create",
+            WorkspaceCreateInput(sample_path=str(source)),
+        )
+        assert isinstance(started, WorkspaceCreateOutput)
+        completed = await first.execute_tool(
+            "operation.wait",
+            OperationWaitInput(operation_id=started.analysis_operation_id, wait_ms=1_000),
+        )
+        assert isinstance(completed, OperationWaitOutput)
+        assert completed.state == "failed"
+        assert completed.failure is not None
+        assert completed.failure.message == "长操作失败"
+        await first.aclose()
+
+        second_paths = _session_paths(tmp_path, "session_second")
+        config = AppConfig(workers=WorkerConfig(analysis_limit=1))
+        second_storage = SupervisorStorage.open(config=config, paths=second_paths)
+        second = Application(
+            config=config,
+            storage=second_storage,
+            changes=ChangeSetStore(
+                second_paths.data_root / "change-sets",
+                workspace_lease_root=second_storage.workspaces.lease_root,
+            ),
+            cursors=CursorCodec(second_paths.data_root / "cursor.key"),
+            backend=_LifecycleBootstrapBackend(started.sample_sha256),
+        )
+        listed = await second.execute_tool("workspace.list", WorkspaceListInput())
+        assert isinstance(listed, WorkspaceListOutput)
+        summary = next(
+            item for item in listed.workspaces if item.workspace_id == started.workspace_id
+        )
+        assert summary.state == "failed"
+        assert summary.analysis_outcome is not None
+        assert summary.analysis_outcome.state == "failed"
+        assert summary.analysis_outcome.reason == "长操作失败"
+        assert "sensitive" not in summary.analysis_outcome.reason
+        assert summary.analysis_outcome.recorded_at > 0
+        await second.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_create_cancelled_outcome_is_visible_across_sessions(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        first_paths = _session_paths(tmp_path, "session_first")
+        first, source, backend = _lifecycle_application(
+            tmp_path,
+            paths=first_paths,
+            block_bootstrap=True,
+        )
+        started = await first.execute_tool(
+            "workspace.create",
+            WorkspaceCreateInput(sample_path=str(source)),
+        )
+        assert isinstance(started, WorkspaceCreateOutput)
+        await asyncio.wait_for(backend.bootstrap_started.wait(), timeout=2)
+
+        cancelled = await first.execute_tool(
+            "operation.cancel",
+            OperationCancelInput(operation_id=started.analysis_operation_id),
+        )
+        assert isinstance(cancelled, OperationCancelOutput)
+        completed = await first.execute_tool(
+            "operation.wait",
+            OperationWaitInput(operation_id=started.analysis_operation_id, wait_ms=1_000),
+        )
+        assert isinstance(completed, OperationWaitOutput)
+        assert completed.state == "cancelled"
+        await first.aclose()
+
+        second_paths = _session_paths(tmp_path, "session_second")
+        config = AppConfig(workers=WorkerConfig(analysis_limit=1))
+        second_storage = SupervisorStorage.open(config=config, paths=second_paths)
+        second = Application(
+            config=config,
+            storage=second_storage,
+            changes=ChangeSetStore(
+                second_paths.data_root / "change-sets",
+                workspace_lease_root=second_storage.workspaces.lease_root,
+            ),
+            cursors=CursorCodec(second_paths.data_root / "cursor.key"),
+            backend=_LifecycleBootstrapBackend(started.sample_sha256),
+        )
+        listed = await second.execute_tool("workspace.list", WorkspaceListInput())
+        assert isinstance(listed, WorkspaceListOutput)
+        summary = next(
+            item for item in listed.workspaces if item.workspace_id == started.workspace_id
+        )
+        assert summary.state == "failed"
+        assert summary.analysis_outcome is not None
+        assert summary.analysis_outcome.state == "cancelled"
+        assert summary.analysis_outcome.reason == "首次分析已取消"
+        assert summary.analysis_outcome.recorded_at > 0
+        await second.aclose()
 
     asyncio.run(scenario())

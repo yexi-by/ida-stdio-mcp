@@ -31,10 +31,27 @@ from ida_re_mcp.supervisor.backend import AnalysisBackend, DebugBackend
 from ida_re_mcp.supervisor.changes import ChangeSetStore
 from ida_re_mcp.supervisor.cursors import CursorCodec
 from ida_re_mcp.supervisor.storage import SupervisorStorage
-from ida_re_mcp.supervisor.workspaces import ColdValidationReceipt, hash_staging_payload
+from ida_re_mcp.supervisor.workspaces import (
+    ColdValidationReceipt,
+    ImageIdentity,
+    hash_staging_payload,
+)
 
 _SESSION_ID = "session_debug_events"
 _STOP_ID = "stop_debug_events"
+
+
+def _pe_image_identity() -> ImageIdentity:
+    return ImageIdentity.model_validate(
+        {
+            "container": "pe",
+            "architecture": "x86_64",
+            "bitness": 64,
+            "endian": "little",
+            "image_size": 0x4000,
+        },
+        strict=True,
+    )
 
 
 class _FakeDebugBackend:
@@ -239,6 +256,7 @@ def test_application_pages_all_debug_events_within_inline_budget(tmp_path: Path)
         receipt = ColdValidationReceipt.create(
             validator="fake_ida_9_3_headless",
             component_hashes=hash_staging_payload(staging),
+            image_identity=_pe_image_identity(),
         )
         revision = storage.workspaces.publish_staging(staging, receipt=receipt)
         backend = _FakeIdaBackend()
@@ -333,6 +351,7 @@ def test_application_stores_oversized_breakpoint_result_as_artifact(
         receipt = ColdValidationReceipt.create(
             validator="fake_ida_9_3_headless",
             component_hashes=hash_staging_payload(staging),
+            image_identity=_pe_image_identity(),
         )
         revision = storage.workspaces.publish_staging(staging, receipt=receipt)
         backend = _FakeIdaBackend()

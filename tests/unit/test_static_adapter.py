@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
+from typing import Literal, cast
 
 import pytest
 from pydantic import ValidationError
@@ -46,11 +48,15 @@ _REVISION = "revision_abcdef"
 _SAMPLE_SHA256 = "1" * 64
 
 
-def _context() -> AnalysisContext:
+def _context(
+    *,
+    native_container: Literal["elf", "pe"] | None = None,
+) -> AnalysisContext:
     return AnalysisContext(
         workspace_id=_WORKSPACE_ID,
         revision=_REVISION,
         sample_sha256=_SAMPLE_SHA256,
+        native_container=native_container,
     )
 
 
@@ -102,105 +108,105 @@ def test_program_overview_maps_identity_counts_and_coverage() -> None:
     with pytest.raises(StaticAdapterInputError):
         build_worker_requests("program.overview", args, limit_override=201)
 
+    raw_result = _raw(
+        {
+            "image": {
+                "input_name": "sample.exe",
+                "sha256": _SAMPLE_SHA256,
+                "imagebase": "0x140000000",
+                "minimum_address": "0x140001000",
+                "maximum_address": "0x140003000",
+                "processor": "metapc",
+                "architecture": "x86_64",
+                "image_size": 0x3000,
+                "bitness": 64,
+                "endianness": "little",
+                "container": "pe",
+            },
+            "segments": [
+                {
+                    "name": ".text",
+                    "class": "CODE",
+                    "start": "0x140001000",
+                    "end": "0x140002000",
+                    "permissions": ["read", "execute"],
+                    "bitness": 64,
+                }
+            ],
+            "entry_points": [
+                {
+                    "address": "0x140001000",
+                    "name": "entry",
+                }
+            ],
+            "exports": [
+                {
+                    "ordinal": 1,
+                    "address": "0x140001000",
+                    "name": "entry",
+                    "forwarder": "",
+                }
+            ],
+            "imports": [
+                {
+                    "module": "KERNEL32",
+                    "address": "0x140002000",
+                    "name": "ExitProcess",
+                    "ordinal": 0,
+                }
+            ],
+            "fixups": [
+                {
+                    "address": "0x140001020",
+                    "type": 1,
+                    "description": "fixup",
+                }
+            ],
+            "unwind_regions": [
+                {
+                    "start": "0x140001000",
+                    "end": "0x140001100",
+                    "kind": "unwind",
+                }
+            ],
+            "functions": [
+                {
+                    "address": "0x140001000",
+                    "name": "entry",
+                }
+            ],
+            "strings": [
+                {
+                    "address": "0x140001800",
+                    "value": "fixture",
+                    "length": 7,
+                }
+            ],
+            "counts": {
+                "segments": 1,
+                "entry_points": 1,
+                "exports": 1,
+                "import_modules": 1,
+                "imports": 1,
+                "functions": 4,
+                "strings": 2,
+                "fixups": 1,
+                "unwind_functions": 1,
+                "catch_functions": 0,
+            },
+            "coverage": {"complete": True, "limit": 200},
+        }
+    )
     output = adapt_worker_results(
         "program.overview",
         args,
-        [
-            _raw(
-                {
-                    "image": {
-                        "input_name": "sample.exe",
-                        "sha256": _SAMPLE_SHA256,
-                        "imagebase": "0x140000000",
-                        "minimum_address": "0x140001000",
-                        "maximum_address": "0x140003000",
-                        "processor": "metapc",
-                        "architecture": "x86_64",
-                        "image_size": 0x3000,
-                        "bitness": 64,
-                        "endianness": "little",
-                        "file_type": 11,
-                    },
-                    "segments": [
-                        {
-                            "name": ".text",
-                            "class": "CODE",
-                            "start": "0x140001000",
-                            "end": "0x140002000",
-                            "permissions": ["read", "execute"],
-                            "bitness": 64,
-                        }
-                    ],
-                    "entry_points": [
-                        {
-                            "address": "0x140001000",
-                            "name": "entry",
-                        }
-                    ],
-                    "exports": [
-                        {
-                            "ordinal": 1,
-                            "address": "0x140001000",
-                            "name": "entry",
-                            "forwarder": "",
-                        }
-                    ],
-                    "imports": [
-                        {
-                            "module": "KERNEL32",
-                            "address": "0x140002000",
-                            "name": "ExitProcess",
-                            "ordinal": 0,
-                        }
-                    ],
-                    "fixups": [
-                        {
-                            "address": "0x140001020",
-                            "type": 1,
-                            "description": "fixup",
-                        }
-                    ],
-                    "unwind_regions": [
-                        {
-                            "start": "0x140001000",
-                            "end": "0x140001100",
-                            "kind": "unwind",
-                        }
-                    ],
-                    "functions": [
-                        {
-                            "address": "0x140001000",
-                            "name": "entry",
-                        }
-                    ],
-                    "strings": [
-                        {
-                            "address": "0x140001800",
-                            "value": "fixture",
-                            "length": 7,
-                        }
-                    ],
-                    "counts": {
-                        "segments": 1,
-                        "entry_points": 1,
-                        "exports": 1,
-                        "import_modules": 1,
-                        "imports": 1,
-                        "functions": 4,
-                        "strings": 2,
-                        "fixups": 1,
-                        "unwind_functions": 1,
-                        "catch_functions": 0,
-                    },
-                    "coverage": {"complete": True, "limit": 200},
-                }
-            )
-        ],
-        _context(),
+        [raw_result],
+        _context(native_container="pe"),
     )
     assert isinstance(output, ProgramOverviewOutput)
     assert output.image.sha256 == _SAMPLE_SHA256
     assert output.image.architecture == "x86_64"
+    assert output.image.format == "pe32+"
     assert output.image.image_size == 0x3000
     assert output.counts.functions == 4
     assert output.segments[0].permissions == "r-x"
@@ -211,6 +217,38 @@ def test_program_overview_maps_identity_counts_and_coverage() -> None:
     assert output.functions[0].name == "entry"
     assert output.strings[0].preview == "fixture"
     assert output.coverage.status == "complete"
+
+    with pytest.raises(StaticAdapterResultError, match="container"):
+        adapt_worker_results(
+            "program.overview",
+            args,
+            [raw_result],
+            _context(native_container="elf"),
+        )
+
+    elf_result = deepcopy(raw_result)
+    elf_image = cast(dict[str, object], elf_result["image"])
+    elf_image["container"] = "elf"
+    elf_output = adapt_worker_results(
+        "program.overview",
+        args,
+        [elf_result],
+        _context(native_container="elf"),
+    )
+    assert isinstance(elf_output, ProgramOverviewOutput)
+    assert elf_output.image.format == "elf64"
+
+    unknown_result = deepcopy(raw_result)
+    unknown_image = cast(dict[str, object], unknown_result["image"])
+    unknown_image["container"] = "unknown"
+    unknown_output = adapt_worker_results(
+        "program.overview",
+        args,
+        [unknown_result],
+        _context(),
+    )
+    assert isinstance(unknown_output, ProgramOverviewOutput)
+    assert unknown_output.image.format == "unknown"
 
 
 def test_program_search_uses_one_global_ordered_page_and_reports_exact_advance() -> None:

@@ -135,13 +135,30 @@ class WorkspaceListInput(StrictModel):
     page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
 
 
+class WorkspaceAnalysisOutcome(StrictModel):
+    """首次分析未成功时可安全公开的持久化终态。"""
+
+    state: Literal["failed", "cancelled"]
+    reason: str = Field(min_length=1, max_length=2_048)
+    recorded_at: float = Field(ge=0, allow_inf_nan=False)
+
+
 class WorkspaceSummary(StrictModel):
     workspace_id: WorkspaceId
     revision: RevisionId | None = None
     sample_name: str
     sample_sha256: Sha256
     architecture: str | None = None
-    state: Literal["analyzing", "ready", "failed"]
+    # unknown 表示当前会话无法证明 workspace 仍在分析(例如 Supervisor 曾被强杀,
+    # 或该 workspace 属于另一条活动连接), 用以替代永久回落到 analyzing 的谎报.
+    state: Literal["analyzing", "ready", "failed", "unknown"]
+    analysis_outcome: WorkspaceAnalysisOutcome | None
+
+    @model_validator(mode="after")
+    def validate_analysis_outcome(self) -> Self:
+        if (self.state == "failed") != (self.analysis_outcome is not None):
+            raise ValueError("failed 状态必须且只能携带 analysis_outcome")
+        return self
 
 
 class WorkspaceListOutput(StrictModel):
@@ -173,6 +190,9 @@ class WorkspaceGetOutput(StrictModel):
     endian: Literal["little", "big"]
     revisions: list[RevisionSummary] = Field(max_length=MAX_PAGE_SIZE)
     next_cursor: Cursor | None = None
+    # 早于 GC 保留窗口的 revision 被回收后, 最早一条 parent_revision 会悬挂;
+    # 该标志让调用方区分“历史完整”与“更早历史已被回收”, 不把 next_cursor=None 误读为全量.
+    history_truncated: bool
 
 
 class WorkspaceExportInput(StrictModel):
@@ -204,7 +224,7 @@ class ProgramOverviewInput(StaticQuery):
 
 class ImageSummary(StrictModel):
     image_id: ImageId
-    format: str
+    format: Literal["elf64", "pe32+", "unknown"]
     architecture: Literal["x86_64", "aarch64"]
     bitness: Literal[32, 64]
     endian: Literal["little", "big"]

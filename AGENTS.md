@@ -25,6 +25,22 @@
 - mutation 失败、取消或 worker 崩溃不得改变已发布 revision、HEAD 或样本摘要。
 - GC 永不删除 current revision 或 pinned export。
 
+## 本机 MCP 开发入口
+
+- 本机 Codex、Claude Code 与 OpenCode 的 `ida-re-mcp` 开发入口必须通过持久
+  `C:\Users\夜袭\.local\bin\uv.exe` 从 `D:\work\ida-stdio-mcp` 当前工作树启动：
+  `C:\Users\夜袭\.local\bin\uv.exe run --locked --directory D:\work\ida-stdio-mcp ida-re-mcp serve --config C:\Users\夜袭\AppData\Roaming\ida-re-mcp\config.toml`。
+- 三个客户端必须设置
+  `UV_PROJECT_ENVIRONMENT=C:\Users\夜袭\AppData\Local\ida-re-mcp\dev-venv`，确保开发虚拟环境位于工作树外。
+- 本机开发入口不得指向 `CodexHome\runtimes` 中的预构建 wheel 环境；该环境只用于
+  wheel 隔离安装与发布候选验收。Claude Code 不得保留旧的 `ida-stdio-mcp` 条目。
+- 执行 IDA 门禁前，先从上述服务配置的 `[runtime].ida_dir` 解析安装目录，显式为测试
+  进程设置 `IDADIR` 并运行
+  `C:\Users\夜袭\.local\bin\uv.exe run --locked --directory D:\work\ida-stdio-mcp ida-re-mcp doctor --config C:\Users\夜袭\AppData\Roaming\ida-re-mcp\config.toml`；
+  不得仅因父进程没有 `IDADIR` 就判定 IDA 不可用。
+- Windows IDALib E2E 必须使用工作树外的短 data、log 与 pytest basetemp 路径，避免
+  私有 checkout 接近传统 `MAX_PATH` 后由 `idapro.open_database()` 返回失败。
+
 ## 工程与验证
 
 - 运行时固定为 Python 3.13，项目使用 uv、Ruff、basedpyright strict 与 pytest。

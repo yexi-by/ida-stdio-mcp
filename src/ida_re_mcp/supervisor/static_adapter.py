@@ -111,6 +111,8 @@ _OVERVIEW_SECTIONS: Final = frozenset(
         "strings",
     }
 )
+# 把 worker 报告的稳定容器族映射为公开格式串; 当前边界只接受 64 位镜像.
+_NATIVE_CONTAINER_FORMATS: Final = {"elf": "elf64", "pe": "pe32+"}
 
 
 class StaticAdapterError(RuntimeError):
@@ -135,6 +137,7 @@ class AnalysisContext(StrictModel):
     workspace_id: WorkspaceId
     revision: RevisionId
     sample_sha256: Sha256
+    native_container: Literal["elf", "pe"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1013,6 +1016,10 @@ def _adapt_program_overview(
         != image_size
     ):
         raise StaticAdapterResultError("worker image_size 与 image range 不一致")
+    raw_container = _text(image.get("container"), "program.overview.image.container")
+    if context.native_container is not None and raw_container != context.native_container:
+        raise StaticAdapterResultError("worker container 与 Native 预检身份不一致")
+    trusted_container = context.native_container or raw_container
     coverage = _coverage((raw,))
     provenance = _provenance(
         context,
@@ -1025,16 +1032,7 @@ def _adapt_program_overview(
         {
             "image": {
                 "image_id": f"image~{context.sample_sha256}",
-                "format": (
-                    "ida-filetype-"
-                    + str(
-                        _integer(
-                            image.get("file_type"),
-                            "program.overview.image.file_type",
-                            minimum=0,
-                        )
-                    )
-                ),
+                "format": _NATIVE_CONTAINER_FORMATS.get(trusted_container, "unknown"),
                 "architecture": architecture,
                 "bitness": bitness,
                 "endian": _text(

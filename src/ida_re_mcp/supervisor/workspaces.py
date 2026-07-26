@@ -17,7 +17,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, JsonValue, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, model_validator
 
 from ida_re_mcp.constants import (
     DEFAULT_RETAINED_REVISIONS,
@@ -50,12 +50,46 @@ _STAGING_MANIFEST_NAME = "stage.json"
 _SAMPLE_NAME = "sample.bin"
 
 
+class ImageIdentity(BaseModel):
+    """冷验证已证明的原生镜像身份, 随 revision manifest 一并持久化。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    container: Literal["elf", "pe"]
+    architecture: Literal["x86_64", "aarch64"]
+    bitness: Literal[64]
+    endian: Literal["little"]
+    image_size: int = Field(ge=1)
+
+
+class _LegacyImageIdentity(BaseModel):
+    """缺少 container 的中间版本身份; 只用于严格读取与冲突检测。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    architecture: Literal["x86_64", "aarch64"]
+    bitness: Literal[64]
+    endian: Literal["little"]
+    image_size: int = Field(ge=1)
+
+
+class AnalysisOutcome(BaseModel):
+    """首次分析的持久化终态; 位于共享 workspace manifest, 跨会话可见。"""
+
+    model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
+
+    state: Literal["failed", "cancelled"]
+    reason: str = Field(min_length=1, max_length=2_048)
+    recorded_at: float = Field(ge=0, allow_inf_nan=False)
+
+
 @dataclass(frozen=True, slots=True)
 class ColdValidationReceipt:
     """worker 冷启动验证后返回、由 Supervisor 复核的内容摘要。"""
 
     validator: str
     component_hashes: Mapping[str, str]
+    image_identity: ImageIdentity
 
     @classmethod
     def create(
@@ -63,10 +97,15 @@ class ColdValidationReceipt:
         *,
         validator: str,
         component_hashes: Mapping[str, str],
+        image_identity: ImageIdentity,
     ) -> ColdValidationReceipt:
         validate_identifier(validator, field="validator")
         checked = _validate_component_hashes(component_hashes)
-        return cls(validator=validator, component_hashes=MappingProxyType(checked))
+        return cls(
+            validator=validator,
+            component_hashes=MappingProxyType(checked),
+            image_identity=_strict_image_identity(image_identity),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +124,8 @@ class RevisionSnapshot:
     operation_result: Mapping[str, JsonValue] | None
     pinned: bool
     path: Path
+    image_identity: ImageIdentity | None = None
+    legacy_image_identity: _LegacyImageIdentity | None = None
 
     @property
     def database_path(self) -> Path:
@@ -103,6 +144,7 @@ class WorkspaceSnapshot:
     current_revision: str | None
     sample_path: Path
     revisions: tuple[RevisionSnapshot, ...]
+    analysis_outcome: AnalysisOutcome | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +200,8 @@ class _WorkspaceManifest(BaseModel):
     current_revision: str | None
     revision_ids: list[str]
     pinned_revisions: list[str]
+    # 可选; 记录首次分析的持久化失败/取消终态, 供 workspace.list 跨会话诚实报告状态.
+    analysis_outcome: AnalysisOutcome | None = None
 
 
 class _RevisionManifest(BaseModel):
@@ -174,6 +218,8 @@ class _RevisionManifest(BaseModel):
     change_id: str | None
     operation_id: str | None
     operation_result: dict[str, JsonValue] | None
+    # 可选; 旧 manifest 可完全缺失身份, 中间版本也可能只缺 container.
+    image_identity: ImageIdentity | _LegacyImageIdentity | None = None
 
     @model_validator(mode="after")
     def validate_operation_commit(self) -> Self:
@@ -374,6 +420,33 @@ class WorkspaceRegistry:
             with self._locks_guard:
                 self._sample_identities.pop(workspace_id, None)
 
+    def record_analysis_outcome(
+        self,
+        workspace_id: str,
+        *,
+        state: Literal["failed", "cancelled"],
+        reason: str,
+    ) -> None:
+        """把首次分析的持久化终态写入共享 workspace manifest。
+
+        已发布 revision 的 workspace 视为成功, 不接受失败/取消标记。
+        """
+
+        workspace_id = validate_identifier(workspace_id, field="workspace_id")
+        clean_reason = reason.strip()[:2_048] or state
+        lock = self._lock_for(workspace_id)
+        with lock:
+            manifest = self._read_workspace_manifest(workspace_id)
+            if manifest.current_revision is not None:
+                return
+            outcome = AnalysisOutcome(
+                state=state,
+                reason=clean_reason,
+                recorded_at=time.time(),
+            )
+            next_manifest = manifest.model_copy(update={"analysis_outcome": outcome})
+            self._commit_manifest(workspace_id, next_manifest)
+
     def get_revision(self, workspace_id: str, revision: str) -> RevisionSnapshot:
         workspace_id = validate_identifier(workspace_id, field="workspace_id")
         revision = validate_identifier(revision, field="revision")
@@ -530,6 +603,7 @@ class WorkspaceRegistry:
         operation_id: str | None,
         operation_result: Mapping[str, JsonValue] | None,
     ) -> RevisionSnapshot:
+        image_identity = _strict_image_identity(receipt.image_identity)
         if change_id is not None:
             validate_identifier(change_id, field="change_id")
         if operation_id is not None:
@@ -572,6 +646,7 @@ class WorkspaceRegistry:
                 change_id=change_id,
                 operation_id=operation_id,
                 operation_result=(dict(operation_result) if operation_result is not None else None),
+                image_identity=image_identity,
             )
             for revision in manifest.revision_ids:
                 existing_revision = self._read_revision_manifest(workspace_id, revision)
@@ -601,6 +676,7 @@ class WorkspaceRegistry:
                     update={
                         "current_revision": staging.candidate_revision,
                         "revision_ids": [revision for revision in revision_ids if revision in keep],
+                        "analysis_outcome": None,
                     }
                 )
                 published = RevisionSnapshot(
@@ -620,6 +696,7 @@ class WorkspaceRegistry:
                     ),
                     pinned=False,
                     path=target,
+                    image_identity=image_identity,
                 )
                 self._commit_manifest(workspace_id, next_manifest)
                 committed = True
@@ -991,6 +1068,7 @@ class WorkspaceRegistry:
             current_revision=manifest.current_revision,
             sample_path=sample_path,
             revisions=revisions,
+            analysis_outcome=manifest.analysis_outcome,
         )
 
     def _read_staging_manifest(self, path: Path) -> _StagingManifest:
@@ -1019,6 +1097,7 @@ class WorkspaceRegistry:
             actual_hashes = _hash_payload(path)
             if actual_hashes != manifest.component_hashes:
                 raise StorageCorruptionError(f"revision 内容摘要校验失败: {revision}")
+        image_identity = manifest.image_identity
         return RevisionSnapshot(
             workspace_id=workspace_id,
             revision=revision,
@@ -1036,6 +1115,10 @@ class WorkspaceRegistry:
             ),
             pinned=pinned,
             path=path,
+            image_identity=(image_identity if isinstance(image_identity, ImageIdentity) else None),
+            legacy_image_identity=(
+                image_identity if isinstance(image_identity, _LegacyImageIdentity) else None
+            ),
         )
 
     def _read_revision_manifest(
@@ -1158,6 +1241,13 @@ def _validate_component_hashes(values: Mapping[str, str]) -> dict[str, str]:
     return checked
 
 
+def _strict_image_identity(value: object) -> ImageIdentity:
+    """从普通字段重新严格构造身份, 拒绝 model_construct 等绕过路径。"""
+
+    ordinary = value.model_dump(mode="python") if isinstance(value, ImageIdentity) else value
+    return ImageIdentity.model_validate(ordinary, strict=True)
+
+
 def _validate_workspace_manifest(
     manifest: _WorkspaceManifest,
     workspace_id: str,
@@ -1184,6 +1274,8 @@ def _validate_workspace_manifest(
         validate_identifier(manifest.current_revision, field="current_revision")
         if manifest.current_revision not in manifest.revision_ids:
             raise StorageCorruptionError("current_revision 未被 manifest 引用")
+        if manifest.analysis_outcome is not None:
+            raise StorageCorruptionError("已发布 revision 的 workspace 不得携带分析失败终态")
     elif manifest.revision_ids:
         raise StorageCorruptionError("包含 revision 的 workspace 缺少 HEAD")
     if not set(manifest.pinned_revisions).issubset(manifest.revision_ids):
@@ -1258,6 +1350,11 @@ def _workspace_dict(manifest: _WorkspaceManifest) -> dict[str, object]:
         "current_revision": manifest.current_revision,
         "revision_ids": manifest.revision_ids,
         "pinned_revisions": manifest.pinned_revisions,
+        "analysis_outcome": (
+            manifest.analysis_outcome.model_dump(mode="json")
+            if manifest.analysis_outcome is not None
+            else None
+        ),
     }
 
 
@@ -1274,6 +1371,11 @@ def _revision_dict(manifest: _RevisionManifest) -> dict[str, object]:
         "change_id": manifest.change_id,
         "operation_id": manifest.operation_id,
         "operation_result": manifest.operation_result,
+        "image_identity": (
+            manifest.image_identity.model_dump(mode="json")
+            if manifest.image_identity is not None
+            else None
+        ),
     }
 
 

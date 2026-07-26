@@ -21,6 +21,9 @@ expected bytes，且 replacement bytes 与其长度一致并非空。撤销使�
 
 ## IL2CPP bundle
 
+逐字段格式规范、canonical NDJSON 约束与完整示例见
+[il2cpp-bundle-format.md](il2cpp-bundle-format.md)。本节只描述事务侧规则。
+
 MIME 固定为 `application/vnd.ida-re.il2cpp-bundle+ndjson`。记录按以下顺序出现：
 
 1. manifest；

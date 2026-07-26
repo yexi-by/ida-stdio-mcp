@@ -63,6 +63,11 @@ class _FakeHandler:
                 "revision 已改变",
                 details={"current_revision": "revision_current"},
             )
+        if name == "not_found.echo":
+            raise ToolExecutionError(
+                BusinessErrorCode.REVISION_NOT_FOUND,
+                "revision 不存在或已被 GC 回收",
+            )
         if name == "internal.echo":
             raise RuntimeError("sensitive-internal-detail")
         typed = cast(_EchoInput, arguments)
@@ -135,6 +140,7 @@ def _runtime(handler: _FakeHandler | None = None) -> tuple[McpRuntime, _FakeHand
                 "z.echo",
                 "internal.echo",
                 "business.echo",
+                "not_found.echo",
                 "a.echo",
             )
         ),
@@ -185,6 +191,7 @@ def test_official_list_tools_is_sorted_and_uses_closed_strict_schemas() -> None:
             "a.echo",
             "business.echo",
             "internal.echo",
+            "not_found.echo",
             "z.echo",
         ]
         for tool in tools:
@@ -258,6 +265,20 @@ def test_official_call_tool_preserves_business_error() -> None:
             "code": "revision_conflict",
             "message": "revision 已改变",
             "details": {"current_revision": "revision_current"},
+        }
+
+    asyncio.run(scenario())
+
+
+def test_official_call_tool_preserves_revision_not_found() -> None:
+    async def scenario() -> None:
+        runtime, _handler = _runtime()
+        payload = _error_payload(await _call_tool(runtime, "not_found.echo", {"value": "input"}))
+
+        assert payload == {
+            "code": "revision_not_found",
+            "message": "revision 不存在或已被 GC 回收",
+            "details": {},
         }
 
     asyncio.run(scenario())

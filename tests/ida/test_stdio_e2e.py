@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import shutil
 import sys
 from collections.abc import AsyncGenerator
@@ -17,6 +18,15 @@ from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
 
 JsonObject = dict[str, object]
+
+
+@pytest.fixture
+def stdio_runtime_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """为 IDALib 链路提供工作树外且不含测试长名的短运行根。"""
+
+    root = tmp_path_factory.mktemp("s")
+    assert not root.is_relative_to(Path(__file__).resolve().parents[2])
+    return root
 
 
 def _tree_identity(root: Path) -> dict[str, str]:
@@ -113,18 +123,18 @@ async def _wait_operation(
 
 @pytest.mark.ida
 def test_real_stdio_static_and_transaction_chain(
-    tmp_path: Path,
+    stdio_runtime_root: Path,
     ida_environment: dict[str, str],
     fixture_directory: Path,
 ) -> None:
     async def scenario() -> None:
         fixture_before = _tree_identity(fixture_directory)
-        sample = tmp_path / "native_pe_x64.dll"
+        sample = stdio_runtime_root / "native_pe_x64.dll"
         shutil.copyfile(fixture_directory / sample.name, sample)
-        runtime = tmp_path / "runtime"
+        runtime = stdio_runtime_root / "runtime"
         async with _official_session(
             environment=_environment(ida_environment, runtime),
-            stderr_path=tmp_path / "static-stdio-stderr.log",
+            stderr_path=stdio_runtime_root / "static-stdio-stderr.log",
         ) as client:
             created = await _call_tool(
                 client,
@@ -138,6 +148,29 @@ def test_real_stdio_static_and_transaction_chain(
                 operation_id=operation_id,
             )
             revision = cast(str, initialized["revision"])
+            listed = await _call_tool(
+                client,
+                name="workspace.list",
+                arguments={},
+            )
+            summaries = cast(list[JsonObject], listed["workspaces"])
+            summary = next(item for item in summaries if item["workspace_id"] == workspace_id)
+            assert summary["state"] == "ready"
+            assert summary["architecture"] == "x86_64"
+            assert summary["analysis_outcome"] is None
+
+            overview = await _call_tool(
+                client,
+                name="program.overview",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": revision,
+                    "include": ["unwind"],
+                },
+            )
+            image = cast(JsonObject, overview["image"])
+            assert image["format"] == "pe32+"
+            expected_image_size = cast(int, image["image_size"])
 
             searched = await _call_tool(
                 client,
@@ -198,7 +231,189 @@ def test_real_stdio_static_and_transaction_chain(
                 "agent_verified_entry" in cast(str, item["preview"])
                 for item in cast(list[JsonObject], verified["matches"])
             )
+        revision_manifests = [
+            cast(JsonObject, json.loads(path.read_text(encoding="utf-8")))
+            for path in runtime.rglob("revision.json")
+        ]
+        assert len(revision_manifests) == 2
+        for manifest in revision_manifests:
+            identity = cast(JsonObject, manifest["image_identity"])
+            assert identity == {
+                "architecture": "x86_64",
+                "bitness": 64,
+                "container": "pe",
+                "endian": "little",
+                "image_size": expected_image_size,
+            }
         assert _tree_identity(fixture_directory) == fixture_before
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.ida
+def test_real_stdio_il2cpp_bundle_prepare_apply_and_publish(
+    stdio_runtime_root: Path,
+    ida_environment: dict[str, str],
+    fixture_directory: Path,
+) -> None:
+    async def scenario() -> None:
+        sample = stdio_runtime_root / "il2cpp_pe_x64.dll"
+        shutil.copyfile(fixture_directory / sample.name, sample)
+        bundle = fixture_directory.parent / "src" / "il2cpp_bundle_example.ndjson"
+        metadata = fixture_directory / "il2cpp_metadata_fingerprint.bin"
+        runtime = stdio_runtime_root / "runtime"
+        async with _official_session(
+            environment=_environment(ida_environment, runtime),
+            stderr_path=stdio_runtime_root / "il2cpp-stdio-stderr.log",
+        ) as client:
+            created = await _call_tool(
+                client,
+                name="workspace.create",
+                arguments={"sample_path": str(sample)},
+            )
+            workspace_id = cast(str, created["workspace_id"])
+            initialized = await _wait_operation(
+                client,
+                operation_id=cast(str, created["analysis_operation_id"]),
+            )
+            revision = cast(str, initialized["revision"])
+
+            prepared = await _call_tool(
+                client,
+                name="change.prepare",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "base_revision": revision,
+                    "operations": [
+                        {
+                            "kind": "import_il2cpp_bundle",
+                            "bundle_path": str(bundle),
+                            "bundle_sha256": hashlib.sha256(bundle.read_bytes()).hexdigest(),
+                            "metadata_path": str(metadata),
+                            "metadata_sha256": hashlib.sha256(metadata.read_bytes()).hexdigest(),
+                            "type_resolutions": [],
+                        }
+                    ],
+                },
+            )
+            impact = cast(JsonObject, prepared["impact"])
+            assert impact["conflicts"] == []
+            applied = await _call_tool(
+                client,
+                name="change.apply",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "expected_revision": revision,
+                    "change_set_id": prepared["change_set_id"],
+                    "digest": prepared["digest"],
+                },
+            )
+            next_revision = cast(str, applied["revision"])
+            assert next_revision != revision
+
+            actor = await _call_tool(
+                client,
+                name="type.inspect",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": next_revision,
+                    "type": {"kind": "name", "name": "Game::Actor"},
+                },
+            )
+            assert actor["kind"] == "struct"
+            assert actor["size"] == 32
+            assert [
+                (
+                    field["name"],
+                    field["offset_bits"],
+                    field["size_bits"],
+                )
+                for field in cast(list[JsonObject], actor["fields"])
+            ] == [
+                ("klass", 0, 64),
+                ("monitor", 64, 64),
+                ("instance_id", 128, 32),
+                ("position", 160, 96),
+            ]
+
+        manifests = [
+            cast(JsonObject, json.loads(path.read_text(encoding="utf-8")))
+            for path in runtime.rglob("revision.json")
+        ]
+        assert len(manifests) == 2
+        mutation_manifest = next(
+            manifest for manifest in manifests if manifest["parent_revision"] == revision
+        )
+        identity = cast(JsonObject, mutation_manifest["image_identity"])
+        assert identity["container"] == "pe"
+        assert identity["architecture"] == "x86_64"
+        assert identity["bitness"] == 64
+        assert identity["endian"] == "little"
+        assert isinstance(identity["image_size"], int)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.ida
+def test_real_stdio_elf_overview_reports_container_capability_boundary(
+    stdio_runtime_root: Path,
+    ida_environment: dict[str, str],
+    fixture_directory: Path,
+) -> None:
+    async def scenario() -> None:
+        sample = stdio_runtime_root / "native_elf_x64.so"
+        shutil.copyfile(fixture_directory / sample.name, sample)
+        async with _official_session(
+            environment=_environment(ida_environment, stdio_runtime_root / "runtime"),
+            stderr_path=stdio_runtime_root / "elf-stdio-stderr.log",
+        ) as client:
+            created = await _call_tool(
+                client,
+                name="workspace.create",
+                arguments={"sample_path": str(sample)},
+            )
+            workspace_id = cast(str, created["workspace_id"])
+            initialized = await _wait_operation(
+                client,
+                operation_id=cast(str, created["analysis_operation_id"]),
+            )
+            revision = cast(str, initialized["revision"])
+
+            with_unwind = await _call_tool(
+                client,
+                name="program.overview",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": revision,
+                    "include": ["unwind"],
+                },
+            )
+            image = cast(JsonObject, with_unwind["image"])
+            coverage = cast(JsonObject, with_unwind["coverage"])
+            assert image["format"] == "elf64"
+            assert coverage["status"] == "partial"
+            assert coverage["truncated"] is False
+            assert "unwind_unsupported_for_elf_eh_frame" in cast(
+                list[str],
+                coverage["reasons"],
+            )
+
+            without_unwind = await _call_tool(
+                client,
+                name="program.overview",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": revision,
+                    "include": ["segments"],
+                },
+            )
+            complete_coverage = cast(JsonObject, without_unwind["coverage"])
+            assert complete_coverage["status"] == "complete"
+            assert complete_coverage["truncated"] is False
+            assert "unwind_unsupported_for_elf_eh_frame" not in cast(
+                list[str],
+                complete_coverage["reasons"],
+            )
 
     asyncio.run(scenario())
 
@@ -206,17 +421,17 @@ def test_real_stdio_static_and_transaction_chain(
 @pytest.mark.ida
 @pytest.mark.debugger
 def test_real_stdio_debug_chain(
-    tmp_path: Path,
+    stdio_runtime_root: Path,
     ida_environment: dict[str, str],
     fixture_directory: Path,
 ) -> None:
     async def scenario() -> None:
         fixture_before = _tree_identity(fixture_directory)
-        sample = tmp_path / "debug_target_x64.exe"
+        sample = stdio_runtime_root / "debug_target_x64.exe"
         shutil.copyfile(fixture_directory / sample.name, sample)
         async with _official_session(
-            environment=_environment(ida_environment, tmp_path / "runtime"),
-            stderr_path=tmp_path / "debug-stdio-stderr.log",
+            environment=_environment(ida_environment, stdio_runtime_root / "runtime"),
+            stderr_path=stdio_runtime_root / "debug-stdio-stderr.log",
         ) as client:
             created = await _call_tool(
                 client,

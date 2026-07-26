@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
@@ -12,6 +13,7 @@ from pydantic import JsonValue
 
 from ida_re_mcp.supervisor import (
     ColdValidationReceipt,
+    ImageIdentity,
     RevisionConflictError,
     RevisionSnapshot,
     StagingIntegrityError,
@@ -19,6 +21,31 @@ from ida_re_mcp.supervisor import (
     WorkspaceRegistry,
     hash_staging_payload,
 )
+from ida_re_mcp.supervisor._fs import atomic_write_json
+
+
+def _pe_image_identity() -> ImageIdentity:
+    return ImageIdentity.model_validate(
+        {
+            "container": "pe",
+            "architecture": "x86_64",
+            "bitness": 64,
+            "endian": "little",
+            "image_size": 0x4000,
+        },
+        strict=True,
+    )
+
+
+def _invalid_image_identity() -> ImageIdentity:
+    return ImageIdentity.model_construct(
+        container="macho",
+        architecture="x86_64",
+        bitness=64,
+        endian="little",
+        image_size=0x4000,
+    )
+
 
 _LOCK_PROBE = """
 from pathlib import Path
@@ -50,6 +77,7 @@ import time
 
 from ida_re_mcp.supervisor import (
     ColdValidationReceipt,
+    ImageIdentity,
     RevisionConflictError,
     WorkspaceRegistry,
     hash_staging_payload,
@@ -74,6 +102,16 @@ staging.database_path.write_bytes((unit * (size // len(unit) + 1))[:size])
 receipt = ColdValidationReceipt.create(
     validator="cold.worker",
     component_hashes=hash_staging_payload(staging),
+    image_identity=ImageIdentity.model_validate(
+        {
+            "container": "pe",
+            "architecture": "x86_64",
+            "bitness": 64,
+            "endian": "little",
+            "image_size": 0x4000,
+        },
+        strict=True,
+    ),
 )
 ready.write_text("ready", encoding="ascii")
 deadline = time.monotonic() + 30
@@ -145,6 +183,7 @@ def _publish(
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
     return registry.publish_staging(staging, receipt=receipt)
 
@@ -219,6 +258,7 @@ def test_revision_commit_receipt_survives_cold_registry_reopen(tmp_path: Path) -
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
     operation_result: dict[str, JsonValue] = {
         "workspace_id": workspace_id,
@@ -272,6 +312,7 @@ def test_publish_rejects_unpaired_operation_commit_receipt(
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
 
     with pytest.raises(ValueError, match="operation_id 与 operation_result 必须同时存在"):
@@ -296,6 +337,7 @@ def test_publish_rejects_operation_result_bound_to_another_revision(
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
 
     with pytest.raises(ValueError, match="绑定当前 workspace/revision"):
@@ -325,6 +367,7 @@ def test_cold_reopen_rejects_corrupt_revision_commit_manifest(
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
     published = registry.publish_staging(
         staging,
@@ -386,6 +429,7 @@ def test_publish_does_not_perform_fallible_readback_after_manifest_commit(
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
 
     def reject_post_commit_readback(*_args: object, **_kwargs: object) -> None:
@@ -452,10 +496,12 @@ def test_revision_cas_allows_only_one_writer(tmp_path: Path) -> None:
     first_receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(first),
+        image_identity=_pe_image_identity(),
     )
     second_receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(second),
+        image_identity=_pe_image_identity(),
     )
 
     winner = registry.publish_staging(first, receipt=first_receipt)
@@ -474,6 +520,7 @@ def test_hash_mismatch_discards_staging_and_preserves_head(tmp_path: Path) -> No
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
     staging.database_path.write_bytes(b"after validation")
 
@@ -497,6 +544,7 @@ def test_manifest_commit_failure_discards_candidate_and_preserves_head(
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
 
     def fail_commit(_workspace_id: str, _manifest: object) -> None:
@@ -582,6 +630,7 @@ def test_restore_staging_uses_source_content_but_current_parent(tmp_path: Path) 
     receipt = ColdValidationReceipt.create(
         validator="cold.worker",
         component_hashes=hash_staging_payload(staging),
+        image_identity=_pe_image_identity(),
     )
     restored = registry.publish_staging(
         staging,
@@ -796,3 +845,192 @@ def test_multiprocess_publish_has_one_cas_winner_and_preserves_storage(
     assert current.sample_path.read_bytes() == sample_bytes
     assert current.sample_sha256 == before.sample_sha256
     assert source.read_bytes() == b"sample bytes"
+
+
+def test_image_identity_persists_and_survives_cold_reopen(tmp_path: Path) -> None:
+    registry, workspace_id, _ = _new_registry(tmp_path)
+    staging = registry.begin_staging(workspace_id, expected_revision=None)
+    staging.database_path.write_bytes(b"cold idb with image identity")
+    identity = _pe_image_identity()
+    receipt = ColdValidationReceipt.create(
+        validator="cold.worker",
+        component_hashes=hash_staging_payload(staging),
+        image_identity=identity,
+    )
+    published = registry.publish_staging(staging, receipt=receipt)
+    assert published.image_identity == identity
+
+    reopened = WorkspaceRegistry(registry.root, checkout_root=registry.checkout_root)
+    restored = reopened.get_revision(workspace_id, published.revision)
+    assert restored.image_identity == identity
+    snapshot = reopened.get(workspace_id)
+    current = next(
+        revision
+        for revision in snapshot.revisions
+        if revision.revision == snapshot.current_revision
+    )
+    assert current.image_identity == identity
+
+
+def test_cold_validation_receipt_revalidates_constructed_image_identity() -> None:
+    with pytest.raises(ValueError, match="container"):
+        ColdValidationReceipt.create(
+            validator="cold.worker",
+            component_hashes={"database.i64": "0" * 64},
+            image_identity=_invalid_image_identity(),
+        )
+
+
+def test_cold_validation_receipt_requires_image_identity() -> None:
+    create = cast(
+        Callable[..., ColdValidationReceipt],
+        ColdValidationReceipt.create,
+    )
+    with pytest.raises(TypeError, match="image_identity"):
+        create(
+            validator="cold.worker",
+            component_hashes={"database.i64": "0" * 64},
+        )
+
+
+@pytest.mark.parametrize("construction", ["direct", "tampered"])
+def test_publish_revalidates_receipt_image_identity(
+    tmp_path: Path,
+    construction: str,
+) -> None:
+    registry, workspace_id, _ = _new_registry(tmp_path)
+    staging = registry.begin_staging(workspace_id, expected_revision=None)
+    staging.database_path.write_bytes(b"candidate")
+    component_hashes = hash_staging_payload(staging)
+    if construction == "direct":
+        receipt = ColdValidationReceipt(
+            validator="cold.worker",
+            component_hashes=component_hashes,
+            image_identity=_invalid_image_identity(),
+        )
+    else:
+        receipt = ColdValidationReceipt.create(
+            validator="cold.worker",
+            component_hashes=component_hashes,
+            image_identity=_pe_image_identity(),
+        )
+        object.__setattr__(receipt, "image_identity", _invalid_image_identity())
+
+    with pytest.raises(ValueError, match="container"):
+        registry.publish_staging(staging, receipt=receipt)
+
+    assert registry.get(workspace_id).current_revision is None
+    assert not staging.path.exists()
+
+
+def test_legacy_revision_manifest_without_image_identity_reads_as_none(
+    tmp_path: Path,
+) -> None:
+    registry, workspace_id, _ = _new_registry(tmp_path)
+    published = _publish(registry, workspace_id, None, b"legacy cold idb")
+    # 模拟旧版本发布的 revision manifest: 磁盘上缺少 image_identity 键.
+    manifest_path = (
+        registry.root / workspace_id / "revisions" / published.revision / "revision.json"
+    )
+    raw = json.loads(manifest_path.read_text(encoding="utf-8"))
+    raw.pop("image_identity", None)
+    atomic_write_json(manifest_path, raw)
+
+    reopened = WorkspaceRegistry(registry.root, checkout_root=registry.checkout_root)
+    restored = reopened.get_revision(workspace_id, published.revision)
+    assert restored.image_identity is None
+
+
+def test_legacy_revision_manifest_identity_without_container_reads_as_none(
+    tmp_path: Path,
+) -> None:
+    registry, workspace_id, _ = _new_registry(tmp_path)
+    published = _publish(registry, workspace_id, None, b"legacy cold idb")
+    manifest_path = (
+        registry.root / workspace_id / "revisions" / published.revision / "revision.json"
+    )
+    raw = cast(
+        dict[str, object],
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+    )
+    identity = cast(dict[str, object], raw["image_identity"])
+    assert identity.pop("container") == "pe"
+    atomic_write_json(manifest_path, raw)
+
+    reopened = WorkspaceRegistry(registry.root, checkout_root=registry.checkout_root)
+    restored = reopened.get_revision(workspace_id, published.revision)
+    assert restored.image_identity is None
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("architecture", "mips64"),
+        ("unexpected", "value"),
+    ],
+)
+def test_legacy_revision_manifest_rejects_invalid_identity_evidence(
+    tmp_path: Path,
+    field: str,
+    value: str,
+) -> None:
+    registry, workspace_id, _ = _new_registry(tmp_path)
+    published = _publish(registry, workspace_id, None, b"legacy cold idb")
+    manifest_path = (
+        registry.root / workspace_id / "revisions" / published.revision / "revision.json"
+    )
+    raw = cast(
+        dict[str, object],
+        json.loads(manifest_path.read_text(encoding="utf-8")),
+    )
+    identity = cast(dict[str, object], raw["image_identity"])
+    identity.pop("container")
+    identity[field] = value
+    atomic_write_json(manifest_path, raw)
+
+    reopened = WorkspaceRegistry(registry.root, checkout_root=registry.checkout_root)
+    with pytest.raises(StorageCorruptionError, match="revision manifest"):
+        reopened.get_revision(workspace_id, published.revision)
+
+
+def test_record_analysis_outcome_persists_failure_across_reopen(tmp_path: Path) -> None:
+    registry, workspace_id, _ = _new_registry(tmp_path)
+    registry.record_analysis_outcome(
+        workspace_id,
+        state="failed",
+        reason="bootstrap worker crashed",
+    )
+    reopened = WorkspaceRegistry(registry.root, checkout_root=registry.checkout_root)
+    snapshot = reopened.get(workspace_id)
+    assert snapshot.current_revision is None
+    assert snapshot.analysis_outcome is not None
+    assert snapshot.analysis_outcome.state == "failed"
+    assert snapshot.analysis_outcome.reason == "bootstrap worker crashed"
+
+
+def test_record_analysis_outcome_ignored_once_revision_published(tmp_path: Path) -> None:
+    registry, workspace_id, _ = _new_registry(tmp_path)
+    _publish(registry, workspace_id, None, b"published cold idb")
+    registry.record_analysis_outcome(
+        workspace_id,
+        state="failed",
+        reason="late failure must not overwrite success",
+    )
+    snapshot = registry.get(workspace_id)
+    assert snapshot.current_revision is not None
+    assert snapshot.analysis_outcome is None
+
+
+def test_publish_clears_earlier_analysis_outcome(tmp_path: Path) -> None:
+    registry, workspace_id, _ = _new_registry(tmp_path)
+    registry.record_analysis_outcome(
+        workspace_id,
+        state="failed",
+        reason="长操作失败",
+    )
+
+    _publish(registry, workspace_id, None, b"later successful cold idb")
+
+    snapshot = registry.get(workspace_id)
+    assert snapshot.current_revision is not None
+    assert snapshot.analysis_outcome is None

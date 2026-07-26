@@ -491,14 +491,16 @@ class MutationWorker(OwnerThreadBound):
         for symbol in bundle.symbols:
             ea = imagebase + int(symbol.rva, 16)
             flags = int(api.ida_bytes.get_flags(ea))
+            existing_name = str(api.ida_name.get_name(ea) or "")
             if api.ida_bytes.has_user_name(flags):
-                name_conflicts.append(
-                    {
-                        "symbol_id": symbol.id,
-                        "address": _hex(ea),
-                        "existing_name": str(api.ida_name.get_name(ea) or ""),
-                    }
-                )
+                if existing_name != symbol.name:
+                    name_conflicts.append(
+                        {
+                            "symbol_id": symbol.id,
+                            "address": _hex(ea),
+                            "existing_name": existing_name,
+                        }
+                    )
             else:
                 if not api.ida_name.set_name(
                     ea,

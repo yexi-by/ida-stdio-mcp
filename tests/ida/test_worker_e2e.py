@@ -11,13 +11,11 @@ import subprocess
 import sys
 import time
 import uuid
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-from ida_re_mcp.constants import IL2CPP_MEDIA_TYPE, IL2CPP_SCHEMA_VERSION
 from ida_re_mcp.domain.address import DatabaseAddress
 from ida_re_mcp.domain.tools import (
     AddressInspectInput,
@@ -30,8 +28,6 @@ from ida_re_mcp.domain.tools import (
     ProgramSearchInput,
     ProgramSearchOutput,
 )
-from ida_re_mcp.il2cpp import canonical_ndjson, compute_record_id
-from ida_re_mcp.il2cpp.canonical import JsonObject
 from ida_re_mcp.supervisor.static_adapter import (
     AnalysisContext,
     adapt_worker_results,
@@ -144,161 +140,6 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _with_record_id(record: JsonObject) -> JsonObject:
-    result = deepcopy(record)
-    result["id"] = compute_record_id(result)
-    return result
-
-
-def _write_il2cpp_bundle(
-    path: Path,
-    native: Path,
-    metadata: Path,
-) -> tuple[str, int]:
-    metadata_sha256 = _sha256(metadata)
-    metadata_size = metadata.stat().st_size
-    manifest: JsonObject = {
-        "kind": "manifest",
-        "schema": IL2CPP_SCHEMA_VERSION,
-        "media_type": IL2CPP_MEDIA_TYPE,
-        "native": {
-            "sha256": _sha256(native),
-            "size": native.stat().st_size,
-            "image_size": 0x4000,
-            "architecture": "x86_64",
-            "abi": "msvc-x64",
-            "pointer_width": 64,
-            "endianness": "little",
-        },
-        "metadata": {"sha256": metadata_sha256, "size": metadata_size},
-    }
-    image = _with_record_id(
-        {
-            "kind": "managed_image",
-            "name": "Assembly-CSharp",
-            "assembly_name": "Assembly-CSharp.dll",
-        }
-    )
-    actor = _with_record_id(
-        {
-            "kind": "type",
-            "image_id": image["id"],
-            "namespace": "Game",
-            "name": "Actor",
-            "layout": {
-                "kind": "struct",
-                "size": 16,
-                "alignment": 8,
-                "fields": [
-                    {
-                        "name": "instance_id",
-                        "offset": 0,
-                        "type": {"kind": "primitive", "name": "i32"},
-                    }
-                ],
-            },
-        }
-    )
-    marker = _with_record_id(
-        {
-            "kind": "type",
-            "image_id": image["id"],
-            "namespace": "Game",
-            "name": "Marker",
-            "layout": {
-                "kind": "struct",
-                "size": 8,
-                "alignment": 8,
-                "fields": [],
-            },
-        }
-    )
-    value = _with_record_id(
-        {
-            "kind": "type",
-            "image_id": image["id"],
-            "namespace": "Game",
-            "name": "Value",
-            "layout": {
-                "kind": "union",
-                "size": 16,
-                "alignment": 8,
-                "fields": [
-                    {
-                        "name": "code",
-                        "offset": 0,
-                        "type": {"kind": "primitive", "name": "u32"},
-                    }
-                ],
-            },
-        }
-    )
-    state = _with_record_id(
-        {
-            "kind": "type",
-            "image_id": image["id"],
-            "namespace": "Game",
-            "name": "State",
-            "layout": {
-                "kind": "enum",
-                "underlying": "i16",
-                "members": [
-                    {"name": "Unknown", "value": -1},
-                    {"name": "Ready", "value": 1},
-                ],
-            },
-        }
-    )
-    method = _with_record_id(
-        {
-            "kind": "method",
-            "image_id": image["id"],
-            "declaring_type_id": actor["id"],
-            "name": "GetScore",
-            "rva": "0x1000",
-            "managed_signature": {
-                "return_type": "System.Int32",
-                "parameters": [
-                    {"name": "bonus", "type": "System.Int32"},
-                ],
-            },
-            "native_signature": {
-                "calling_convention": "win64",
-                "return_type": {"kind": "primitive", "name": "i32"},
-                "parameters": [
-                    {
-                        "name": "self",
-                        "type": {
-                            "kind": "pointer",
-                            "to": {"kind": "named", "type_id": actor["id"]},
-                            "const": False,
-                        },
-                    },
-                    {
-                        "name": "bonus",
-                        "type": {"kind": "primitive", "name": "i32"},
-                    },
-                ],
-                "variadic": False,
-            },
-        }
-    )
-    symbol = _with_record_id(
-        {
-            "kind": "symbol",
-            "name": "Actor_GetScore",
-            "rva": "0x1000",
-            "symbol_kind": "function",
-            "method_id": method["id"],
-            "type": None,
-        }
-    )
-    path.write_bytes(
-        canonical_ndjson([manifest, image, actor, marker, value, state, method, symbol])
-    )
-    return metadata_sha256, metadata_size
-
-
 @pytest.mark.ida
 def test_runtime_probe_is_headless_and_current(
     ida_environment: dict[str, str],
@@ -335,9 +176,15 @@ def test_bootstrap_and_static_analysis_leave_checkout_unchanged(
         assert isinstance(image, dict)
         assert image["bitness"] == 64
         assert image["architecture"] == "x86_64"
+        assert image["container"] == "pe"
         assert isinstance(image["image_size"], int)
         assert image["image_size"] > 0  # type: ignore[operator]
         assert overview["counts"]["functions"] > 0  # type: ignore[index,operator]
+        pe_coverage = overview["coverage"]
+        assert isinstance(pe_coverage, dict)
+        pe_reasons = pe_coverage["reasons"]
+        assert isinstance(pe_reasons, list)
+        assert "unwind_unsupported_for_elf_eh_frame" not in pe_reasons
         function = worker.client.execute(
             "function.inspect",
             {
@@ -377,6 +224,7 @@ def test_overview_normalizes_supported_elf_architectures(
         image = overview["image"]
         assert isinstance(image, dict)
         assert image["architecture"] == architecture
+        assert image["container"] == "elf"
         imagebase = image["imagebase"]
         maximum = image["maximum_address"]
         image_size = image["image_size"]
@@ -385,6 +233,13 @@ def test_overview_normalizes_supported_elf_architectures(
         assert isinstance(image_size, int)
         assert image_size == int(maximum, 16) - int(imagebase, 16)
         assert image_size > 0
+        # 请求 unwind 时 ELF 必须显式降级, 不得以零结果谎报 complete.
+        elf_coverage = overview["coverage"]
+        assert isinstance(elf_coverage, dict)
+        assert elf_coverage["complete"] is False
+        elf_reasons = elf_coverage["reasons"]
+        assert isinstance(elf_reasons, list)
+        assert "unwind_unsupported_for_elf_eh_frame" in elf_reasons
     finally:
         worker.close()
 
@@ -986,12 +841,10 @@ def test_mutation_and_il2cpp_publish_only_the_staging_database(
     base_hash = _sha256(base_revision)
     staging = tmp_path / "mutation.i64"
     shutil.copy2(base_revision, staging)
-    bundle_path = tmp_path / "annotations.ndjson"
-    metadata_sha256, metadata_size = _write_il2cpp_bundle(
-        bundle_path,
-        sample,
-        fixture_directory / "il2cpp_metadata_fingerprint.bin",
-    )
+    bundle_path = fixture_directory.parent / "src" / "il2cpp_bundle_example.ndjson"
+    metadata = fixture_directory / "il2cpp_metadata_fingerprint.bin"
+    metadata_sha256 = _sha256(metadata)
+    metadata_size = metadata.stat().st_size
 
     worker = _start_worker(tmp_path, ida_environment, "mutation", checkout=staging)
     try:
@@ -1023,7 +876,7 @@ def test_mutation_and_il2cpp_publish_only_the_staging_database(
                         "expected_native": {
                             "sha256": _sha256(sample),
                             "size": sample.stat().st_size,
-                            "image_size": 0x4000,
+                            "image_size": 0x5000,
                             "architecture": "x86_64",
                             "abi": "msvc-x64",
                             "pointer_width": 64,
@@ -1070,10 +923,10 @@ def test_mutation_and_il2cpp_publish_only_the_staging_database(
         )
         actor_type = imported_type["type"]
         assert isinstance(actor_type, dict)
-        assert actor_type["size"] == 16
+        assert actor_type["size"] == 32
         actor_members = actor_type["members"]
         assert isinstance(actor_members, list)
-        actor_field = next(
+        actor_fields = [
             (
                 member["name"],
                 member["offset_bits"],
@@ -1081,35 +934,39 @@ def test_mutation_and_il2cpp_publish_only_the_staging_database(
             )
             for member in actor_members
             if isinstance(member, dict)
-        )
-        assert actor_field == ("instance_id", 0, 32)
-        assert len(actor_members) == 1
-        marker_type = verifier.client.execute(
+        ]
+        assert actor_fields == [
+            ("klass", 0, 64),
+            ("monitor", 64, 64),
+            ("instance_id", 128, 32),
+            ("position", 160, 96),
+        ]
+        vec3_type = verifier.client.execute(
             "type.inspect",
-            {"name": "Game::Marker"},
+            {"name": "Game::Vec3"},
         )["type"]
-        assert isinstance(marker_type, dict)
-        assert marker_type["size"] == 8
-        marker_members = marker_type["members"]
-        assert isinstance(marker_members, list)
-        assert marker_members == []
-        value_type = verifier.client.execute(
-            "type.inspect",
-            {"name": "Game::Value"},
-        )["type"]
-        assert isinstance(value_type, dict)
-        assert value_type["size"] == 16
-        assert value_type["is_union"] is True
-        value_members = value_type["members"]
-        assert isinstance(value_members, list)
-        value_field = next(
+        assert isinstance(vec3_type, dict)
+        assert vec3_type["size"] == 12
+        vec3_members = vec3_type["members"]
+        assert isinstance(vec3_members, list)
+        assert [
             (member["name"], member["offset_bits"], member["size_bits"])
-            for member in value_members
+            for member in vec3_members
             if isinstance(member, dict)
-        )
-        assert value_field == ("code", 0, 32)
-        assert value_members[1]["offset_bits"] == 0  # type: ignore[index]
-        assert value_members[1]["size_bits"] == 128  # type: ignore[index]
+        ] == [("x", 0, 32), ("y", 32, 32), ("z", 64, 32)]
+        metadata_type = verifier.client.execute(
+            "type.inspect",
+            {"name": "MethodMetadata"},
+        )["type"]
+        assert isinstance(metadata_type, dict)
+        assert metadata_type["size"] == 16
+        metadata_members = metadata_type["members"]
+        assert isinstance(metadata_members, list)
+        assert [
+            (member["name"], member["offset_bits"], member["size_bits"])
+            for member in metadata_members
+            if isinstance(member, dict)
+        ] == [("name", 0, 64), ("token", 64, 32)]
     finally:
         verifier.close()
 
@@ -1137,26 +994,29 @@ def test_mutation_and_il2cpp_publish_only_the_staging_database(
                     "    assert value.get_udt_details(details)\n"
                     "    return value, details\n"
                     "actor, actor_fields = udt('Game::Actor')\n"
-                    "assert actor.get_size() == 16\n"
-                    "assert actor_fields.total_size == 16\n"
+                    "assert actor.get_size() == 32\n"
+                    "assert actor_fields.total_size == 32\n"
                     "assert [(field.name, field.offset, field.size) "
-                    "for field in actor_fields] == [('instance_id', 0, 32)]\n"
-                    "marker, marker_fields = udt('Game::Marker')\n"
-                    "assert marker.get_size() == marker_fields.total_size == 8\n"
-                    "assert len(marker_fields) == 0\n"
-                    "value, value_fields = udt('Game::Value')\n"
-                    "assert value.is_union() and value.get_size() == 16\n"
-                    "assert value_fields.total_size == 16\n"
+                    "for field in actor_fields] == "
+                    "[('klass', 0, 64), ('monitor', 64, 64), "
+                    "('instance_id', 128, 32), ('position', 160, 96)]\n"
+                    "vec3, vec3_fields = udt('Game::Vec3')\n"
+                    "assert vec3.get_size() == vec3_fields.total_size == 12\n"
                     "assert [(field.name, field.offset, field.size) "
-                    "for field in value_fields][0] == ('code', 0, 32)\n"
-                    "assert (value_fields[1].offset, value_fields[1].size) == (0, 128)\n"
-                    "state = named('Game::State')\n"
-                    "assert state.is_enum() and state.get_size() == 2\n"
+                    "for field in vec3_fields] == "
+                    "[('x', 0, 32), ('y', 32, 32), ('z', 64, 32)]\n"
+                    "metadata, metadata_fields = udt('MethodMetadata')\n"
+                    "assert metadata.get_size() == metadata_fields.total_size == 16\n"
+                    "assert [(field.name, field.offset, field.size) "
+                    "for field in metadata_fields] == "
+                    "[('name', 0, 64), ('token', 64, 32)]\n"
+                    "state = named('Game::ActorState')\n"
+                    "assert state.is_enum() and state.get_size() == 4\n"
                     "assert state.get_sign() == ida_typeinf.type_signed\n"
                     "state_members = ida_typeinf.enum_type_data_t()\n"
                     "assert state.get_enum_details(state_members)\n"
                     "assert [(member.name, member.value) for member in state_members] == "
-                    "[('Unknown', (1 << 64) - 1), ('Ready', 1)]\n"
+                    "[('Idle', 0), ('Running', 1), ('Disabled', 2)]\n"
                     "function_type = ida_typeinf.tinfo_t()\n"
                     "ea = ida_nalt.get_imagebase() + 0x1000\n"
                     "assert ida_nalt.get_tinfo(function_type, ea)\n"
@@ -1167,12 +1027,17 @@ def test_mutation_and_il2cpp_publish_only_the_staging_database(
                     "assert signature.rettype.equals_to("
                     "ida_typeinf.tinfo_t(ida_typeinf.BTF_INT32))\n"
                     "assert [(argument.name, argument.type.get_size()) "
-                    "for argument in signature] == [('self', 8), ('bonus', 4)]\n"
+                    "for argument in signature] == "
+                    "[('self', 8), ('bonus', 4), ('method', 8)]\n"
                     "actor_pointer = ida_typeinf.tinfo_t()\n"
                     "assert actor_pointer.create_ptr(actor)\n"
                     "assert signature[0].type.equals_to(actor_pointer)\n"
                     "assert signature[1].type.equals_to("
                     "ida_typeinf.tinfo_t(ida_typeinf.BTF_INT32))\n"
+                    "metadata.set_const()\n"
+                    "metadata_pointer = ida_typeinf.tinfo_t()\n"
+                    "assert metadata_pointer.create_ptr(metadata)\n"
+                    "assert signature[2].type.equals_to(metadata_pointer)\n"
                     "True"
                 ),
             },

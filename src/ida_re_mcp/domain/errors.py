@@ -11,6 +11,7 @@ class BusinessErrorCode(StrEnum):
     """Agent 可以据此采取修复动作的工具执行错误。"""
 
     REVISION_CONFLICT = "revision_conflict"
+    REVISION_NOT_FOUND = "revision_not_found"
     CURSOR_STALE = "cursor_stale"
     AMBIGUOUS_REFERENCE = "ambiguous_reference"
     CAPABILITY_UNAVAILABLE = "capability_unavailable"

@@ -12,8 +12,9 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from pydantic import JsonValue
 
@@ -79,6 +80,7 @@ from ida_re_mcp.domain.tools import (
     RevisionSummary,
     TypeInspectInput,
     TypeInspectOutput,
+    WorkspaceAnalysisOutcome,
     WorkspaceCreateInput,
     WorkspaceCreateOutput,
     WorkspaceExportInput,
@@ -209,6 +211,7 @@ from ida_re_mcp.supervisor.storage import SupervisorStorage
 from ida_re_mcp.supervisor.workers import WorkerProcessError
 from ida_re_mcp.supervisor.workspaces import (
     ColdValidationReceipt,
+    ImageIdentity,
     RevisionCheckout,
     RevisionSnapshot,
     RevisionStaging,
@@ -309,6 +312,7 @@ class _ColdImageIdentity:
     """发布前必须由冷重开 IDB 再次证明的原生镜像身份。"""
 
     sample_sha256: str
+    container: Literal["elf", "pe"] | None = None
     architecture: str | None = None
     bitness: int | None = None
     endianness: str | None = None
@@ -320,8 +324,13 @@ class _ColdImageIdentity:
         sample_sha256: str,
         overview: ProgramOverviewOutput,
     ) -> _ColdImageIdentity:
+        container = {
+            "elf64": "elf",
+            "pe32+": "pe",
+        }.get(overview.image.format)
         return cls(
             sample_sha256=sample_sha256,
+            container=cast(Literal["elf", "pe"] | None, container),
             architecture=overview.image.architecture,
             bitness=overview.image.bitness,
             endianness=overview.image.endian,
@@ -363,6 +372,10 @@ class Application:
         self._catalog_by_name = {spec.name: spec for spec in catalog}
         self._mcp = McpRuntime(self, catalog=catalog)
         self._operation_tasks: dict[str, asyncio.Task[None]] = {}
+        self._operation_terminal_callbacks: dict[
+            str,
+            Callable[[Literal["failed", "cancelled"], str], None],
+        ] = {}
         self._cancellable_operations: set[str] = set()
         self._workspace_operations: dict[str, str] = {}
         self._debug_sessions: dict[str, _DebugSession] = {}
@@ -737,21 +750,48 @@ class Application:
                     continue
                 failures.append(result)
 
-        for operation_id, task in self._operation_tasks.items():
+        operation_tasks = tuple(self._operation_tasks.items())
+        for operation_id, task in operation_tasks:
             if not task.done():
                 try:
                     snapshot = self.storage.operations.get(operation_id)
+                    callback = self._operation_terminal_callbacks.get(operation_id)
                     if snapshot.state is OperationState.QUEUED:
-                        self.storage.operations.cancel(operation_id)
+                        self.storage.operations.start(operation_id)
+                        self.storage.operations.fail(
+                            operation_id,
+                            code="worker_crashed",
+                            message="操作因服务关闭而中止",
+                        )
+                        task.cancel()
+                        if callback is not None:
+                            await _complete_thread_call(
+                                partial(
+                                    callback,
+                                    "failed",
+                                    "操作因服务关闭而中止",
+                                )
+                            )
+                        continue
+                    if snapshot.state is OperationState.CANCELLED:
+                        task.cancel()
+                        if callback is not None:
+                            await _complete_thread_call(
+                                partial(
+                                    callback,
+                                    "cancelled",
+                                    "首次分析已取消",
+                                )
+                            )
                         continue
                 except SupervisorError:
                     pass
                 except BaseException as exc:
                     failures.append(exc)
                 task.cancel()
-        if self._operation_tasks:
+        if operation_tasks:
             operation_results = await asyncio.gather(
-                *self._operation_tasks.values(),
+                *(task for _operation_id, task in operation_tasks),
                 return_exceptions=True,
             )
             record_failures(operation_results, ignore_cancellation=True)
@@ -859,13 +899,18 @@ class Application:
             arguments.operation_id,
         )
         if (
-            before.state is OperationState.RUNNING
-            and snapshot.state is OperationState.CANCEL_REQUESTED
+            snapshot.state is OperationState.CANCEL_REQUESTED
             and snapshot.operation_id in self._cancellable_operations
         ):
             task = self._operation_tasks.get(snapshot.operation_id)
             if task is not None and not task.done():
                 task.cancel()
+        elif snapshot.state is OperationState.CANCELLED:
+            # queued operation 的 coordinator 会立即进入终态; 等待调度任务完成其
+            # 持久化终态回调, 使 operation.cancel 返回时 workspace 也已可观察。
+            task = self._operation_tasks.get(snapshot.operation_id)
+            if task is not None:
+                await _await_task_preserving_cancellation(task)
         return OperationCancelOutput(
             operation_id=snapshot.operation_id,
             state=snapshot.state.value,
@@ -911,24 +956,44 @@ class Application:
         validated_identity = native_identity
         if validated_identity is None:
             raise RuntimeError("workspace 候选样本缺少 Native 预检身份")
-        operation_id = self._schedule_operation(
-            "workspace_create",
-            workspace.workspace_id,
-            lambda current_operation_id: self._initialize_workspace(
-                workspace,
-                operation_id=current_operation_id,
-                native_identity=validated_identity,
-            ),
-            discard_workspace_on_failure=True,
-            cancellable=True,
+        operation_id = self._schedule_workspace_initialization(
+            workspace,
+            native_identity=validated_identity,
         )
-        self._workspace_operations[workspace.workspace_id] = operation_id
         return WorkspaceCreateOutput(
             workspace_id=workspace.workspace_id,
             revision=None,
             sample_sha256=workspace.sample_sha256,
             analysis_operation_id=operation_id,
         )
+
+    def _schedule_workspace_initialization(
+        self,
+        workspace: WorkspaceSnapshot,
+        *,
+        native_identity: NativeImageIdentity,
+    ) -> str:
+        """调度首次分析, 并在统一调度边界持久化所有非成功终态。"""
+
+        operation_id = self._schedule_operation(
+            "workspace_create",
+            workspace.workspace_id,
+            lambda current_operation_id: self._initialize_workspace(
+                workspace,
+                operation_id=current_operation_id,
+                native_identity=native_identity,
+            ),
+            on_unsuccessful_terminal=lambda state, reason: (
+                self.storage.workspaces.record_analysis_outcome(
+                    workspace.workspace_id,
+                    state=state,
+                    reason=reason,
+                )
+            ),
+            cancellable=True,
+        )
+        self._workspace_operations[workspace.workspace_id] = operation_id
+        return operation_id
 
     async def _workspace_list(
         self,
@@ -959,7 +1024,18 @@ class Application:
         summaries: list[WorkspaceSummary] = []
         output = WorkspaceListOutput(workspaces=[])
         for workspace in available:
-            candidate_summaries = [*summaries, self._workspace_summary(workspace)]
+            native_identity = (
+                await asyncio.to_thread(self._trusted_native_identity, workspace)
+                if workspace.current_revision is not None
+                else None
+            )
+            candidate_summaries = [
+                *summaries,
+                self._workspace_summary(
+                    workspace,
+                    native_identity=native_identity,
+                ),
+            ]
             next_offset = offset + len(candidate_summaries)
             next_cursor = (
                 self.cursors.encode(
@@ -984,10 +1060,7 @@ class Application:
         self,
         arguments: WorkspaceGetInput,
     ) -> WorkspaceGetOutput:
-        async with (
-            self._workspace_lock(arguments.workspace_id),
-            self._analysis_slots,
-        ):
+        async with self._workspace_lock(arguments.workspace_id):
             workspace = await asyncio.to_thread(
                 self.storage.workspaces.get,
                 arguments.workspace_id,
@@ -1007,6 +1080,12 @@ class Application:
                 )
                 for item in workspace.revisions
             ]
+            existing_revision_ids = {item.revision for item in workspace.revisions}
+            history_truncated = any(
+                item.parent_revision is not None
+                and item.parent_revision not in existing_revision_ids
+                for item in workspace.revisions
+            )
             digest = query_digest(
                 canonical_json_bytes(
                     {
@@ -1025,16 +1104,13 @@ class Application:
                     revision=workspace.current_revision,
                     query_digest=digest,
                 ).offset
-            overview = await self._static_query_unlocked(
-                "program.overview",
-                ProgramOverviewInput(
-                    workspace_id=workspace.workspace_id,
-                    revision=workspace.current_revision,
-                    include=[],
-                ),
+            native_identity = await asyncio.to_thread(
+                self._trusted_native_identity,
+                workspace,
             )
-        typed_overview = cast(ProgramOverviewOutput, overview)
-        image = typed_overview.image
+            architecture = native_identity.architecture
+            bitness: Literal[32, 64] = native_identity.bitness
+            endian: Literal["little", "big"] = native_identity.endian
         available = revision_summaries[offset : offset + arguments.page_size]
         selected: list[RevisionSummary] = []
         output = WorkspaceGetOutput(
@@ -1042,11 +1118,12 @@ class Application:
             current_revision=workspace.current_revision,
             sample_name=workspace.sample_name,
             sample_sha256=workspace.sample_sha256,
-            architecture=image.architecture,
-            bitness=image.bitness,
-            endian=image.endian,
+            architecture=architecture,
+            bitness=bitness,
+            endian=endian,
             revisions=[],
             next_cursor=None,
+            history_truncated=history_truncated,
         )
         for summary in available:
             candidate_revisions = [*selected, summary]
@@ -1069,11 +1146,12 @@ class Application:
                 current_revision=workspace.current_revision,
                 sample_name=workspace.sample_name,
                 sample_sha256=workspace.sample_sha256,
-                architecture=image.architecture,
-                bitness=image.bitness,
-                endian=image.endian,
+                architecture=architecture,
+                bitness=bitness,
+                endian=endian,
                 revisions=candidate_revisions,
                 next_cursor=next_cursor,
+                history_truncated=history_truncated,
             )
             if _inline_model_size(candidate) > MAX_INLINE_RESULT_BYTES:
                 break
@@ -1162,10 +1240,15 @@ class Application:
             self.storage.workspaces.get,
             workspace_id,
         )
-        await asyncio.to_thread(
+        revision_snapshot = await asyncio.to_thread(
             self.storage.workspaces.get_revision,
             workspace_id,
             revision,
+        )
+        native_identity = await asyncio.to_thread(
+            self._trusted_native_identity,
+            workspace,
+            revision_snapshot,
         )
         session = await self._acquire_analysis_session(workspace_id, revision)
         reusable = True
@@ -1192,6 +1275,7 @@ class Application:
                     workspace_id=workspace_id,
                     revision=revision,
                     sample_sha256=workspace.sample_sha256,
+                    native_container=native_identity.container,
                 ),
             )
             page = static_page_facts(name, typed_arguments, results)
@@ -2028,7 +2112,11 @@ class Application:
                 component_hashes=dict(revision.component_hashes),
                 native=native,
             ),
-            _ColdImageIdentity.from_overview(workspace.sample_sha256, overview),
+            self._cold_identity_from_revision(
+                workspace,
+                revision,
+                overview=overview,
+            ),
         )
 
     def _materialize_change_artifacts(
@@ -2760,6 +2848,7 @@ class Application:
                 staging,
                 expected=_ColdImageIdentity(
                     sample_sha256=workspace.sample_sha256,
+                    container=native_identity.container,
                     architecture=native_identity.architecture,
                     bitness=native_identity.bitness,
                     endianness=native_identity.endian,
@@ -2819,6 +2908,13 @@ class Application:
             self.storage.workspaces.get,
             workspace_id,
         )
+        revision_snapshot = await asyncio.to_thread(
+            self.storage.workspaces.get_revision,
+            workspace_id,
+            revision,
+        )
+        if revision_snapshot.image_identity is not None:
+            return self._cold_identity_from_revision(workspace, revision_snapshot)
         overview = cast(
             ProgramOverviewOutput,
             await self._static_query_unlocked(
@@ -2830,7 +2926,54 @@ class Application:
                 ),
             ),
         )
-        return _ColdImageIdentity.from_overview(workspace.sample_sha256, overview)
+        return self._cold_identity_from_revision(
+            workspace,
+            revision_snapshot,
+            overview=overview,
+        )
+
+    def _cold_identity_from_revision(
+        self,
+        workspace: WorkspaceSnapshot,
+        revision: RevisionSnapshot,
+        *,
+        overview: ProgramOverviewOutput | None = None,
+    ) -> _ColdImageIdentity:
+        """从持久 receipt 固定发布身份; legacy revision 才依赖冷查询补 image_size。"""
+
+        identity = revision.image_identity
+        if identity is not None:
+            return _ColdImageIdentity(
+                sample_sha256=workspace.sample_sha256,
+                container=identity.container,
+                architecture=identity.architecture,
+                bitness=identity.bitness,
+                endianness=identity.endian,
+                image_size=identity.image_size,
+            )
+        if overview is None:
+            raise RuntimeError("legacy revision 缺少冷查询镜像身份")
+        cold_identity = _ColdImageIdentity.from_overview(
+            workspace.sample_sha256,
+            overview,
+        )
+        native_identity = self._trusted_native_identity(workspace, revision)
+        if (
+            cold_identity.container != native_identity.container
+            or cold_identity.architecture != native_identity.architecture
+            or cold_identity.bitness != native_identity.bitness
+            or cold_identity.endianness != native_identity.endian
+        ):
+            raise RuntimeError("legacy revision 的 IDA 镜像身份与 Native 预检冲突")
+        legacy_identity = revision.legacy_image_identity
+        if legacy_identity is not None and (
+            cold_identity.architecture != legacy_identity.architecture
+            or cold_identity.bitness != legacy_identity.bitness
+            or cold_identity.endianness != legacy_identity.endian
+            or cold_identity.image_size != legacy_identity.image_size
+        ):
+            raise RuntimeError("legacy revision 的 IDA 镜像身份与持久证据冲突")
+        return cold_identity
 
     async def _cold_validate(
         self,
@@ -2862,8 +3005,10 @@ class Application:
         bitness = image.get("bitness")
         endianness = image.get("endianness")
         image_size = image.get("image_size")
+        container = image.get("container")
         if (
-            architecture not in {"x86_64", "aarch64"}
+            container not in {"elf", "pe"}
+            or architecture not in {"x86_64", "aarch64"}
             or isinstance(bitness, bool)
             or bitness != 64
             or endianness != "little"
@@ -2873,7 +3018,8 @@ class Application:
         ):
             raise RuntimeError("冷验证镜像不满足当前 Native 产品边界")
         if (
-            (expected.architecture is not None and architecture != expected.architecture)
+            (expected.container is not None and container != expected.container)
+            or (expected.architecture is not None and architecture != expected.architecture)
             or (expected.bitness is not None and bitness != expected.bitness)
             or (expected.endianness is not None and endianness != expected.endianness)
             or (expected.image_size is not None and image_size != expected.image_size)
@@ -2882,9 +3028,21 @@ class Application:
         hashes = await _settle_thread_call_preserving_cancellation(
             lambda: hash_staging_payload(staging)
         )
+        # 冷验证已证明的镜像身份随 revision 一并持久化, 让 workspace.list/get
+        # 免于为读取架构再冷开一次 IDB.
+        image_identity = ImageIdentity.model_validate(
+            {
+                "container": container,
+                "architecture": architecture,
+                "bitness": bitness,
+                "endian": endianness,
+                "image_size": image_size,
+            }
+        )
         return ColdValidationReceipt.create(
             validator="ida_9_3_headless",
             component_hashes=hashes,
+            image_identity=image_identity,
         )
 
     async def _export_workspace(
@@ -3067,35 +3225,164 @@ class Application:
             "size": artifact.size,
         }
 
-    def _workspace_summary(self, workspace: WorkspaceSnapshot) -> WorkspaceSummary:
-        state = "ready"
-        if workspace.current_revision is None:
-            state = "analyzing"
-            operation_id = self._workspace_operations.get(workspace.workspace_id)
-            operation = None
-            if operation_id is not None:
-                try:
-                    operation = self.storage.operations.get(operation_id)
-                except OperationNotFoundError:
-                    pass
-            if operation is None:
-                operation = self.storage.operations.latest(
-                    workspace_id=workspace.workspace_id,
-                    kind="workspace_create",
-                )
-            if operation is not None and operation.state in {
-                OperationState.FAILED,
-                OperationState.CANCELLED,
-            }:
-                state = "failed"
+    def _workspace_summary(
+        self,
+        workspace: WorkspaceSnapshot,
+        *,
+        native_identity: NativeImageIdentity | None = None,
+    ) -> WorkspaceSummary:
+        # 状态阶梯只陈述可证明的事实, 不把无法证明的进行时冒充为 analyzing:
+        # 1) 有 current revision -> ready;
+        # 2) manifest 已持久化失败/取消终态 -> failed(跨会话持久可见);
+        # 3) 可见 operation 处于终态失败/取消 -> failed, 处于排队/运行 -> analyzing
+        #    (仅当 operation 存储对本会话可见时成立; session 私有存储跨会话查不到即跳过);
+        # 4) 其余 -> unknown(Supervisor 曾被强杀, 或该 workspace 属于另一条活动连接)。
+        state: Literal["analyzing", "ready", "failed", "unknown"]
+        architecture: str | None = None
+        analysis_outcome: WorkspaceAnalysisOutcome | None = None
+        if workspace.current_revision is not None:
+            state = "ready"
+            architecture = (
+                native_identity.architecture
+                if native_identity is not None
+                else self._workspace_architecture(workspace)
+            )
+        elif workspace.analysis_outcome is not None:
+            state = "failed"
+            analysis_outcome = WorkspaceAnalysisOutcome(
+                state=workspace.analysis_outcome.state,
+                reason=workspace.analysis_outcome.reason,
+                recorded_at=workspace.analysis_outcome.recorded_at,
+            )
+        else:
+            operation_status = self._operation_backed_status(workspace.workspace_id)
+            if operation_status is None:
+                state = "unknown"
+            else:
+                state, analysis_outcome = operation_status
         return WorkspaceSummary(
             workspace_id=workspace.workspace_id,
             revision=workspace.current_revision,
             sample_name=workspace.sample_name,
             sample_sha256=workspace.sample_sha256,
-            architecture=None,
+            architecture=architecture,
             state=state,
+            analysis_outcome=analysis_outcome,
         )
+
+    def _current_revision_identity(self, workspace: WorkspaceSnapshot) -> ImageIdentity | None:
+        """返回 current revision 已持久化的镜像身份; 旧 revision 或未初始化返回 None。"""
+
+        revision = self._current_revision_snapshot(workspace)
+        return revision.image_identity if revision is not None else None
+
+    def _current_revision_snapshot(
+        self,
+        workspace: WorkspaceSnapshot,
+    ) -> RevisionSnapshot | None:
+        """返回 current revision 快照; 未初始化 workspace 返回 None。"""
+
+        if workspace.current_revision is None:
+            return None
+        for revision in workspace.revisions:
+            if revision.revision == workspace.current_revision:
+                return revision
+        return None
+
+    def _trusted_native_identity(
+        self,
+        workspace: WorkspaceSnapshot,
+        revision: RevisionSnapshot | None = None,
+    ) -> NativeImageIdentity:
+        """优先使用完整冷验证身份; legacy revision 回退有界文件头预检。"""
+
+        selected_revision = revision or self._current_revision_snapshot(workspace)
+        persisted = selected_revision.image_identity if selected_revision is not None else None
+        if persisted is not None:
+            return NativeImageIdentity(
+                container=persisted.container,
+                architecture=persisted.architecture,
+                endian=persisted.endian,
+                bitness=persisted.bitness,
+            )
+        try:
+            native_identity = inspect_native_image(workspace.sample_path)
+        except (OSError, UnsupportedNativeImageError) as exc:
+            raise StorageCorruptionError("workspace 原样本无法通过 Native 文件头预检") from exc
+        legacy_identity = (
+            selected_revision.legacy_image_identity if selected_revision is not None else None
+        )
+        if legacy_identity is not None and (
+            legacy_identity.architecture != native_identity.architecture
+            or legacy_identity.bitness != native_identity.bitness
+            or legacy_identity.endian != native_identity.endian
+        ):
+            raise StorageCorruptionError("legacy revision 镜像身份与 Native 文件头冲突")
+        return native_identity
+
+    def _workspace_architecture(self, workspace: WorkspaceSnapshot) -> str | None:
+        """从 current revision 已持久化的镜像身份读取架构; 旧 revision 缺省返回 None。"""
+
+        identity = self._current_revision_identity(workspace)
+        return identity.architecture if identity is not None else None
+
+    def _operation_backed_status(
+        self,
+        workspace_id: str,
+    ) -> (
+        tuple[
+            Literal["failed", "analyzing"],
+            WorkspaceAnalysisOutcome | None,
+        ]
+        | None
+    ):
+        """由可见的首次分析 operation 推导公开状态与安全终态。
+
+        优先本会话登记的 operation, 其次读取 operation 存储中同 workspace 的最新
+        `workspace_create` 记录。session 私有存储在新会话下查不到旧记录, 因此该证据
+        只在存储对当前会话可见时生效, 不会跨会话伪造进行时或失败。
+        """
+
+        operation = None
+        operation_id = self._workspace_operations.get(workspace_id)
+        if operation_id is not None:
+            try:
+                operation = self.storage.operations.get(operation_id)
+            except OperationNotFoundError:
+                operation = None
+        if operation is None:
+            operation = self.storage.operations.latest(
+                workspace_id=workspace_id,
+                kind="workspace_create",
+            )
+        if operation is None:
+            return None
+        if operation.state is OperationState.FAILED:
+            reason = operation.failure.message if operation.failure is not None else "长操作失败"
+            return (
+                "failed",
+                WorkspaceAnalysisOutcome(
+                    state="failed",
+                    reason=reason,
+                    recorded_at=operation.finished_at or operation.updated_at,
+                ),
+            )
+        if operation.state is OperationState.CANCELLED:
+            return (
+                "failed",
+                WorkspaceAnalysisOutcome(
+                    state="cancelled",
+                    reason="首次分析已取消",
+                    recorded_at=operation.finished_at or operation.updated_at,
+                ),
+            )
+        if operation.state in {
+            OperationState.QUEUED,
+            OperationState.RUNNING,
+            OperationState.CANCEL_REQUESTED,
+        }:
+            return "analyzing", None
+        return None
 
     def _schedule_operation(
         self,
@@ -3103,19 +3390,30 @@ class Application:
         workspace_id: str,
         work: Callable[[str], Awaitable[JsonObject]],
         *,
-        discard_workspace_on_failure: bool = False,
+        on_unsuccessful_terminal: (
+            Callable[[Literal["failed", "cancelled"], str], None] | None
+        ) = None,
         cancellable: bool = False,
     ) -> str:
         snapshot = self.storage.operations.create(kind, workspace_id=workspace_id)
+
+        async def record_unsuccessful_terminal(
+            state: Literal["failed", "cancelled"],
+            reason: str,
+        ) -> None:
+            callback = on_unsuccessful_terminal
+            if callback is None:
+                return
+            await _complete_thread_call(lambda: callback(state, reason))
 
         async def run() -> None:
             try:
                 current = self.storage.operations.get(snapshot.operation_id)
                 if current.state is OperationState.CANCELLED:
-                    if discard_workspace_on_failure:
-                        await _complete_thread_call(
-                            lambda: self.storage.workspaces.discard_uninitialized(workspace_id)
-                        )
+                    await record_unsuccessful_terminal(
+                        "cancelled",
+                        "首次分析已取消",
+                    )
                     return
                 self.storage.operations.start(snapshot.operation_id)
                 result = await work(snapshot.operation_id)
@@ -3125,49 +3423,50 @@ class Application:
             except asyncio.CancelledError:
                 try:
                     state = self.storage.operations.get(snapshot.operation_id).state
-                    if state is OperationState.CANCEL_REQUESTED:
+                except SupervisorError:
+                    return
+                if state is OperationState.CANCEL_REQUESTED:
+                    try:
+                        await record_unsuccessful_terminal(
+                            "cancelled",
+                            "首次分析已取消",
+                        )
+                    finally:
                         self.storage.operations.acknowledge_cancel(snapshot.operation_id)
-                    elif state is OperationState.RUNNING:
+                elif state is OperationState.RUNNING:
+                    try:
+                        await record_unsuccessful_terminal(
+                            "failed",
+                            "操作因服务关闭而中止",
+                        )
+                    finally:
                         self.storage.operations.fail(
                             snapshot.operation_id,
                             code="worker_crashed",
                             message="操作因服务关闭而中止",
                         )
-                except SupervisorError:
-                    pass
-                finally:
-                    if discard_workspace_on_failure:
-                        try:
-                            await _complete_thread_call(
-                                lambda: self.storage.workspaces.discard_uninitialized(workspace_id)
-                            )
-                        except SupervisorError:
-                            pass
             except Exception as exc:
+                code, message, details = _operation_failure(exc)
                 try:
-                    code, message, details = _operation_failure(exc)
+                    await record_unsuccessful_terminal("failed", message)
+                finally:
                     self.storage.operations.fail(
                         snapshot.operation_id,
                         code=code,
                         message=message,
                         details=details,
                     )
-                finally:
-                    if discard_workspace_on_failure:
-                        try:
-                            await _complete_thread_call(
-                                lambda: self.storage.workspaces.discard_uninitialized(workspace_id)
-                            )
-                        except SupervisorError:
-                            pass
 
         task = asyncio.create_task(run(), name=f"{kind}:{snapshot.operation_id}")
         self._operation_tasks[snapshot.operation_id] = task
+        if on_unsuccessful_terminal is not None:
+            self._operation_terminal_callbacks[snapshot.operation_id] = on_unsuccessful_terminal
         if cancellable:
             self._cancellable_operations.add(snapshot.operation_id)
 
         def forget_operation(_task: asyncio.Task[None]) -> None:
             self._operation_tasks.pop(snapshot.operation_id, None)
+            self._operation_terminal_callbacks.pop(snapshot.operation_id, None)
             self._cancellable_operations.discard(snapshot.operation_id)
 
         task.add_done_callback(forget_operation)
@@ -3529,7 +3828,9 @@ def _operation_failure(exc: Exception) -> tuple[str, str, JsonValue]:
 def _tool_error(exc: Exception) -> ToolExecutionError | None:
     if isinstance(exc, WorkspaceNotFoundError):
         return ToolExecutionError(BusinessErrorCode.WORKSPACE_NOT_FOUND, str(exc))
-    if isinstance(exc, (RevisionNotFoundError, RevisionConflictError)):
+    if isinstance(exc, RevisionNotFoundError):
+        return ToolExecutionError(BusinessErrorCode.REVISION_NOT_FOUND, str(exc))
+    if isinstance(exc, RevisionConflictError):
         return ToolExecutionError(BusinessErrorCode.REVISION_CONFLICT, str(exc))
     if isinstance(exc, OperationNotFoundError):
         return ToolExecutionError(BusinessErrorCode.OPERATION_NOT_FOUND, str(exc))

@@ -106,7 +106,11 @@ def _start_owner(
 
 def _wait_for_ready(ready: Path, process: subprocess.Popen[str]) -> str:
     deadline = time.monotonic() + 10
-    while not ready.is_file():
+    while True:
+        if ready.is_file():
+            operation_id = ready.read_text(encoding="ascii")
+            if operation_id:
+                return operation_id
         if process.poll() is not None:
             stdout, stderr = process.communicate()
             pytest.fail(
@@ -116,7 +120,6 @@ def _wait_for_ready(ready: Path, process: subprocess.Popen[str]) -> str:
         if time.monotonic() >= deadline:
             pytest.fail("等待 owner probe 超时")
         time.sleep(0.01)
-    return ready.read_text(encoding="ascii")
 
 
 def _finish_process(process: subprocess.Popen[str], crash: Path) -> tuple[str, str]:
@@ -170,10 +173,10 @@ def test_application_aclose_releases_owner_lease_after_early_operation_failure(
 
         pending = asyncio.create_task(wait_forever())
 
-        def fail_cancel(_operation_id: str) -> None:
+        def fail_start(_operation_id: str) -> None:
             raise OSError("injected operation cleanup failure")
 
-        monkeypatch.setattr(first.storage.operations, "cancel", fail_cancel)
+        monkeypatch.setattr(first.storage.operations, "start", fail_start)
         monkeypatch.setattr(
             first,
             "_operation_tasks",
