@@ -16,6 +16,8 @@ from ida_re_mcp.worker.ipc import JsonObject, JsonValue
 
 _PROBE_TIMEOUT_SECONDS = 30.0
 _PROBE_TERMINATE_SECONDS = 2.0
+_PROBE_LOG_BYTES = 64 * 1_024
+_PROBE_LOG_NAME = "doctor-probe.log"
 
 
 class DebugRequestCancelled(asyncio.CancelledError):
@@ -173,7 +175,7 @@ class _ProcessDebugBackend:
             try:
                 await asyncio.to_thread(self._process.cancel, request_id)
             except Exception:
-                # IPC 失联会由原调用给出稳定 worker 错误; 调试取消绝不以杀进程兜底。
+                # IPC 失联由原调用报告；取消调试时不能因此结束目标进程。
                 pass
             while not execution.done():
                 try:
@@ -333,25 +335,59 @@ class SubprocessIdaBackend:
             await _await_cleanup(cleanup)
             raise
         if process.returncode != 0:
+            await asyncio.to_thread(
+                _write_probe_log,
+                self._log_root,
+                stdout,
+                stderr,
+            )
             return {
                 "available": False,
                 "code": "worker_probe_failed",
                 "returncode": process.returncode,
-                "stderr": stderr.decode("utf-8", errors="replace")[:2_048],
+                "summary": "IDA 检查进程没有正常完成。",
+                "next_step": "请确认 ida_dir 和 IDA 许可证，然后查看探测日志。",
+                "log_file": _PROBE_LOG_NAME,
             }
         try:
             value: object = json.loads(stdout.decode("utf-8", errors="strict"))
         except (UnicodeDecodeError, json.JSONDecodeError):
+            await asyncio.to_thread(
+                _write_probe_log,
+                self._log_root,
+                stdout,
+                stderr,
+            )
             return {
                 "available": False,
                 "code": "worker_probe_invalid_output",
+                "summary": "IDA 检查进程返回了无法读取的结果。",
+                "next_step": "请查看探测日志，并确认 ida_dir 指向 IDA Pro 9.3。",
+                "log_file": _PROBE_LOG_NAME,
             }
         if not isinstance(value, dict):
+            await asyncio.to_thread(
+                _write_probe_log,
+                self._log_root,
+                stdout,
+                stderr,
+            )
             return {
                 "available": False,
                 "code": "worker_probe_invalid_output",
+                "summary": "IDA 检查进程返回了无法读取的结果。",
+                "next_step": "请查看探测日志，并确认 ida_dir 指向 IDA Pro 9.3。",
+                "log_file": _PROBE_LOG_NAME,
             }
-        return cast(JsonObject, cast(dict[str, object], value))
+        parsed = cast(dict[str, object], value)
+        if parsed.get("available") is not True:
+            await asyncio.to_thread(
+                _write_probe_log,
+                self._log_root,
+                stdout,
+                stderr,
+            )
+        return _public_probe_result(parsed)
 
     async def _one_shot(
         self,
@@ -419,6 +455,50 @@ class SubprocessIdaBackend:
                 cleanup = asyncio.create_task(asyncio.to_thread(outcome.abort))
                 await _await_cleanup(cleanup)
             raise
+
+
+def _write_probe_log(log_root: Path, stdout: bytes, stderr: bytes) -> None:
+    """把探测进程原始输出写入日志，不把它放进命令行报告。"""
+
+    payload = b"stdout:\n" + stdout + b"\n\nstderr:\n" + stderr
+    if len(payload) > _PROBE_LOG_BYTES:
+        payload = "[仅保留最后 64 KiB]\n".encode() + payload[-_PROBE_LOG_BYTES:]
+    (log_root / _PROBE_LOG_NAME).write_bytes(payload)
+
+
+def _public_probe_result(value: Mapping[str, object]) -> JsonObject:
+    """只返回检查结论和公开的版本、能力信息。"""
+
+    allowed = (
+        "available",
+        "python",
+        "python_ok",
+        "implementation",
+        "ida_kernel_version",
+        "ida_ok",
+        "headless",
+        "hexrays_available",
+        "debugger_api_available",
+    )
+    result: dict[str, object] = {key: value[key] for key in allowed if key in value}
+    if value.get("available") is not True:
+        raw_error = value.get("error")
+        error_code = "runtime_probe_failed"
+        if isinstance(raw_error, dict):
+            error_data = cast(dict[str, object], raw_error)
+            candidate_code = error_data.get("code")
+            if isinstance(candidate_code, str):
+                error_code = candidate_code
+        result.update(
+            {
+                "available": False,
+                "code": error_code,
+                "summary": "IDA 运行环境检查失败。",
+                "next_step": "请确认 ida_dir、IDA 许可证和所需插件，然后查看探测日志。",
+                "log_file": _PROBE_LOG_NAME,
+            }
+        )
+    return cast(JsonObject, result)
 
 
 async def _settle_cancelled_worker_launch(

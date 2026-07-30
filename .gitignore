@@ -9,3 +9,5 @@ __pycache__/
 htmlcov/
 build/
 dist/
+/data/
+/logs/

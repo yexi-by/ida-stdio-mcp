@@ -8,6 +8,7 @@ import binascii
 import json
 import logging
 from importlib.metadata import version
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol, cast
 
@@ -26,6 +27,7 @@ from ida_re_mcp.constants import (
     PRODUCT_VERSION,
     RESOURCE_CHUNK_BYTES,
 )
+from ida_re_mcp.diagnostics import write_exception_log
 from ida_re_mcp.domain.base import JsonObject, StrictModel, tool_json_schema
 from ida_re_mcp.domain.catalog import ToolSpec
 from ida_re_mcp.domain.errors import (
@@ -35,6 +37,14 @@ from ida_re_mcp.domain.errors import (
 )
 from ida_re_mcp.domain.resources import BinaryResourceData, TextResourceData
 from ida_re_mcp.protocol.handlers import McpHandler
+from ida_re_mcp.protocol.messages import (
+    build_server_instructions,
+    error_summary,
+    safe_error_message,
+    sanitize_error_details,
+    success_summary,
+    validation_issue_message,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +65,7 @@ def _validation_details(error: ValidationError) -> JsonObject:
         issues.append(
             {
                 "path": [str(part) for part in item["loc"]],
-                "message": str(item["msg"])[:512],
+                "message": validation_issue_message(str(item["type"])),
                 "type": str(item["type"]),
             }
         )
@@ -78,17 +88,24 @@ def _tool_error(
 ) -> mcp_types.CallToolResult:
     """构造 Agent 可据此修正请求的稳定工具执行错误。"""
 
+    safe_message = safe_error_message(message)[:_MAX_ERROR_MESSAGE_CHARS]
     payload: JsonObject = {
         "code": code,
-        "message": message[:_MAX_ERROR_MESSAGE_CHARS],
-        "details": details or {},
+        "message": safe_message,
+        "details": sanitize_error_details(details or {}),
     }
     serialized = _compact_json(payload)
     if len(serialized.encode("utf-8")) > MAX_INLINE_RESULT_BYTES:
         payload["details"] = {"truncated": True}
         serialized = _compact_json(payload)
     return mcp_types.CallToolResult(
-        content=[mcp_types.TextContent(type="text", text=serialized)],
+        content=[
+            mcp_types.TextContent(
+                type="text",
+                text=error_summary(code, safe_message),
+            ),
+            mcp_types.TextContent(type="text", text=serialized),
+        ],
         isError=True,
     )
 
@@ -131,6 +148,9 @@ class McpRuntime:
         handler: McpHandler,
         *,
         catalog: tuple[ToolSpec, ...],
+        data_root: Path | None = None,
+        log_root: Path | None = None,
+        diagnostic_log_root: Path | None = None,
     ) -> None:
         ordered = tuple(sorted(catalog, key=lambda item: item.name))
         names = tuple(item.name for item in ordered)
@@ -140,6 +160,7 @@ class McpRuntime:
             raise ValueError("MCP 工具目录包含重复名称")
 
         self._handler = handler
+        self._diagnostic_log_root = diagnostic_log_root
         self._catalog = ordered
         self._catalog_by_name = MappingProxyType({spec.name: spec for spec in ordered})
         self._tools = tuple(_tool_definition(spec) for spec in ordered)
@@ -155,9 +176,9 @@ class McpRuntime:
         self._server: Server[object, object] = Server(
             PRODUCT_NAME,
             version=PRODUCT_VERSION,
-            instructions=(
-                "所有静态查询必须显式提供 workspace_id 与 revision。"
-                "所有写入必须通过 change.prepare 与 change.apply 发布新 revision。"
+            instructions=build_server_instructions(
+                data_root=data_root,
+                log_root=log_root,
             ),
         )
         self._initialization = InitializationOptions(
@@ -213,7 +234,7 @@ class McpRuntime:
         if name not in self._catalog_by_name:
             raise _protocol_error(
                 mcp_types.INVALID_PARAMS,
-                f"Unknown tool: {name}",
+                f"找不到工具 `{name}`。请先读取 tools/list，并使用其中列出的工具名称。",
             )
         result = await self._call_tool(name, request.params.arguments or {})
         return mcp_types.ServerResult(result)
@@ -229,7 +250,7 @@ class McpRuntime:
         except ValidationError as error:
             return _tool_error(
                 _INVALID_ARGUMENTS,
-                "工具参数无效",
+                "工具参数不正确。请按照 tools/list 返回的 inputSchema 修改后重试。",
                 _validation_details(error),
             )
 
@@ -242,6 +263,15 @@ class McpRuntime:
                 raise ValueError("工具结果超过 inline 上限")
             self._output_validators[spec.name].validate(structured)
         except ToolExecutionError as error:
+            safe_message = safe_error_message(error.message)
+            safe_details = sanitize_error_details(error.details)
+            if safe_message != error.message or safe_details != error.details:
+                write_exception_log(
+                    self._diagnostic_log_root,
+                    context=f"MCP 工具 {spec.name} 返回了需要隐藏的内部信息",
+                    error=error,
+                    details=error.details,
+                )
             return _tool_error(
                 error.code.value,
                 error.message,
@@ -250,14 +280,27 @@ class McpRuntime:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.exception("工具 %s 执行失败", spec.name)
+            logger.error("工具 %s 执行失败，详细原因已写入当前会话日志", spec.name)
+            write_exception_log(
+                self._diagnostic_log_root,
+                context=f"MCP 工具 {spec.name} 执行失败",
+                error=error,
+            )
             raise _protocol_error(
                 mcp_types.INTERNAL_ERROR,
-                "Internal server error",
+                (
+                    "工具执行失败，服务内部出现错误。请重试；如果仍然失败，"
+                    "请运行 doctor 检查配置并查看日志。"
+                ),
             ) from error
 
         return mcp_types.CallToolResult(
-            content=[mcp_types.TextContent(type="text", text=serialized)],
+            content=[
+                mcp_types.TextContent(
+                    type="text",
+                    text=success_summary(spec.name, cast(JsonObject, structured)),
+                )
+            ],
             structuredContent=structured,
             isError=False,
         )
@@ -273,16 +316,27 @@ class McpRuntime:
             data: JsonObject | None = {"uri": error.uri} if error.uri is not None else None
             raise _protocol_error(
                 mcp_types.INVALID_PARAMS,
-                error.message[:_MAX_ERROR_MESSAGE_CHARS],
+                (
+                    "无法列出工具生成的文件：分页位置无效或已经过期。"
+                    "请不传 cursor，从第一页重新读取。"
+                ),
                 data,
             ) from error
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.exception("列出 resources 失败")
+            logger.error("列出工具生成的文件失败，详细原因已写入当前会话日志")
+            write_exception_log(
+                self._diagnostic_log_root,
+                context="列出工具生成的文件失败",
+                error=error,
+            )
             raise _protocol_error(
                 mcp_types.INTERNAL_ERROR,
-                "Internal server error",
+                (
+                    "无法列出工具生成的文件，服务内部出现错误。请重试；"
+                    "如果仍然失败，请运行 doctor 检查配置并查看日志。"
+                ),
             ) from error
 
         return mcp_types.ListResourcesResult(
@@ -308,22 +362,36 @@ class McpRuntime:
         except ResourceNotFoundError as error:
             raise _protocol_error(
                 _RESOURCE_NOT_FOUND,
-                "Resource not found",
+                (
+                    "找不到这个工具生成的文件。请重新调用生成文件的工具，"
+                    "并使用它返回的完整文件地址。"
+                ),
                 {"uri": error.uri},
             ) from error
         except ResourceRequestError as error:
             raise _protocol_error(
                 mcp_types.INVALID_PARAMS,
-                error.message[:_MAX_ERROR_MESSAGE_CHARS],
+                (
+                    "无法读取工具生成的文件：文件地址格式不正确。"
+                    "请使用生成文件的工具返回的完整文件地址。"
+                ),
                 {"uri": error.uri or requested_uri},
             ) from error
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            logger.exception("读取 resource 失败")
+            logger.error("读取工具生成的文件失败，详细原因已写入当前会话日志")
+            write_exception_log(
+                self._diagnostic_log_root,
+                context="读取工具生成的文件失败",
+                error=error,
+            )
             raise _protocol_error(
                 mcp_types.INTERNAL_ERROR,
-                "Internal server error",
+                (
+                    "无法读取工具生成的文件，服务内部出现错误。请重试；"
+                    "如果仍然失败，请运行 doctor 检查配置并查看日志。"
+                ),
             ) from error
         return contents
 
@@ -345,18 +413,18 @@ class McpRuntime:
         item: TextResourceData | BinaryResourceData,
     ) -> ReadResourceContents:
         if item.uri != requested_uri:
-            raise ValueError("resource 内容 URI 与请求不一致")
+            raise ValueError("工具生成的文件内容与请求地址不一致")
         if isinstance(item, TextResourceData):
             if len(item.text.encode("utf-8")) > RESOURCE_CHUNK_BYTES:
-                raise ValueError("文本 resource chunk 超出上限")
+                raise ValueError("工具生成的文本文件分块超过大小上限")
             content: str | bytes = item.text
         else:
             try:
                 content = base64.b64decode(item.blob, validate=True)
             except (ValueError, binascii.Error) as error:
-                raise ValueError("二进制 resource chunk 不是规范 base64") from error
+                raise ValueError("工具生成的二进制文件分块不是有效的 base64") from error
             if len(content) > RESOURCE_CHUNK_BYTES:
-                raise ValueError("二进制 resource chunk 超出上限")
+                raise ValueError("工具生成的二进制文件分块超过大小上限")
         return ReadResourceContents(
             content=content,
             mime_type=item.mime_type,

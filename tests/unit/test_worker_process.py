@@ -383,17 +383,38 @@ def test_close_sends_eof_before_terminate_and_kill(tmp_path: Path) -> None:
     assert process.actions == ["wait", "terminate", "wait", "kill", "wait"]
 
 
-def test_log_root_inside_working_tree_is_rejected(tmp_path: Path) -> None:
+def test_log_root_inside_working_tree_is_allowed(tmp_path: Path) -> None:
     sample = tmp_path / "repo" / "sample.exe"
     (sample.parent / ".git").mkdir(parents=True)
     sample.write_bytes(b"sample")
+    log_root = sample.parent / "logs"
+    worker = WorkerProcess.launch(
+        kind="bootstrap",
+        sample=sample,
+        log_root=log_root,
+        working_tree=sample.parent,
+        process_launcher=_Launcher(_Process()),
+        endpoint_factory=_endpoint,
+        client_factory=lambda _endpoint_value: _Client(),
+        sleeper=lambda _seconds: None,
+    )
 
-    with pytest.raises(ValueError, match="日志目录不得位于工作树"):
+    assert log_root.is_dir()
+    worker.close()
+
+
+def test_log_root_rejects_directory_that_contains_working_tree(tmp_path: Path) -> None:
+    working_tree = tmp_path / "repo"
+    sample = working_tree / "sample.exe"
+    (working_tree / ".git").mkdir(parents=True)
+    sample.write_bytes(b"sample")
+
+    with pytest.raises(ValueError, match="项目根目录或它的上级目录"):
         WorkerProcess.launch(
             kind="bootstrap",
             sample=sample,
-            log_root=sample.parent / "logs",
-            working_tree=sample.parent,
+            log_root=tmp_path,
+            working_tree=working_tree,
             process_launcher=_Launcher(_Process()),
             endpoint_factory=_endpoint,
             client_factory=lambda _endpoint_value: _Client(),

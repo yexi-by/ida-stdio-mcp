@@ -169,8 +169,8 @@ def _prepare_log_root(log_root: Path, working_tree: Path | None) -> Path:
         if working_tree is not None
         else (_find_working_tree(Path.cwd().resolve()) or _find_working_tree(root))
     )
-    if tree is not None and _is_within(root, tree):
-        raise ValueError(f"worker 日志目录不得位于工作树内: {root}")
+    if tree is not None and _is_within(tree, root):
+        raise ValueError(f"IDA 日志目录不能是项目根目录或它的上级目录：{root}")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
     return root
 

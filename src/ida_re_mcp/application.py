@@ -18,12 +18,13 @@ from typing import Literal, cast
 
 from pydantic import JsonValue
 
-from ida_re_mcp.config import AppConfig, RuntimePaths, load_config
+from ida_re_mcp.config import AppConfig, RuntimePaths, default_config_path, load_config
 from ida_re_mcp.constants import (
     MAX_INLINE_RESULT_BYTES,
     OPERATION_RETENTION_SECONDS,
     RESOURCE_CHUNK_BYTES,
 )
+from ida_re_mcp.diagnostics import write_exception_log
 from ida_re_mcp.domain.base import JsonObject, StrictModel
 from ida_re_mcp.domain.catalog import build_tool_catalog
 from ida_re_mcp.domain.errors import (
@@ -263,6 +264,79 @@ _WORKER_BUSINESS_ERRORS: dict[str, BusinessErrorCode] = {
     "worker_crashed": BusinessErrorCode.WORKER_CRASHED,
     "worker_timeout": BusinessErrorCode.WORKER_CRASHED,
 }
+_WORKER_PUBLIC_MESSAGES: dict[str, str] = {
+    "ambiguous_reference": ("这个名称对应多个目标。请改用明确的编号或地址后重试。"),
+    "capability_unavailable": (
+        "当前 IDA 安装没有完成这项操作所需的功能。"
+        "如果请求包含伪代码，请确认已经安装并授权 Hex-Rays Decompiler。"
+    ),
+    "cursor_stale": ("分页位置已经失效。请去掉 cursor，从第一页重新查询。"),
+    "debug_state_conflict": (
+        "调试会话的当前状态不允许这个操作。请先调用 debug.events 读取最新状态；"
+        "程序暂停后，请使用最新的 stop_id。"
+    ),
+    "policy_denied": (
+        "config.toml 当前禁止这项操作。确实需要时，请修改 [policy] 中对应的选项并重启服务。"
+    ),
+    "revision_conflict": (
+        "分析项目已经产生新版本，当前操作不能继续。"
+        "请调用 workspace.get 读取 current_revision，再用新版本重新发起操作。"
+    ),
+    "slice_seed_not_found": (
+        "IDA 在这个地址没有找到可追踪的数据流指令。"
+        "请先用 address.inspect 确认地址，或换一个指令地址。"
+    ),
+    "unsupported": ("IDA 无法按当前目标或参数完成这项操作。请检查工具说明、编号和地址后重试。"),
+    "worker_crashed": ("IDA 后台进程意外退出。请查看 logs 目录中的本次运行日志，然后重试。"),
+    "worker_timeout": ("IDA 后台处理超时，已经停止。请查看 logs 目录中的本次运行日志，然后重试。"),
+}
+_BUSINESS_PUBLIC_MESSAGES: dict[BusinessErrorCode, str] = {
+    BusinessErrorCode.AMBIGUOUS_REFERENCE: ("这个引用对应多个目标。请改用明确的编号或地址后重试。"),
+    BusinessErrorCode.CAPABILITY_UNAVAILABLE: (
+        "当前 IDA 安装没有完成这项操作所需的功能。请检查工具说明和 IDA 许可证。"
+    ),
+    BusinessErrorCode.CHANGE_SET_INVALID: (
+        "修改内容没有通过检查。请核对 change.prepare 的操作参数；"
+        "只有准备成功后才能调用 change.apply。"
+    ),
+    BusinessErrorCode.CURSOR_STALE: ("分页位置已经失效。请去掉 cursor，从第一页重新查询。"),
+    BusinessErrorCode.DEBUG_STATE_CONFLICT: (
+        "调试会话的状态已经变化。请调用 debug.events 获取最新状态；"
+        "程序暂停后，请使用最新的 stop_id。"
+    ),
+    BusinessErrorCode.EXECUTION_FAILED: (
+        "IDA 没有完成这项操作。请查看 logs 目录中的本次运行日志，然后重试。"
+    ),
+    BusinessErrorCode.OPERATION_NOT_FOUND: (
+        "找不到这个后台任务，或任务记录已经过期。"
+        "如果它属于样本分析，请调用 workspace.get 检查是否已经产生 current_revision。"
+    ),
+    BusinessErrorCode.POLICY_DENIED: (
+        "config.toml 当前禁止这项操作。确实需要时，请修改 [policy] 中对应的选项并重启服务。"
+    ),
+    BusinessErrorCode.PRECONDITION_FAILED: (
+        "操作前提已经变化。请重新读取当前数据，并用最新编号、版本或校验值重试。"
+    ),
+    BusinessErrorCode.RESOURCE_NOT_FOUND: (
+        "找不到这个工具生成的文件。请重新调用生成文件的工具，并使用它返回的新地址。"
+    ),
+    BusinessErrorCode.REVISION_CONFLICT: (
+        "分析项目已经产生新版本，当前操作不能继续。"
+        "请调用 workspace.get 读取 current_revision，再用新版本重新发起操作。"
+    ),
+    BusinessErrorCode.REVISION_NOT_FOUND: (
+        "找不到这个分析版本，它可能已经被清理。"
+        "请调用 workspace.get，并改用 current_revision 或仍然存在的历史版本。"
+    ),
+    BusinessErrorCode.UNSUPPORTED: ("当前目标或参数无法处理。请检查工具说明、编号和地址后重试。"),
+    BusinessErrorCode.WORKER_CRASHED: (
+        "IDA 后台进程没有正常完成操作。请查看 logs 目录中的本次运行日志，然后重试。"
+    ),
+    BusinessErrorCode.WORKSPACE_NOT_FOUND: (
+        "找不到这个分析项目。请先调用 workspace.list 检查 workspace_id；"
+        "找到后再用 workspace.get 读取 current_revision。"
+    ),
+}
 
 
 def _is_utf8_resource(media_type: str) -> bool:
@@ -346,7 +420,7 @@ class _SessionGarbageCollection:
 
 
 class Application:
-    """Supervisor 进程中的唯一产品应用对象。"""
+    """负责处理 MCP 请求并管理本次服务运行所需的资源。"""
 
     def __init__(
         self,
@@ -370,7 +444,13 @@ class Application:
             enable_expert=config.policy.expert,
         )
         self._catalog_by_name = {spec.name: spec for spec in catalog}
-        self._mcp = McpRuntime(self, catalog=catalog)
+        self._mcp = McpRuntime(
+            self,
+            catalog=catalog,
+            data_root=storage.paths.data_root,
+            log_root=storage.paths.shared_log_root,
+            diagnostic_log_root=storage.paths.log_root,
+        )
         self._operation_tasks: dict[str, asyncio.Task[None]] = {}
         self._operation_terminal_callbacks: dict[
             str,
@@ -406,8 +486,12 @@ class Application:
         paths: RuntimePaths | None = None,
         backend: IdaBackend | None = None,
     ) -> Application:
+        config_source = (config_path or default_config_path()).resolve()
         config = load_config(config_path)
-        runtime_paths = paths or RuntimePaths.discover(runtime=config.runtime)
+        runtime_paths = paths or RuntimePaths.discover(
+            runtime=config.runtime,
+            config_directory=config_source.parent,
+        )
         runtime_paths.data_root.mkdir(parents=True, exist_ok=True)
         registry_lease = exclusive_process_lease(_session_registry_lease_path(runtime_paths))
         registry_lease.acquire()
@@ -416,8 +500,8 @@ class Application:
             owner_lease = exclusive_process_lease(runtime_paths.session_lease_path)
             if not owner_lease.try_acquire():
                 raise SupervisorAlreadyRunningError(
-                    "当前 MCP 会话目录已被另一个 ida-re-mcp Supervisor 占用: "
-                    f"{runtime_paths.session_data_root.resolve()}"
+                    "当前连接使用的运行目录正在被另一个 ida-re-mcp 使用。"
+                    "请关闭重复启动的服务后重试。"
                 )
             try:
                 storage = SupervisorStorage.open(config=config, paths=runtime_paths)
@@ -441,7 +525,12 @@ class Application:
                     ),
                     owner_lease=owner_lease,
                 )
-            except BaseException:
+            except BaseException as error:
+                write_exception_log(
+                    runtime_paths.log_root,
+                    context="ida-re-mcp 启动失败",
+                    error=error,
+                )
                 owner_lease.release()
                 raise
         finally:
@@ -488,7 +577,7 @@ class Application:
                 return await self._expert_execute(cast(ExpertExecuteInput, arguments))
             raise ToolExecutionError(
                 BusinessErrorCode.UNSUPPORTED,
-                f"工具尚未实现: {name}",
+                f"当前服务没有提供工具 `{name}`。请先读取 tools/list，并使用其中列出的名称。",
             )
         except ToolExecutionError:
             raise
@@ -517,7 +606,9 @@ class Application:
                     query_digest=digest,
                 ).offset
             except CursorError as exc:
-                raise ResourceRequestError("resource cursor 已失效") from exc
+                raise ResourceRequestError(
+                    "下一页位置已经失效。请从第一页重新读取生成文件列表。"
+                ) from exc
         page_items = artifacts[offset : offset + 200]
         next_offset = offset + len(page_items)
         next_cursor = (
@@ -531,7 +622,7 @@ class Application:
                     uri=item.uri,
                     name=item.name or item.artifact_id,
                     title=item.name,
-                    description=f"不可变 artifact, SHA-256 {item.content_sha256}",
+                    description=(f"工具生成的文件。内容校验值为 SHA-256 {item.content_sha256}。"),
                     mime_type=item.media_type,
                     size_bytes=item.size,
                 )
@@ -549,7 +640,10 @@ class Application:
         try:
             workspace_id, revision, artifact_id = parse_artifact_uri(uri)
         except ValueError as exc:
-            raise ResourceRequestError("resource URI 无效", uri=uri) from exc
+            raise ResourceRequestError(
+                "文件地址格式不正确。请使用工具返回的完整文件地址。",
+                uri=uri,
+            ) from exc
         try:
             metadata = await asyncio.to_thread(
                 self.storage.artifacts.get,
@@ -598,19 +692,38 @@ class Application:
                 offset = chunk.next_offset
         except ArtifactNotFoundError as exc:
             raise ResourceNotFoundError(uri=uri) from exc
-        raise RuntimeError("artifact 超过单次 resource 读取上限")
+        raise RuntimeError(
+            "生成文件过大，无法一次读完。"
+            "请使用生成该文件的工具返回的文件索引，并按索引中的分块地址读取。"
+        )
 
     async def doctor(self) -> tuple[bool, JsonObject]:
         self._require_open()
         worker = await self._run_analysis_worker(self.backend.doctor)
         usage = await asyncio.to_thread(self.storage.usage)
+        healthy = bool(worker.get("available"))
         report: JsonObject = {
-            "healthy": bool(worker.get("available")),
+            "healthy": healthy,
+            "summary": (
+                "检查通过：配置、数据目录、日志目录和 IDA 都可以正常使用。"
+                if healthy
+                else "检查未通过：IDA 当前无法正常启动或响应。"
+            ),
+            "next_step": (
+                "现在可以启动 MCP 服务。"
+                if healthy
+                else (
+                    "请确认 config.toml 中的 ida_dir 指向 IDA Pro 9.3，"
+                    "再查看 runtime_paths.session_logs 目录下由 "
+                    "worker.log_file 指定的探测日志。"
+                )
+            ),
             "python": "3.13",
             "mcp": self._mcp.protocol_report(),
             "runtime_paths": {
                 "data": str(self.storage.paths.data_root),
-                "logs": str(self.storage.paths.log_root),
+                "logs": str(self.storage.paths.shared_log_root),
+                "session_logs": str(self.storage.paths.log_root),
                 "session": str(self.storage.paths.session_data_root),
             },
             "storage": {
@@ -620,7 +733,7 @@ class Application:
             },
             "worker": worker,
         }
-        return bool(report["healthy"]), report
+        return healthy, report
 
     async def gc(self, *, apply: bool) -> JsonObject:
         self._require_open()
@@ -686,8 +799,33 @@ class Application:
             "protected_bytes": protected_bytes,
             "protected_bytes_exceed_quota": protected_bytes > usage.quota_bytes,
         }
+        candidate_count = (
+            len(workspace_result.removed_paths)
+            + len(artifact_result.removed_paths)
+            + len(change_set_result.removed_change_set_paths)
+            + len(change_set_result.removed_staging_paths)
+            + len(session_result.removed_paths)
+        )
+        if apply:
+            summary = (
+                f"清理完成：删除了 {candidate_count} 项不再使用的数据，"
+                f"共释放 {reclaimed_bytes} 字节。"
+            )
+            next_step = "无需继续操作。" if candidate_count == 0 else "可以继续使用当前分析项目。"
+        else:
+            summary = (
+                f"检查完成：找到 {candidate_count} 项可以清理的数据，"
+                f"预计可释放 {reclaimed_bytes} 字节。"
+            )
+            next_step = (
+                "确认列表无误后，使用 gc --apply 执行清理。"
+                if candidate_count
+                else "当前没有需要清理的数据。"
+            )
         return {
             "applied": apply,
+            "summary": summary,
+            "next_step": next_step,
             "candidates": candidates,
             "skipped_workspace_ids": skipped_json,
             "skipped_session_ids": list(session_result.skipped_session_ids),
@@ -936,7 +1074,10 @@ class Application:
             if arguments.expected_sha256 is not None and sample_sha256 != arguments.expected_sha256:
                 raise ToolExecutionError(
                     BusinessErrorCode.PRECONDITION_FAILED,
-                    "样本 SHA-256 与 expected_sha256 不一致",
+                    (
+                        "文件的 SHA-256 与 expected_sha256 不一致。"
+                        "请确认 sample_path 指向正确文件，并更新校验值后重试。"
+                    ),
                     details={
                         "actual_sha256": sample_sha256,
                     },
@@ -946,7 +1087,10 @@ class Application:
             except UnsupportedNativeImageError as exc:
                 raise ToolExecutionError(
                     BusinessErrorCode.UNSUPPORTED,
-                    str(exc),
+                    (
+                        "无法导入这个文件。当前支持 64 位小端 ELF（x86-64 或 AArch64）"
+                        "和 64 位 PE（x86-64）。如果输入是脚本或压缩文件，请先提取实际程序。"
+                    ),
                     details=cast(dict[str, JsonValue], exc.details),
                 ) from exc
 
@@ -1018,7 +1162,7 @@ class Application:
             except CursorError as exc:
                 raise ToolExecutionError(
                     BusinessErrorCode.CURSOR_STALE,
-                    "workspace cursor 已失效",
+                    "分页位置已经失效。请去掉 cursor，从第一页重新调用 workspace.list。",
                 ) from exc
         available = workspaces[offset : offset + arguments.page_size]
         summaries: list[WorkspaceSummary] = []
@@ -1068,7 +1212,11 @@ class Application:
             if workspace.current_revision is None:
                 raise ToolExecutionError(
                     BusinessErrorCode.EXECUTION_FAILED,
-                    "workspace 首次分析尚未成功发布 revision",
+                    (
+                        "这个分析项目还没有可用版本。"
+                        "请调用 workspace.list 查看保存的首次分析结果；"
+                        "分析失败时检查 logs 目录，再决定是否重新导入。"
+                    ),
                 )
             revision_summaries = [
                 RevisionSummary(
@@ -1234,7 +1382,7 @@ class Application:
             except CursorError as exc:
                 raise ToolExecutionError(
                     BusinessErrorCode.CURSOR_STALE,
-                    "静态查询 cursor 已失效",
+                    f"分页位置已经失效。请去掉 cursor，从第一页重新调用 {name}。",
                 ) from exc
         workspace = await asyncio.to_thread(
             self.storage.workspaces.get,
@@ -1839,7 +1987,10 @@ class Application:
                 ):
                     raise ToolExecutionError(
                         BusinessErrorCode.PRECONDITION_FAILED,
-                        "inverse_of_change_id 只能撤销当前 HEAD 对应的 change",
+                        (
+                            "只能撤销当前分析版本最近保存的修改。"
+                            "请先调用 workspace.get 读取 current_revision，再重新准备撤销操作。"
+                        ),
                     )
                 plan = build_canonical_plan(
                     arguments,
@@ -2176,12 +2327,18 @@ class Application:
             request = cast(DebugFinishInput, arguments)
             session_id = request.debug_session_id
         else:
-            raise ToolExecutionError(BusinessErrorCode.UNSUPPORTED, f"未知调试工具: {name}")
+            raise ToolExecutionError(
+                BusinessErrorCode.UNSUPPORTED,
+                f"当前服务没有提供调试工具 `{name}`。请先读取 tools/list。",
+            )
         session = self._debug_sessions.get(session_id)
         if session is None:
             raise ToolExecutionError(
                 BusinessErrorCode.DEBUG_STATE_CONFLICT,
-                "debug_session_id 不存在或已经结束",
+                (
+                    "找不到这个调试会话，或会话已经结束。"
+                    "请使用 debug.establish 返回的 debug_session_id；已结束的会话不能继续使用。"
+                ),
             )
         self._cancel_debug_idle(session)
         try:
@@ -2277,12 +2434,15 @@ class Application:
             if typed.action == "terminate" and not session.owned_target:
                 raise ToolExecutionError(
                     BusinessErrorCode.POLICY_DENIED,
-                    "只能终止由本服务启动并纳入 Job Object 的目标",
+                    (
+                        "不能结束这个外部进程。terminate 只适用于由本服务启动的目标；"
+                        "外部进程请使用 detach。"
+                    ),
                 )
             if typed.action == "detach" and session.owned_target:
                 raise ToolExecutionError(
                     BusinessErrorCode.POLICY_DENIED,
-                    "本服务启动的目标必须使用 terminate 结束",
+                    "这个进程由本服务启动，不能只断开连接。请使用 terminate 结束进程。",
                 )
             raw = await self._execute_debug(
                 session,
@@ -2326,12 +2486,18 @@ class Application:
         if target_kind == "launch" and not self.config.policy.debug_launch:
             raise ToolExecutionError(
                 BusinessErrorCode.POLICY_DENIED,
-                "策略禁止 launch",
+                (
+                    "config.toml 当前不允许启动调试目标。"
+                    "确实需要时，请将 policy.debug_launch 设为 true 并重启服务。"
+                ),
             )
         if target_kind == "attach" and not self.config.policy.debug_attach:
             raise ToolExecutionError(
                 BusinessErrorCode.POLICY_DENIED,
-                "策略禁止 attach",
+                (
+                    "config.toml 当前不允许连接已经运行的进程。"
+                    "确实需要时，请将 policy.debug_attach 设为 true 并重启服务。"
+                ),
             )
         runtime_sample_name = (
             workspace.sample_path.name
@@ -2519,7 +2685,7 @@ class Application:
             if _inline_model_size(compact) > MAX_INLINE_RESULT_BYTES:
                 raise RuntimeError("debug.breakpoints artifact 引用结果仍超过 inline 上限")
             return compact
-        except BaseException as original:
+        except BaseException:
             try:
                 current_after_failure = await self._execute_debug(
                     session,
@@ -2535,11 +2701,10 @@ class Application:
             except BaseException as rollback_error:
                 raise ToolExecutionError(
                     BusinessErrorCode.EXECUTION_FAILED,
-                    "断点替换失败且无法恢复原断点集合",
-                    details={
-                        "failure": type(original).__name__,
-                        "rollback_failure": type(rollback_error).__name__,
-                    },
+                    (
+                        "断点没有全部设置成功，并且原来的断点也未能恢复。"
+                        "请调用 debug.events 确认程序状态，再用最新 stop_id 读取断点。"
+                    ),
                 ) from rollback_error
             raise
 
@@ -3146,7 +3311,7 @@ class Application:
                 strict=True,
             )
         document: dict[str, object] = {
-            "title": arguments.title or "Reverse Engineering Report",
+            "title": arguments.title or "逆向分析报告",
             "workspace_id": arguments.workspace_id,
             "revision": arguments.revision,
             "sections": arguments.sections,
@@ -3176,36 +3341,37 @@ class Application:
         else:
             lines = [
                 f"# {document['title']}\n\n"
-                f"- Workspace: `{arguments.workspace_id}`\n"
-                f"- Revision: `{arguments.revision}`\n"
+                f"- 分析项目编号：`{arguments.workspace_id}`\n"
+                f"- 分析版本：`{arguments.revision}`\n"
             ]
             if "overview" in arguments.sections:
                 lines.extend(
                     (
-                        "\n## Overview\n\n",
-                        f"- Architecture: `{overview.image.architecture}`\n",
-                        f"- Format: `{overview.image.format}`\n",
-                        f"- Image base: `{overview.image.image_base}`\n",
-                        f"- Image size: `{overview.image.image_size}`\n",
+                        "\n## 概览\n\n",
+                        f"- 处理器架构：`{overview.image.architecture}`\n",
+                        f"- 文件格式：`{overview.image.format}`\n",
+                        f"- 默认加载地址：`{overview.image.image_base}`\n",
+                        f"- 文件映像大小：`{overview.image.image_size}`\n",
                         f"- SHA-256: `{overview.image.sha256}`\n",
-                        f"- Functions: `{overview.counts.functions}`\n",
-                        f"- Strings: `{overview.counts.strings}`\n",
+                        f"- 函数数量：`{overview.counts.functions}`\n",
+                        f"- 字符串数量：`{overview.counts.strings}`\n",
                     )
                 )
             if "entry_points" in arguments.sections:
-                lines.append("\n## Entry points\n\n")
+                lines.append("\n## 入口点\n\n")
                 lines.extend(
-                    f"- `{item.name}` at `{_address_text(item.address.model_dump(mode='json'))}`\n"
+                    f"- `{item.name}`，地址 "
+                    f"`{_address_text(item.address.model_dump(mode='json'))}`\n"
                     for item in overview.entry_points
                 )
             if "imports_exports" in arguments.sections:
                 for heading, items in (
-                    ("Imports", overview.imports),
-                    ("Exports", overview.exports),
+                    ("导入项", overview.imports),
+                    ("导出项", overview.exports),
                 ):
                     lines.append(f"\n## {heading}\n\n")
                     lines.extend(
-                        f"- `{item.name}` at "
+                        f"- `{item.name}`，地址 "
                         f"`{_address_text(item.address.model_dump(mode='json'))}`\n"
                         for item in items
                     )
@@ -3358,7 +3524,11 @@ class Application:
         if operation is None:
             return None
         if operation.state is OperationState.FAILED:
-            reason = operation.failure.message if operation.failure is not None else "长操作失败"
+            reason = (
+                operation.failure.message
+                if operation.failure is not None
+                else _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.EXECUTION_FAILED]
+            )
             return (
                 "failed",
                 WorkspaceAnalysisOutcome(
@@ -3446,6 +3616,17 @@ class Application:
                             message="操作因服务关闭而中止",
                         )
             except Exception as exc:
+                diagnostic_details = (
+                    exc.details
+                    if isinstance(exc, (ToolExecutionError, WorkerProcessError, WorkerError))
+                    else None
+                )
+                write_exception_log(
+                    self.storage.paths.log_root,
+                    context=(f"后台任务 {kind}（{snapshot.operation_id}）执行失败"),
+                    error=exc,
+                    details=diagnostic_details,
+                )
                 code, message, details = _operation_failure(exc)
                 try:
                     await record_unsuccessful_terminal("failed", message)
@@ -3804,16 +3985,16 @@ def _operation_failure(exc: Exception) -> tuple[str, str, JsonValue]:
     if isinstance(exc, ToolExecutionError):
         return exc.code.value, exc.message, cast(JsonValue, exc.details)
     if isinstance(exc, WorkerProcessError):
-        details = dict(exc.details)
         if exc.code == "worker_timeout":
-            details["reason"] = "timeout"
-            message = "worker 操作超时并已终止"
+            details: JsonValue = {"reason": "timeout"}
+            message = _WORKER_PUBLIC_MESSAGES["worker_timeout"]
         else:
-            message = "worker 进程崩溃或失联"
+            details = {"reason": "process_exited"}
+            message = _WORKER_PUBLIC_MESSAGES["worker_crashed"]
         return (
             BusinessErrorCode.WORKER_CRASHED.value,
             message,
-            cast(JsonValue, details),
+            details,
         )
     translated = _tool_error(exc)
     if translated is not None:
@@ -3822,30 +4003,55 @@ def _operation_failure(exc: Exception) -> tuple[str, str, JsonValue]:
             translated.message,
             cast(JsonValue, translated.details),
         )
-    return "execution_failed", "长操作失败", None
+    return (
+        BusinessErrorCode.EXECUTION_FAILED.value,
+        _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.EXECUTION_FAILED],
+        None,
+    )
 
 
 def _tool_error(exc: Exception) -> ToolExecutionError | None:
     if isinstance(exc, WorkspaceNotFoundError):
-        return ToolExecutionError(BusinessErrorCode.WORKSPACE_NOT_FOUND, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.WORKSPACE_NOT_FOUND,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.WORKSPACE_NOT_FOUND],
+        )
     if isinstance(exc, RevisionNotFoundError):
-        return ToolExecutionError(BusinessErrorCode.REVISION_NOT_FOUND, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.REVISION_NOT_FOUND,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.REVISION_NOT_FOUND],
+        )
     if isinstance(exc, RevisionConflictError):
-        return ToolExecutionError(BusinessErrorCode.REVISION_CONFLICT, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.REVISION_CONFLICT,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.REVISION_CONFLICT],
+        )
     if isinstance(exc, OperationNotFoundError):
-        return ToolExecutionError(BusinessErrorCode.OPERATION_NOT_FOUND, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.OPERATION_NOT_FOUND,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.OPERATION_NOT_FOUND],
+        )
     if isinstance(exc, ArtifactNotFoundError):
-        return ToolExecutionError(BusinessErrorCode.RESOURCE_NOT_FOUND, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.RESOURCE_NOT_FOUND,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.RESOURCE_NOT_FOUND],
+        )
     if isinstance(exc, CursorError):
-        return ToolExecutionError(BusinessErrorCode.CURSOR_STALE, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.CURSOR_STALE,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.CURSOR_STALE],
+        )
     if isinstance(exc, (WorkerProcessError, WorkerError)):
         code = getattr(exc, "code", "worker_crashed")
         business = _WORKER_BUSINESS_ERRORS.get(
             code,
             BusinessErrorCode.EXECUTION_FAILED,
         )
-        details = cast(dict[str, JsonValue], getattr(exc, "details", {}))
-        return ToolExecutionError(business, str(exc), details=details)
+        message = _WORKER_PUBLIC_MESSAGES.get(
+            code,
+            _BUSINESS_PUBLIC_MESSAGES[business],
+        )
+        return ToolExecutionError(business, message)
     if isinstance(
         exc,
         (
@@ -3854,15 +4060,36 @@ def _tool_error(exc: Exception) -> ToolExecutionError | None:
             ChangeSetError,
         ),
     ):
-        return ToolExecutionError(BusinessErrorCode.CHANGE_SET_INVALID, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.CHANGE_SET_INVALID,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.CHANGE_SET_INVALID],
+        )
     if isinstance(exc, StaticAdapterCapabilityError):
-        return ToolExecutionError(BusinessErrorCode.CAPABILITY_UNAVAILABLE, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.CAPABILITY_UNAVAILABLE,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.CAPABILITY_UNAVAILABLE],
+        )
     if isinstance(exc, StaticAdapterInputError):
-        return ToolExecutionError(BusinessErrorCode.UNSUPPORTED, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.UNSUPPORTED,
+            (
+                "无法按这组参数执行查询。"
+                "请检查 workspace_id、revision、编号和地址，并按工具说明修改后重试。"
+            ),
+        )
     if isinstance(exc, DebugAdapterError):
-        return ToolExecutionError(BusinessErrorCode.DEBUG_STATE_CONFLICT, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.DEBUG_STATE_CONFLICT,
+            _BUSINESS_PUBLIC_MESSAGES[BusinessErrorCode.DEBUG_STATE_CONFLICT],
+        )
     if isinstance(exc, RefineAdapterInputError):
-        return ToolExecutionError(BusinessErrorCode.UNSUPPORTED, str(exc))
+        return ToolExecutionError(
+            BusinessErrorCode.UNSUPPORTED,
+            (
+                "无法按这些目标和动作重新分析。"
+                "请先用 address.inspect 确认地址，并按 analysis.refine 的工具说明修改后重试。"
+            ),
+        )
     if isinstance(
         exc,
         (
@@ -3872,7 +4099,13 @@ def _tool_error(exc: Exception) -> ToolExecutionError | None:
             ExpertAdapterError,
         ),
     ):
-        return ToolExecutionError(BusinessErrorCode.WORKER_CRASHED, "worker 结果不可信")
+        return ToolExecutionError(
+            BusinessErrorCode.WORKER_CRASHED,
+            (
+                "IDA 返回的数据未通过检查，服务没有使用这些数据。"
+                "请查看 logs 目录中的本次运行日志，然后重试。"
+            ),
+        )
     if isinstance(
         exc,
         (
@@ -3885,6 +4118,9 @@ def _tool_error(exc: Exception) -> ToolExecutionError | None:
     ):
         return ToolExecutionError(
             BusinessErrorCode.EXECUTION_FAILED,
-            "持久化状态未通过完整性校验",
+            (
+                "保存的数据未通过完整性检查，服务已经停止使用它。"
+                "请不要继续修改这个分析项目；查看 logs 目录，必要时重新导入样本。"
+            ),
         )
     return None

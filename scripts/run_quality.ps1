@@ -34,8 +34,22 @@ function Invoke-CheckedPowerShellScript {
 }
 
 $repository = [System.IO.Path]::GetFullPath((Split-Path -Parent $PSScriptRoot))
+$qualityRoot = Join-Path (
+    [System.IO.Path]::GetTempPath()
+) ("ida-re-mcp-quality-" + [Guid]::NewGuid().ToString("N"))
+$qualityRoot = [System.IO.Path]::GetFullPath($qualityRoot)
+$temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+if (-not $qualityRoot.StartsWith(
+    $temporaryRoot,
+    [System.StringComparison]::OrdinalIgnoreCase
+)) {
+    throw "质量检查的临时目录必须位于系统临时目录"
+}
+
+$hadProjectEnvironment = Test-Path Env:UV_PROJECT_ENVIRONMENT
+$originalProjectEnvironment = $env:UV_PROJECT_ENVIRONMENT
 if (-not $env:UV_PROJECT_ENVIRONMENT) {
-    $env:UV_PROJECT_ENVIRONMENT = Join-Path $env:LOCALAPPDATA "ida-re-mcp/dev-venv"
+    $env:UV_PROJECT_ENVIRONMENT = Join-Path $qualityRoot "project-venv"
 }
 $projectEnvironment = [System.IO.Path]::GetFullPath($env:UV_PROJECT_ENVIRONMENT)
 $repositoryPrefix = $repository + [System.IO.Path]::DirectorySeparatorChar
@@ -49,19 +63,7 @@ if (
         [System.StringComparison]::OrdinalIgnoreCase
     )
 ) {
-    throw "UV_PROJECT_ENVIRONMENT 必须位于工作树外"
-}
-
-$qualityRoot = Join-Path (
-    [System.IO.Path]::GetTempPath()
-) ("ida-re-mcp-quality-" + [Guid]::NewGuid().ToString("N"))
-$qualityRoot = [System.IO.Path]::GetFullPath($qualityRoot)
-$temporaryRoot = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
-if (-not $qualityRoot.StartsWith(
-    $temporaryRoot,
-    [System.StringComparison]::OrdinalIgnoreCase
-)) {
-    throw "质量门禁临时目录必须位于平台临时目录"
+    throw "UV_PROJECT_ENVIRONMENT 不能是项目目录或项目中的子目录"
 }
 
 try {
@@ -137,6 +139,12 @@ try {
     }
 }
 finally {
+    if ($hadProjectEnvironment) {
+        $env:UV_PROJECT_ENVIRONMENT = $originalProjectEnvironment
+    }
+    else {
+        Remove-Item Env:UV_PROJECT_ENVIRONMENT -ErrorAction SilentlyContinue
+    }
     if (Test-Path -LiteralPath $qualityRoot) {
         Remove-Item -Recurse -Force -LiteralPath $qualityRoot
     }

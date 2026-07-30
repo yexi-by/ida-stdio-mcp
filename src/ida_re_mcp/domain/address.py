@@ -28,7 +28,7 @@ type U64Hex = Annotated[
 
 
 class ImageAddress(StrictModel):
-    """相对于已分析镜像基址的稳定地址。"""
+    """相对于程序默认加载地址的位置，不受实际调试加载地址影响。"""
 
     kind: Literal["image"]
     image_id: ImageId
@@ -36,7 +36,7 @@ class ImageAddress(StrictModel):
 
 
 class DatabaseAddress(StrictModel):
-    """指定 IDB revision 中的数据库有效地址。"""
+    """IDA 数据库中的地址，只能用于对应的分析版本。"""
 
     kind: Literal["database"]
     ea: U64Hex
@@ -50,7 +50,7 @@ class FileAddress(StrictModel):
 
 
 class RuntimeAddress(StrictModel):
-    """绑定调试暂停快照的运行时虚拟地址。"""
+    """程序暂停时的实际内存地址，只能用于同一个 stop_id。"""
 
     kind: Literal["runtime"]
     module_id: ModuleId

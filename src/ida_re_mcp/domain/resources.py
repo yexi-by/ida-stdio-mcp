@@ -1,4 +1,4 @@
-"""不可变 artifact 的资源目录与读取结果。"""
+"""工具生成文件的目录与读取结果。"""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ type ArtifactUri = Annotated[
 
 
 class ResourceDescriptor(StrictModel):
-    """`resources/list` 暴露的不可变 artifact 描述。"""
+    """`resources/list` 返回的文件说明。"""
 
     uri: ArtifactUri
     name: str = Field(min_length=1, max_length=256)
@@ -36,14 +36,14 @@ class ResourceDescriptor(StrictModel):
 
 
 class ResourcePage(StrictModel):
-    """Supervisor 返回给协议层的资源分页。"""
+    """主服务交给 MCP 的一页文件列表。"""
 
     resources: list[ResourceDescriptor] = Field(max_length=200)
     next_cursor: Cursor | None = None
 
 
 class TextResourceData(StrictModel):
-    """UTF-8 文本资源块。"""
+    """一块 UTF-8 文本文件内容。"""
 
     kind: Literal["text"]
     uri: ArtifactUri
@@ -69,7 +69,7 @@ type Base64Text = Annotated[
 
 
 class BinaryResourceData(StrictModel):
-    """以 base64 表达的二进制资源块。"""
+    """一块使用 base64 表示的二进制文件内容。"""
 
     kind: Literal["blob"]
     uri: ArtifactUri
@@ -84,6 +84,6 @@ type ResourceData = Annotated[
 
 
 class ResourceRead(StrictModel):
-    """Supervisor 返回给协议层的资源读取结果。"""
+    """主服务交给 MCP 的文件内容。"""
 
     contents: list[ResourceData] = Field(min_length=1, max_length=64)

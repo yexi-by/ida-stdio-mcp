@@ -10,6 +10,7 @@ from typing import cast
 
 import pytest
 
+import ida_re_mcp.application as application_module
 from ida_re_mcp.application import Application
 from ida_re_mcp.config import RuntimePaths
 from ida_re_mcp.constants import OPERATION_RETENTION_SECONDS
@@ -129,6 +130,27 @@ def _finish_process(process: subprocess.Popen[str], crash: Path) -> tuple[str, s
     except subprocess.TimeoutExpired:
         process.kill()
         return process.communicate(timeout=5)
+
+
+def test_application_open_writes_unexpected_failure_to_session_log(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _runtime_paths(tmp_path)
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('schema_version = "1"\n', encoding="utf-8")
+
+    def fail_change_store(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("private startup detail")
+
+    monkeypatch.setattr(application_module, "ChangeSetStore", fail_change_store)
+
+    with pytest.raises(RuntimeError, match="private startup detail"):
+        Application.open(config_path, paths=paths)
+
+    log = (paths.log_root / "service-errors.log").read_text(encoding="utf-8")
+    assert "ida-re-mcp 启动失败" in log
+    assert "private startup detail" in log
 
 
 class _FailingAsyncLock:
@@ -381,7 +403,7 @@ def test_application_owner_lease_precedes_operation_recovery_and_survives_crash(
 
         record_path.write_bytes(b"deliberately invalid while active owner is alive")
         started = time.monotonic()
-        with pytest.raises(SupervisorAlreadyRunningError, match="Supervisor"):
+        with pytest.raises(SupervisorAlreadyRunningError, match="ida-re-mcp"):
             Application.open(config_path, paths=paths)
         assert time.monotonic() - started < 1
         assert record_path.read_bytes() == b"deliberately invalid while active owner is alive"

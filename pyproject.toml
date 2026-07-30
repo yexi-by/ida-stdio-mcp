@@ -47,6 +47,7 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "RUF"]
+allowed-confusables = ["，", "：", "；", "（", "）", "“", "”"]
 
 [tool.basedpyright]
 include = ["src", "tests"]

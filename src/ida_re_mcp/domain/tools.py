@@ -75,8 +75,15 @@ type ByteHex = Annotated[
 
 
 class OperationWaitInput(StrictModel):
-    operation_id: OperationId
-    wait_ms: int = Field(default=0, ge=0, le=MAX_OPERATION_WAIT_MS)
+    """查询后台任务，或等待它的状态发生变化。"""
+
+    operation_id: OperationId = Field(description="要查询的后台任务编号。")
+    wait_ms: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_OPERATION_WAIT_MS,
+        description="最多等待多少毫秒；0 表示立即返回当前状态。",
+    )
 
 
 class OperationFailure(StrictModel):
@@ -86,7 +93,9 @@ class OperationFailure(StrictModel):
 
 
 class OperationWaitOutput(StrictModel):
-    operation_id: OperationId
+    """后台任务当前可以确认的状态和结果。"""
+
+    operation_id: OperationId = Field(description="本次查询对应的后台任务编号。")
     state: Literal[
         "queued",
         "running",
@@ -95,14 +104,31 @@ class OperationWaitOutput(StrictModel):
         "failed",
         "cancelled",
     ]
-    progress: float | None = Field(default=None, ge=0.0, le=1.0)
-    result: JsonValue | None = None
-    failure: OperationFailure | None = None
+    progress: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="只有服务能确认真实进度时才返回；无法确认时为 null。",
+    )
+    result: JsonValue | None = Field(
+        default=None,
+        description="任务成功后的完整结果；任务未成功时为 null。",
+    )
+    failure: OperationFailure | None = Field(
+        default=None,
+        description="任务失败的原因和是否适合重试。",
+    )
 
 
 class OperationCancelInput(StrictModel):
-    operation_id: OperationId
-    reason: str | None = Field(default=None, max_length=1_024)
+    """请求停止一个尚未结束的后台任务。"""
+
+    operation_id: OperationId = Field(description="要停止的后台任务编号。")
+    reason: str | None = Field(
+        default=None,
+        max_length=1_024,
+        description="可选的停止原因，供后续接手任务的 Agent 参考。",
+    )
 
 
 class OperationCancelOutput(StrictModel):
@@ -119,8 +145,17 @@ class OperationCancelOutput(StrictModel):
 
 
 class WorkspaceCreateInput(StrictModel):
-    sample_path: str = Field(min_length=1, max_length=32_767)
-    expected_sha256: Sha256 | None = None
+    """复制一个程序文件，并创建可以长期接手的分析项目。"""
+
+    sample_path: str = Field(
+        min_length=1,
+        max_length=32_767,
+        description="要分析的 PE 或 ELF 文件路径；原文件不会被修改。",
+    )
+    expected_sha256: Sha256 | None = Field(
+        default=None,
+        description="可选的文件校验值；不一致时拒绝创建，避免分析错文件。",
+    )
 
 
 class WorkspaceCreateOutput(StrictModel):
@@ -131,8 +166,18 @@ class WorkspaceCreateOutput(StrictModel):
 
 
 class WorkspaceListInput(StrictModel):
-    cursor: Cursor | None = None
-    page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
+    """列出 data 目录中已经保存的分析项目。"""
+
+    cursor: Cursor | None = Field(
+        default=None,
+        description="上一页返回的 next_cursor；首次查询不要填写。",
+    )
+    page_size: int = Field(
+        default=DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=MAX_PAGE_SIZE,
+        description="本页最多返回多少个分析项目。",
+    )
 
 
 class WorkspaceAnalysisOutcome(StrictModel):
@@ -167,9 +212,19 @@ class WorkspaceListOutput(StrictModel):
 
 
 class WorkspaceGetInput(StrictModel):
-    workspace_id: WorkspaceId
-    cursor: Cursor | None = None
-    page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
+    """读取一个分析项目的当前版本和历史版本。"""
+
+    workspace_id: WorkspaceId = Field(description="要读取的分析项目编号。")
+    cursor: Cursor | None = Field(
+        default=None,
+        description="上一页返回的 next_cursor；首次查询不要填写。",
+    )
+    page_size: int = Field(
+        default=DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=MAX_PAGE_SIZE,
+        description="本页最多返回多少个历史版本。",
+    )
 
 
 class RevisionSummary(StrictModel):
@@ -196,9 +251,11 @@ class WorkspaceGetOutput(StrictModel):
 
 
 class WorkspaceExportInput(StrictModel):
-    workspace_id: WorkspaceId
-    revision: RevisionId
-    format: Literal["idb"]
+    """把已经保存的分析版本导出为 IDA 数据库文件。"""
+
+    workspace_id: WorkspaceId = Field(description="要导出的分析项目编号。")
+    revision: RevisionId = Field(description="要导出的分析版本。")
+    format: Literal["idb"] = Field(description="导出格式；当前只支持 IDA 数据库。")
 
 
 class WorkspaceExportOutput(StrictModel):
@@ -208,6 +265,8 @@ class WorkspaceExportOutput(StrictModel):
 
 
 class ProgramOverviewInput(StaticQuery):
+    """读取程序的基本信息，并按需附带指定内容。"""
+
     include: list[
         Literal[
             "segments",
@@ -219,7 +278,14 @@ class ProgramOverviewInput(StaticQuery):
             "functions",
             "strings",
         ]
-    ] = Field(default_factory=list, max_length=8)
+    ] = Field(
+        default_factory=list,
+        max_length=8,
+        description=(
+            "要附带的内容；留空时只返回文件信息和数量。"
+            "可选段、入口点、导入、导出、重定位、异常处理、函数和字符串。"
+        ),
+    )
 
 
 class ImageSummary(StrictModel):
@@ -293,15 +359,34 @@ class ProgramOverviewOutput(StaticOutput):
 
 
 class ProgramSearchInput(StaticQuery):
+    """按文本或十六进制字节搜索已经分析出的内容。"""
+
     domains: list[Literal["function", "name", "string", "bytes"]] = Field(
         min_length=1,
         max_length=4,
+        description="搜索范围：函数、名称、字符串或原始字节。",
     )
-    text_query: str | None = Field(default=None, max_length=1_024)
-    bytes_query: ByteHex | None = Field(default=None, max_length=2_048)
-    cursor: Cursor | None = None
-    page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
-    case_sensitive: bool = False
+    text_query: str | None = Field(
+        default=None,
+        max_length=1_024,
+        description="文本搜索内容；搜索函数、名称或字符串时必须填写。",
+    )
+    bytes_query: ByteHex | None = Field(
+        default=None,
+        max_length=2_048,
+        description="不带空格的十六进制字节；搜索 bytes 时必须填写。",
+    )
+    cursor: Cursor | None = Field(
+        default=None,
+        description="上一页返回的 next_cursor；首次查询不要填写。",
+    )
+    page_size: int = Field(
+        default=DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=MAX_PAGE_SIZE,
+        description="本页最多返回多少条匹配结果。",
+    )
+    case_sensitive: bool = Field(default=False, description="文本搜索是否区分大小写。")
 
     @model_validator(mode="after")
     def validate_search_capabilities(self) -> Self:
@@ -336,11 +421,20 @@ class ProgramSearchOutput(StaticOutput):
 
 
 class AddressInspectInput(StaticQuery):
-    address: AddressRef
+    """读取一个地址处的指令、数据、名称、引用或所属函数。"""
+
+    address: AddressRef = Field(description="要检查的地址及其地址种类。")
     include: list[Literal["bytes", "instruction", "data", "symbol", "xrefs", "function"]] = Field(
-        default_factory=list, max_length=6
+        default_factory=list,
+        max_length=6,
+        description="要返回的内容；留空时只确认地址。",
     )
-    byte_count: int = Field(default=32, ge=0, le=256)
+    byte_count: int = Field(
+        default=32,
+        ge=0,
+        le=256,
+        description="请求 bytes 时，从该地址最多读取多少字节。",
+    )
 
 
 class CrossReference(StrictModel):
@@ -399,7 +493,9 @@ type FunctionSelector = Annotated[
 
 
 class FunctionInspectInput(StaticQuery):
-    function: FunctionSelector
+    """按函数编号或地址读取函数详情。"""
+
+    function: FunctionSelector = Field(description="要检查的函数编号或函数内地址。")
     views: list[
         Literal[
             "summary",
@@ -414,9 +510,22 @@ class FunctionInspectInput(StaticQuery):
             "locals",
             "types",
         ]
-    ] = Field(default_factory=lambda: ["summary"], min_length=1, max_length=11)
-    cursor: Cursor | None = None
-    page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
+    ] = Field(
+        default_factory=lambda: ["summary"],
+        min_length=1,
+        max_length=11,
+        description="要读取的函数信息；默认只返回摘要。",
+    )
+    cursor: Cursor | None = Field(
+        default=None,
+        description="上一页返回的 next_cursor；首次查询不要填写。",
+    )
+    page_size: int = Field(
+        default=DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=MAX_PAGE_SIZE,
+        description="本页最多返回多少条明细。",
+    )
 
 
 class FunctionChunk(StrictModel):
@@ -486,11 +595,27 @@ class FunctionInspectOutput(StaticOutput):
 
 
 class GraphQueryInput(StaticQuery):
-    graph: Literal["cfg", "call", "xref"]
-    roots: list[AddressRef] = Field(min_length=1, max_length=32)
-    direction: Literal["outgoing", "incoming", "both"] = "outgoing"
-    max_depth: int = Field(default=1, ge=0, le=32)
-    max_nodes: int = Field(default=DEFAULT_GRAPH_NODES, ge=1, le=MAX_GRAPH_NODES)
+    """从指定地址开始查询控制流、函数调用或引用关系。"""
+
+    graph: Literal["cfg", "call", "xref"] = Field(
+        description="关系种类：函数内控制流、函数调用或代码与数据引用。"
+    )
+    roots: list[AddressRef] = Field(
+        min_length=1,
+        max_length=32,
+        description="开始查询的一个或多个地址。",
+    )
+    direction: Literal["outgoing", "incoming", "both"] = Field(
+        default="outgoing",
+        description="查询向外关系、向内关系或两个方向。",
+    )
+    max_depth: int = Field(default=1, ge=0, le=32, description="最多向外展开多少层。")
+    max_nodes: int = Field(
+        default=DEFAULT_GRAPH_NODES,
+        ge=1,
+        le=MAX_GRAPH_NODES,
+        description="最多返回多少个节点。",
+    )
 
 
 class GraphNode(StrictModel):
@@ -521,11 +646,22 @@ class SliceAddressSeed(StrictModel):
 
 
 class DataflowSliceInput(StaticQuery):
-    function: FunctionSelector
-    seed: SliceAddressSeed
-    direction: Literal["backward", "forward"]
-    semantics: Literal["may", "must"]
-    max_steps: int = Field(default=128, ge=1, le=MAX_GRAPH_NODES)
+    """查询一条指令可能或必然依赖的数据来源和去向。"""
+
+    function: FunctionSelector = Field(description="包含起点指令的函数。")
+    seed: SliceAddressSeed = Field(description="开始追踪的数据流指令地址。")
+    direction: Literal["backward", "forward"] = Field(
+        description="向前查影响范围，或向后查数据来源。"
+    )
+    semantics: Literal["may", "must"] = Field(
+        description="may 返回可能关系；must 只返回能够确认的必然关系。"
+    )
+    max_steps: int = Field(
+        default=128,
+        ge=1,
+        le=MAX_GRAPH_NODES,
+        description="最多追踪多少步。",
+    )
 
 
 class DataflowNode(StrictModel):
@@ -587,9 +723,19 @@ type TypeSelector = Annotated[
 
 
 class TypeInspectInput(StaticQuery):
-    type: TypeSelector
-    cursor: Cursor | None = None
-    page_size: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
+    """按类型编号、精确名称或地址读取 IDA 类型信息。"""
+
+    type: TypeSelector = Field(description="要检查的类型编号、名称或所在地址。")
+    cursor: Cursor | None = Field(
+        default=None,
+        description="上一页返回的 next_cursor；首次查询不要填写。",
+    )
+    page_size: int = Field(
+        default=DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=MAX_PAGE_SIZE,
+        description="本页最多返回多少个类型字段。",
+    )
 
 
 class TypeFieldView(StrictModel):
@@ -613,15 +759,25 @@ class TypeInspectOutput(StaticOutput):
 
 
 class ReportBuildInput(StaticQuery):
-    format: Literal["markdown", "json"]
+    """把指定分析版本整理成报告文件。"""
+
+    format: Literal["markdown", "json"] = Field(description="报告使用 Markdown 或 JSON 格式。")
     sections: list[
         Literal[
             "overview",
             "entry_points",
             "imports_exports",
         ]
-    ] = Field(min_length=1, max_length=3)
-    title: str | None = Field(default=None, max_length=256)
+    ] = Field(
+        min_length=1,
+        max_length=3,
+        description="报告中要包含的栏目。",
+    )
+    title: str | None = Field(
+        default=None,
+        max_length=256,
+        description="可选的报告标题；不填时使用“逆向分析报告”。",
+    )
 
     @model_validator(mode="after")
     def validate_sections(self) -> Self:
@@ -637,9 +793,19 @@ class ReportBuildOutput(StrictModel):
 
 
 class AnalysisRefineInput(StaticQuery):
-    targets: list[RevisionAddress] = Field(default_factory=list, max_length=256)
+    """针对指定位置补充分析，并把结果保存为新版本。"""
+
+    targets: list[RevisionAddress] = Field(
+        default_factory=list,
+        max_length=256,
+        description="需要重新分析的位置；某些动作允许留空并处理整个程序。",
+    )
     actions: list[Literal["autoanalysis", "reanalyze_function", "decompile", "rebuild_xrefs"]] = (
-        Field(min_length=1, max_length=4)
+        Field(
+            min_length=1,
+            max_length=4,
+            description="要执行的补充分析动作。",
+        )
     )
 
 
@@ -807,10 +973,19 @@ type ChangeOperation = Annotated[
 
 
 class ChangePrepareInput(StrictModel):
-    workspace_id: WorkspaceId
-    base_revision: RevisionId
-    operations: list[ChangeOperation] = Field(default_factory=list, max_length=1_000)
-    inverse_of_change_id: ChangeId | None = None
+    """检查一组修改，并生成下一步保存时需要的编号和校验值。"""
+
+    workspace_id: WorkspaceId = Field(description="要修改的分析项目编号。")
+    base_revision: RevisionId = Field(description="修改所基于的当前分析版本。")
+    operations: list[ChangeOperation] = Field(
+        default_factory=list,
+        max_length=1_000,
+        description="要检查的修改；正常修改时填写。",
+    )
+    inverse_of_change_id: ChangeId | None = Field(
+        default=None,
+        description="要撤销的历史修改编号；撤销时填写，并且不要同时提供 operations。",
+    )
 
     @model_validator(mode="after")
     def validate_prepare_mode(self) -> Self:
@@ -853,10 +1028,14 @@ class ChangePrepareOutput(StrictModel):
 
 
 class ChangeApplyInput(StrictModel):
-    workspace_id: WorkspaceId
-    expected_revision: RevisionId
-    change_set_id: ChangeSetId
-    digest: Sha256
+    """保存已经通过 change.prepare 检查的修改。"""
+
+    workspace_id: WorkspaceId = Field(description="要保存修改的分析项目编号。")
+    expected_revision: RevisionId = Field(
+        description="准备修改时使用的分析版本；版本已变化时会拒绝保存。"
+    )
+    change_set_id: ChangeSetId = Field(description="change.prepare 返回的修改集合编号。")
+    digest: Sha256 = Field(description="change.prepare 返回的完整校验值。")
 
 
 class ChangeApplyOutput(StrictModel):
@@ -867,14 +1046,26 @@ class ChangeApplyOutput(StrictModel):
 
 
 class DebugLaunchTarget(StrictModel):
-    kind: Literal["launch"]
-    arguments: list[str] = Field(default_factory=list, max_length=128)
-    stop_on_entry: bool = True
+    """由服务启动当前分析项目中的程序。"""
+
+    kind: Literal["launch"] = Field(description="启动新进程。")
+    arguments: list[str] = Field(
+        default_factory=list,
+        max_length=128,
+        description="传给目标程序的命令行参数。",
+    )
+    stop_on_entry: bool = Field(default=True, description="启动后是否先停在程序入口。")
 
 
 class DebugAttachTarget(StrictModel):
-    kind: Literal["attach"]
-    process_id: int = Field(ge=1, le=0xFFFF_FFFF)
+    """连接到已经运行的本机进程。"""
+
+    kind: Literal["attach"] = Field(description="连接现有进程。")
+    process_id: int = Field(
+        ge=1,
+        le=0xFFFF_FFFF,
+        description="要连接的 Windows 进程编号。",
+    )
 
 
 type DebugTarget = Annotated[
@@ -884,10 +1075,17 @@ type DebugTarget = Annotated[
 
 
 class DebugEstablishInput(StrictModel):
-    workspace_id: WorkspaceId
-    revision: RevisionId
-    target: DebugTarget
-    timeout_ms: int = Field(default=30_000, ge=1, le=120_000)
+    """启动程序或连接现有进程，并建立调试会话。"""
+
+    workspace_id: WorkspaceId = Field(description="调试所对应的分析项目编号。")
+    revision: RevisionId = Field(description="调试所依据的分析版本。")
+    target: DebugTarget = Field(description="启动新进程或连接现有进程。")
+    timeout_ms: int = Field(
+        default=30_000,
+        ge=1,
+        le=120_000,
+        description="等待调试开始的最长时间，单位为毫秒。",
+    )
 
 
 class DebugEstablishOutput(StrictModel):
@@ -909,11 +1107,26 @@ class DebugEstablishOutput(StrictModel):
 
 
 class DebugControlInput(StrictModel):
-    debug_session_id: DebugSessionId
-    action: Literal["pause", "continue", "step_into", "step_over", "run_to"]
-    stop_id: StopId | None = None
-    target: ImageAddress | None = None
-    timeout_ms: int = Field(default=30_000, ge=1, le=120_000)
+    """暂停、继续、单步执行，或运行到指定位置。"""
+
+    debug_session_id: DebugSessionId = Field(description="要控制的调试会话编号。")
+    action: Literal["pause", "continue", "step_into", "step_over", "run_to"] = Field(
+        description="要执行的调试动作。"
+    )
+    stop_id: StopId | None = Field(
+        default=None,
+        description="当前暂停编号；继续、单步和运行到指定位置时必须提供。",
+    )
+    target: ImageAddress | None = Field(
+        default=None,
+        description="run_to 的目标位置；其他动作不要填写。",
+    )
+    timeout_ms: int = Field(
+        default=30_000,
+        ge=1,
+        le=120_000,
+        description="等待动作完成的最长时间，单位为毫秒。",
+    )
 
     @model_validator(mode="after")
     def validate_action_context(self) -> Self:
@@ -967,10 +1180,26 @@ class DebugControlOutput(StrictModel):
 
 
 class DebugEventsInput(StrictModel):
-    debug_session_id: DebugSessionId
-    after_sequence: int = Field(default=0, ge=0)
-    wait_ms: int = Field(default=0, ge=0, le=MAX_OPERATION_WAIT_MS)
-    limit: int = Field(default=DEFAULT_PAGE_SIZE, ge=1, le=MAX_PAGE_SIZE)
+    """读取调试会话中尚未处理的事件。"""
+
+    debug_session_id: DebugSessionId = Field(description="要读取的调试会话编号。")
+    after_sequence: int = Field(
+        default=0,
+        ge=0,
+        description="只返回该事件序号之后的内容；首次读取使用 0。",
+    )
+    wait_ms: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_OPERATION_WAIT_MS,
+        description="没有新事件时最多等待多少毫秒；0 表示立即返回。",
+    )
+    limit: int = Field(
+        default=DEFAULT_PAGE_SIZE,
+        ge=1,
+        le=MAX_PAGE_SIZE,
+        description="本次最多返回多少个事件。",
+    )
 
 
 class DebugEventModule(StrictModel):
@@ -1090,13 +1319,27 @@ class DebugEventsOutput(StrictModel):
 
 
 class DebugInspectInput(StrictModel):
-    debug_session_id: DebugSessionId
-    stop_id: StopId
+    """读取程序当前暂停位置的模块、线程、寄存器、调用栈或内存。"""
+
+    debug_session_id: DebugSessionId = Field(description="要读取的调试会话编号。")
+    stop_id: StopId = Field(description="当前暂停编号；状态变化后必须使用新的编号。")
     views: list[Literal["state", "modules", "threads", "registers", "stack", "memory", "maps"]] = (
-        Field(min_length=1, max_length=7)
+        Field(
+            min_length=1,
+            max_length=7,
+            description="要读取的调试信息。",
+        )
     )
-    memory_address: RuntimeAddress | None = None
-    memory_size: int | None = Field(default=None, ge=1, le=MAX_MEMORY_READ_BYTES)
+    memory_address: RuntimeAddress | None = Field(
+        default=None,
+        description="读取 memory 时的起始地址，必须绑定同一个 stop_id。",
+    )
+    memory_size: int | None = Field(
+        default=None,
+        ge=1,
+        le=MAX_MEMORY_READ_BYTES,
+        description="读取 memory 时的字节数。",
+    )
 
     @model_validator(mode="after")
     def validate_memory_view(self) -> Self:
@@ -1223,9 +1466,14 @@ class BreakpointSpec(StrictModel):
 
 
 class DebugBreakpointsInput(StrictModel):
-    debug_session_id: DebugSessionId
-    stop_id: StopId
-    replace: list[BreakpointSpec] = Field(max_length=1_024)
+    """用给定列表替换当前调试会话的全部断点。"""
+
+    debug_session_id: DebugSessionId = Field(description="要设置断点的调试会话编号。")
+    stop_id: StopId = Field(description="当前暂停编号。")
+    replace: list[BreakpointSpec] = Field(
+        max_length=1_024,
+        description="替换后的完整断点列表；空列表表示清除全部断点。",
+    )
 
     @model_validator(mode="after")
     def validate_unique_locations(self) -> Self:
@@ -1267,9 +1515,18 @@ class DebugBreakpointsOutput(StrictModel):
 
 
 class DebugFinishInput(StrictModel):
-    debug_session_id: DebugSessionId
-    action: Literal["detach", "terminate"]
-    timeout_ms: int = Field(default=30_000, ge=1, le=120_000)
+    """断开调试连接，或结束由服务启动的目标程序。"""
+
+    debug_session_id: DebugSessionId = Field(description="要结束的调试会话编号。")
+    action: Literal["detach", "terminate"] = Field(
+        description="detach 只断开连接；terminate 结束服务启动的目标程序。"
+    )
+    timeout_ms: int = Field(
+        default=30_000,
+        ge=1,
+        le=120_000,
+        description="等待会话结束的最长时间，单位为毫秒。",
+    )
 
 
 class DebugFinishOutput(StrictModel):
@@ -1291,10 +1548,21 @@ class DebugFinishOutput(StrictModel):
 
 
 class ExpertExecuteInput(StrictModel):
-    workspace_id: WorkspaceId
-    revision: RevisionId
-    code: str = Field(min_length=1, max_length=262_144)
-    timeout_seconds: int = Field(default=30, ge=1, le=120)
+    """运行 IDAPython，并把数据库修改保存为新分析版本。"""
+
+    workspace_id: WorkspaceId = Field(description="要处理的分析项目编号。")
+    revision: RevisionId = Field(description="代码运行所基于的分析版本。")
+    code: str = Field(
+        min_length=1,
+        max_length=262_144,
+        description=("要运行的 IDAPython 代码。它可以访问本机文件、网络和子进程，不是隔离环境。"),
+    )
+    timeout_seconds: int = Field(
+        default=30,
+        ge=1,
+        le=120,
+        description="代码最多运行多少秒。",
+    )
 
 
 class ExpertExecuteOutput(StrictModel):

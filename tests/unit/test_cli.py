@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from ida_re_mcp.cli import ApplicationLike, main
+from ida_re_mcp.config import ConfigError
 from ida_re_mcp.domain.base import JsonObject
 
 
@@ -127,5 +128,23 @@ def test_command_failure_is_stderr_only_and_still_closes() -> None:
 
     assert exit_code == 1
     assert stdout.getvalue() == b""
-    assert "worker failed" in stderr.getvalue()
+    assert "请查看 logs 目录" in stderr.getvalue()
+    assert "worker failed" not in stderr.getvalue()
+    assert application.closed
+
+
+def test_config_failure_explains_what_to_fix() -> None:
+    application = _Application(doctor_error=ConfigError("配置文件不存在"))
+    stderr = io.StringIO()
+
+    exit_code = main(
+        ["doctor"],
+        application_factory=_Factory(application),
+        stdout=io.BytesIO(),
+        stderr=stderr,
+    )
+
+    assert exit_code == 1
+    assert "配置无法使用：配置文件不存在" in stderr.getvalue()
+    assert "修改 config.toml 后重试" in stderr.getvalue()
     assert application.closed

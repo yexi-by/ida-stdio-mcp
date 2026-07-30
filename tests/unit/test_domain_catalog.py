@@ -86,3 +86,25 @@ def test_all_models_use_strict_forbid_configuration() -> None:
         for model_type in (spec.input_model, spec.output_model):
             assert model_type.model_config.get("strict") is True
             assert model_type.model_config.get("extra") == "forbid"
+
+
+def test_all_tool_descriptions_use_direct_user_facing_language() -> None:
+    specs = build_tool_catalog(enable_expert=True)
+    forbidden_internal_terms = {
+        "staging",
+        "headless",
+        "disposable",
+        "MAY/MUST",
+        "DSTATE_RUN",
+        "provenance",
+        "原子应用",
+        "revision 固定",
+    }
+    for spec in specs:
+        assert spec.title
+        assert len(spec.description) >= 24
+        assert any(
+            action in spec.description
+            for action in ("调用", "提供", "传入", "读取", "使用", "运行")
+        )
+        assert not any(term in spec.description for term in forbidden_internal_terms)

@@ -548,7 +548,20 @@ def test_gc_requires_explicit_workspace_lifecycle_lease(tmp_path: Path) -> None:
         store.collect_garbage(retained_scopes=set(), dry_run=True)
 
 
-def test_store_rejects_working_tree_location() -> None:
-    with pytest.raises(ValueError, match="工作树"):
-        ChangeSetStore(Path.cwd() / "must-not-be-created")
-    assert not (Path.cwd() / "must-not-be-created").exists()
+def test_store_allows_data_directory_inside_working_tree(tmp_path: Path) -> None:
+    working_tree = tmp_path / "repo"
+    (working_tree / ".git").mkdir(parents=True)
+    root = working_tree / "data" / "sessions" / "session_test" / "change-sets"
+
+    store = ChangeSetStore(root)
+
+    assert store.root == root.resolve()
+    assert root.is_dir()
+
+
+def test_store_rejects_directory_that_contains_working_tree(tmp_path: Path) -> None:
+    working_tree = tmp_path / "repo"
+    (working_tree / ".git").mkdir(parents=True)
+
+    with pytest.raises(ValueError, match="项目根目录或它的上级目录"):
+        ChangeSetStore(tmp_path, working_tree=working_tree)

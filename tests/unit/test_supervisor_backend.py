@@ -127,6 +127,22 @@ class _ProbeProcess:
         return self.returncode
 
 
+class _CompletedProbeProcess:
+    def __init__(
+        self,
+        *,
+        returncode: int,
+        stdout: bytes = b"",
+        stderr: bytes = b"",
+    ) -> None:
+        self.returncode = returncode
+        self._stdout = stdout
+        self._stderr = stderr
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return self._stdout, self._stderr
+
+
 def _replace_launch(
     monkeypatch: pytest.MonkeyPatch,
     worker: _BlockingWorker,
@@ -456,5 +472,34 @@ def test_doctor_timeout_kills_and_reaps_probe_that_ignores_terminate(
         assert "wait.done" in process.actions
         assert process.actions.index("terminate") < process.actions.index("kill")
         assert process.actions.index("kill") < process.actions.index("wait.done")
+
+    asyncio.run(scenario())
+
+
+def test_doctor_writes_raw_probe_error_to_log_without_exposing_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        sensitive = b"Traceback: C:\\Users\\private\\ida-probe.py"
+        process = _CompletedProbeProcess(returncode=7, stderr=sensitive)
+
+        async def create_subprocess_exec(
+            *_args: str,
+            **_kwargs: object,
+        ) -> asyncio.subprocess.Process:
+            return cast(asyncio.subprocess.Process, cast(object, process))
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+        log_root = tmp_path / "logs"
+        backend = SubprocessIdaBackend(log_root=log_root)
+
+        report = await backend.doctor()
+
+        assert report["available"] is False
+        assert report["code"] == "worker_probe_failed"
+        assert "stderr" not in report
+        assert "C:\\Users\\private" not in str(report)
+        assert sensitive in (log_root / "doctor-probe.log").read_bytes()
 
     asyncio.run(scenario())

@@ -8,10 +8,19 @@ from pathlib import Path
 
 from pydantic import Field
 
+from ida_re_mcp.domain.address import ImageAddress
 from ida_re_mcp.domain.base import JsonObject, StrictModel
 from ida_re_mcp.domain.catalog import ToolSpec
+from ida_re_mcp.domain.common import Coverage, Provenance
 from ida_re_mcp.domain.errors import ResourceNotFoundError
 from ida_re_mcp.domain.resources import ResourcePage, ResourceRead
+from ida_re_mcp.domain.tools import (
+    ImageSummary,
+    NamedAddress,
+    ProgramCounts,
+    ProgramOverviewInput,
+    ProgramOverviewOutput,
+)
 from ida_re_mcp.protocol import McpRuntime
 
 _STATE_ENV = "IDA_RE_MCP_PROBE_STATE"
@@ -36,6 +45,53 @@ class ProbeHandler:
         name: str,
         arguments: StrictModel,
     ) -> StrictModel | JsonObject:
+        if name == "program.overview" and isinstance(arguments, ProgramOverviewInput):
+            address = ImageAddress(
+                kind="image",
+                image_id="image_stdio",
+                rva="0x401000",
+            )
+            return ProgramOverviewOutput(
+                image=ImageSummary(
+                    image_id="image_stdio",
+                    format="pe32+",
+                    architecture="x86_64",
+                    bitness=64,
+                    endian="little",
+                    image_base="0x140000000",
+                    image_size=4096,
+                    sha256="a" * 64,
+                ),
+                counts=ProgramCounts(
+                    functions=1,
+                    strings=0,
+                    imports=0,
+                    exports=1,
+                    fixups=0,
+                    unwind_regions=0,
+                    exception_regions=0,
+                ),
+                segments=[],
+                entry_points=[
+                    NamedAddress(
+                        entity_id="function_stdio",
+                        name="entry",
+                        address=address,
+                    )
+                ],
+                imports=[],
+                exports=[],
+                fixups=[],
+                unwind_regions=[],
+                functions=[],
+                strings=[],
+                coverage=Coverage(status="complete"),
+                provenance=Provenance(
+                    workspace_id=arguments.workspace_id,
+                    revision=arguments.revision,
+                    backend="ida",
+                ),
+            )
         if name != "probe.wait" or not isinstance(arguments, ProbeWaitInput):
             raise RuntimeError("探针收到无效工具调用")
         self._state_path.write_text("running", encoding="utf-8")
@@ -63,6 +119,17 @@ async def _run() -> None:
     runtime = McpRuntime(
         ProbeHandler(),
         catalog=(
+            ToolSpec(
+                name="program.overview",
+                title="读取程序概览",
+                description="返回带地址、哈希值和嵌套记录的正式工具结果。",
+                input_model=ProgramOverviewInput,
+                output_model=ProgramOverviewOutput,
+                read_only=True,
+                destructive=False,
+                idempotent=True,
+                open_world=False,
+            ),
             ToolSpec(
                 name="probe.wait",
                 title="等待探针",

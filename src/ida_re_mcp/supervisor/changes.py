@@ -281,8 +281,8 @@ class ChangeSetStore:
     ) -> None:
         self.root = root.resolve()
         tree = working_tree.resolve() if working_tree is not None else _find_working_tree(self.root)
-        if tree is not None and _is_within(self.root, tree):
-            raise ValueError("ChangeSet 存储不得位于工作树内")
+        if tree is not None and _is_within(tree, self.root):
+            raise ValueError("ChangeSet 存储目录不能是项目根目录或它的上级目录")
         self.workspace_lease_root = (
             workspace_lease_root.resolve() if workspace_lease_root is not None else None
         )

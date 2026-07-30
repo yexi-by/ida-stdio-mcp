@@ -562,6 +562,24 @@ def _prepare(workspace: WorkspaceSnapshot) -> ChangePrepareInput:
     )
 
 
+def test_doctor_reports_plain_result_and_shared_locations(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, _workspace, _sample_bytes, _backend = _application(tmp_path)
+
+        healthy, report = await application.doctor()
+
+        assert healthy is True
+        assert report["summary"] == ("检查通过：配置、数据目录、日志目录和 IDA 都可以正常使用。")
+        assert report["next_step"] == "现在可以启动 MCP 服务。"
+        runtime_paths = cast(dict[str, JsonValue], report["runtime_paths"])
+        assert runtime_paths["data"] == str(application.storage.paths.data_root)
+        assert runtime_paths["logs"] == str(application.storage.paths.shared_log_root)
+        assert runtime_paths["session_logs"] == str(application.storage.paths.log_root)
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
 def test_workspace_create_rejects_shell_wrapper_before_worker_launch(tmp_path: Path) -> None:
     async def scenario() -> None:
         config = AppConfig()
@@ -1526,6 +1544,8 @@ def test_application_gc_reports_reclaimable_and_protected_bytes(
         preview_bytes = preview_storage["bytes"]
         preview_protected = preview_storage["protected_bytes"]
         reclaimed = preview["reclaimed_bytes"]
+        assert "找到" in cast(str, preview["summary"])
+        assert "gc --apply" in cast(str, preview["next_step"])
         assert isinstance(preview_bytes, int)
         assert isinstance(preview_protected, int)
         assert isinstance(reclaimed, int)
@@ -1542,6 +1562,8 @@ def test_application_gc_reports_reclaimable_and_protected_bytes(
 
         applied = await application.gc(apply=True)
         applied_storage = cast(dict[str, JsonValue], applied["storage"])
+        assert cast(str, applied["summary"]).startswith("清理完成")
+        assert isinstance(applied["next_step"], str)
         assert applied_storage["protected_bytes"] == applied_storage["bytes"]
         with pytest.raises(ArtifactNotFoundError):
             application.storage.artifacts.get(
@@ -1627,6 +1649,9 @@ def test_worker_failures_use_stable_public_business_codes(
                 ),
             )
         assert raised.value.code is expected_code
+        assert raised.value.message != "公开 worker 失败"
+        assert "请" in raised.value.message
+        assert raised.value.details == {}
         await application.aclose()
 
     asyncio.run(scenario())
@@ -2437,7 +2462,9 @@ def test_workspace_create_failure_is_sanitized_and_visible_across_sessions(
         assert isinstance(completed, OperationWaitOutput)
         assert completed.state == "failed"
         assert completed.failure is not None
-        assert completed.failure.message == "长操作失败"
+        assert completed.failure.message == (
+            "IDA 没有完成这项操作。请查看 logs 目录中的本次运行日志，然后重试。"
+        )
         await first.aclose()
 
         second_paths = _session_paths(tmp_path, "session_second")
@@ -2461,7 +2488,9 @@ def test_workspace_create_failure_is_sanitized_and_visible_across_sessions(
         assert summary.state == "failed"
         assert summary.analysis_outcome is not None
         assert summary.analysis_outcome.state == "failed"
-        assert summary.analysis_outcome.reason == "长操作失败"
+        assert summary.analysis_outcome.reason == (
+            "IDA 没有完成这项操作。请查看 logs 目录中的本次运行日志，然后重试。"
+        )
         assert "sensitive" not in summary.analysis_outcome.reason
         assert summary.analysis_outcome.recorded_at > 0
         await second.aclose()

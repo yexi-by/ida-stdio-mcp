@@ -1,21 +1,47 @@
+# 配置格式版本。程序用它判断当前文件是否受支持。
 schema_version = "1"
 
 [runtime]
-data_root = 'C:\Users\夜袭\AppData\Local\ida-re-mcp\hosts\codex\data'
-log_root = 'C:\Users\夜袭\AppData\Local\ida-re-mcp\hosts\codex\logs'
+# 保存导入的样本副本、IDA 分析结果、修改记录和生成文件。
+# 相对路径以本 config.toml 所在目录为准；目录不存在时会自动创建。
+data_root = "data"
+
+# 保存服务和 IDA 子进程的运行日志。
+# 相对路径以本 config.toml 所在目录为准；目录不存在时会自动创建。
+log_root = "logs"
+
+# IDA Pro 9.3 的安装目录。IDA 安装在其他位置时只需修改这一项。
 ida_dir = 'C:\Program Files\IDA Professional 9.3'
 
 [policy]
+# 允许 Agent 修改 IDB。每次成功修改都会生成新的分析版本，原版本仍可读取。
 authoring = true
+
+# 允许 IDA 启动新的本机调试目标。
 debug_launch = true
+
+# 是否允许附加到已经运行的外部进程。当前配置保持原有的开启状态。
+# 不需要分析现有进程时，可以设为 false；修改后需要重启服务。
 debug_attach = true
+
+# 是否允许执行任意 IDAPython。当前配置保持原有的开启状态。
+# 代码可以访问文件、网络和子进程；不需要此功能时应设为 false。
 expert = true
 
 [workers]
+# 同时运行的静态分析任务数。单机使用保持 1，可以避免多个 IDA 实例争用资源。
 analysis_limit = 1
+
+# 同时运行的动态调试任务数。单机使用保持 1。
 debug_limit = 1
+
+# IDA 子进程空闲多少秒后退出；下次需要时会自动重新启动。
 idle_seconds = 300
 
 [storage]
+# data_root 建议最多使用多少 GiB。doctor 和 gc 会报告是否超过此值，
+# 服务不会仅因超过此值自动删除数据。
 quota_gib = 20
+
+# 每个分析项目额外保留多少个旧版本。当前版本和明确保留的版本不计入此数量。
 retained_revisions = 3

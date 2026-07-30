@@ -1,4 +1,4 @@
-"""当前产品配置与工作树外运行目录。"""
+"""项目配置与本机运行目录。"""
 
 from __future__ import annotations
 
@@ -35,11 +35,11 @@ _DATA_ROOT_RESERVED_TREES = frozenset(
 
 
 class ConfigError(ValueError):
-    """配置不符合当前 schema。"""
+    """配置文件缺失、无法读取或内容有误。"""
 
 
 class RuntimePathError(ValueError):
-    """运行目录落入工作树或无法安全解析。"""
+    """运行目录无法安全解析。"""
 
 
 class PolicyConfig(BaseModel):
@@ -85,9 +85,22 @@ class RuntimeConfig(BaseModel):
     log_root: str | None = None
     ida_dir: str | None = None
 
-    @field_validator("data_root", "log_root", "ida_dir")
+    @field_validator("data_root", "log_root")
     @classmethod
-    def validate_absolute_path(
+    def validate_runtime_root(
+        cls,
+        value: str | None,
+        info: ValidationInfo,
+    ) -> str | None:
+        if value is None:
+            return None
+        if not value.strip():
+            raise ValueError(f"runtime.{info.field_name} 不能为空")
+        return value
+
+    @field_validator("ida_dir")
+    @classmethod
+    def validate_ida_dir(
         cls,
         value: str | None,
         info: ValidationInfo,
@@ -115,7 +128,7 @@ class AppConfig(BaseModel):
 
 @dataclass(frozen=True, slots=True)
 class RuntimePaths:
-    """平台用户目录下的运行数据布局。"""
+    """持久化数据、日志和当前连接临时文件的目录布局。"""
 
     data_root: Path
     log_root: Path
@@ -124,12 +137,19 @@ class RuntimePaths:
     checkout_root: Path
     temp_root: Path
     session_root: Path | None = None
+    configured_log_root: Path | None = None
 
     @property
     def session_data_root(self) -> Path:
         """返回仅属于当前 MCP stdio 连接的运行目录。"""
 
         return self.session_root or self.data_root
+
+    @property
+    def shared_log_root(self) -> Path:
+        """返回 config.toml 指定的共用日志目录。"""
+
+        return self.configured_log_root or self.log_root
 
     @property
     def operation_root(self) -> Path:
@@ -159,10 +179,11 @@ class RuntimePaths:
         *,
         runtime: RuntimeConfig | None = None,
         working_tree: Path | None = None,
+        config_directory: Path | None = None,
         environment: Mapping[str, str] | None = None,
         session_id: str | None = None,
     ) -> Self:
-        """解析共享平台目录和当前连接私有目录, 并拒绝写入 Git 工作树。"""
+        """解析共享目录和当前连接私有目录, 并拒绝使用不安全的上级目录。"""
 
         dirs = PlatformDirs(PRODUCT_NAME, appauthor=False, roaming=False)
         runtime_config = runtime or RuntimeConfig()
@@ -180,23 +201,26 @@ class RuntimePaths:
         _validate_session_id(selected_session_id)
         session_root = data_root / "sessions" / selected_session_id
         session_log_root = log_root / "sessions" / selected_session_id
-        tree = (
+        trees: list[Path] = []
+        current_tree = (
             working_tree.resolve()
             if working_tree is not None
             else _find_working_tree(Path.cwd().resolve())
         )
-        if tree is not None:
-            for name, candidate in (
-                (DATA_ROOT_ENV, data_root),
-                (LOG_ROOT_ENV, log_root),
-            ):
+        if current_tree is not None:
+            trees.append(current_tree)
+        if config_directory is not None:
+            config_tree = _find_working_tree(config_directory.resolve())
+            if config_tree is not None and config_tree not in trees:
+                trees.append(config_tree)
+
+        for name, candidate in (
+            (DATA_ROOT_ENV, data_root),
+            (LOG_ROOT_ENV, log_root),
+        ):
+            _validate_runtime_root(candidate, name=name, working_tree=None)
+            for tree in trees:
                 _validate_runtime_root(candidate, name=name, working_tree=tree)
-        else:
-            for name, candidate in (
-                (DATA_ROOT_ENV, data_root),
-                (LOG_ROOT_ENV, log_root),
-            ):
-                _validate_runtime_root(candidate, name=name, working_tree=None)
 
         return cls(
             data_root=data_root,
@@ -206,6 +230,7 @@ class RuntimePaths:
             checkout_root=session_root / "checkouts",
             temp_root=session_root / "temp",
             session_root=session_root,
+            configured_log_root=log_root,
         )
 
     def ensure(self) -> Self:
@@ -238,23 +263,77 @@ def load_config(path: Path | None = None) -> AppConfig:
     source = (path or default_config_path()).resolve()
     if not source.exists():
         if path is not None:
-            raise ConfigError(f"配置文件不存在: {source}")
+            raise ConfigError(f"配置文件不存在：{source}")
         return AppConfig()
     if not source.is_file():
-        raise ConfigError(f"配置路径不是普通文件: {source}")
+        raise ConfigError(f"配置路径不是普通文件：{source}")
 
     try:
         with source.open("rb") as stream:
             raw = tomllib.load(stream)
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise ConfigError(f"无法读取配置 {source}: {exc}") from exc
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError("config.toml 内容不是有效的 TOML。请检查表名、引号和等号") from exc
+    except OSError as exc:
+        raise ConfigError(
+            f"无法读取配置文件：{source}。请确认文件存在且当前用户有读取权限"
+        ) from exc
 
     if "schema_version" not in raw:
-        raise ConfigError("配置必须显式声明 schema_version")
+        raise ConfigError("配置文件缺少 schema_version")
     try:
-        return AppConfig.model_validate(raw, strict=True)
+        config = AppConfig.model_validate(raw, strict=True)
     except ValidationError as exc:
-        raise ConfigError(f"配置不符合当前 schema: {exc}") from exc
+        raise ConfigError(_format_config_validation_error(exc)) from exc
+    return _resolve_config_runtime_paths(config, config_dir=source.parent)
+
+
+def _format_config_validation_error(error: ValidationError) -> str:
+    """把 Pydantic 校验结果改写为简短、稳定的中文说明。"""
+
+    reason_by_type = {
+        "missing": "缺少此项",
+        "extra_forbidden": "此项不受支持",
+        "bool_type": "必须填写 true 或 false",
+        "int_type": "必须填写整数",
+        "string_type": "必须填写文字",
+        "greater_than_equal": "数值太小",
+        "less_than_equal": "数值太大",
+    }
+    problems: list[str] = []
+    for item in error.errors(
+        include_url=False,
+        include_context=False,
+        include_input=False,
+    ):
+        location = ".".join(str(part) for part in item["loc"]) or "配置文件"
+        if item["type"] == "literal_error" and location == "schema_version":
+            reason = f'只能填写 "{CONFIG_SCHEMA_VERSION}"'
+        else:
+            reason = reason_by_type.get(item["type"], "值无效")
+        problems.append(f"{location}：{reason}")
+    return "配置内容有误：" + "；".join(problems)
+
+
+def _resolve_config_runtime_paths(config: AppConfig, *, config_dir: Path) -> AppConfig:
+    """将配置中的运行目录转换为相对配置文件目录的绝对路径。"""
+
+    runtime = config.runtime
+    resolved_runtime = runtime.model_copy(
+        update={
+            "data_root": _resolve_config_runtime_root(runtime.data_root, config_dir=config_dir),
+            "log_root": _resolve_config_runtime_root(runtime.log_root, config_dir=config_dir),
+        }
+    )
+    return config.model_copy(update={"runtime": resolved_runtime})
+
+
+def _resolve_config_runtime_root(value: str | None, *, config_dir: Path) -> str | None:
+    if value is None:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        candidate = config_dir / candidate
+    return str(candidate.resolve())
 
 
 def _find_working_tree(start: Path) -> Path | None:
@@ -293,10 +372,8 @@ def _validate_runtime_root(
 ) -> None:
     if candidate == Path(candidate.anchor):
         raise RuntimePathError(f"{name} 不得指向文件系统根目录")
-    if working_tree is not None and (
-        _is_within(candidate, working_tree) or _is_within(working_tree, candidate)
-    ):
-        raise RuntimePathError(f"{name} 不得与工作树形成包含关系: {candidate}")
+    if working_tree is not None and _is_within(working_tree, candidate):
+        raise RuntimePathError(f"{name} 不能是项目目录或它的上级目录：{candidate}")
 
 
 def _validate_runtime_layout(*, data_root: Path, log_root: Path) -> None:
@@ -312,7 +389,7 @@ def _validate_runtime_layout(*, data_root: Path, log_root: Path) -> None:
     ):
         reserved_root = data_root / relative_log_root.parts[0]
         raise RuntimePathError(
-            f"{LOG_ROOT_ENV} 不得位于 {DATA_ROOT_ENV} 的保留树内: {reserved_root}"
+            f"{LOG_ROOT_ENV} 不能放在 {DATA_ROOT_ENV} 的内部数据目录中：{reserved_root}"
         )
 
 

@@ -5,7 +5,6 @@ from pathlib import Path
 
 import pytest
 
-import ida_re_mcp.config as config_module
 from ida_re_mcp.config import (
     DATA_ROOT_ENV,
     LOG_ROOT_ENV,
@@ -54,8 +53,8 @@ quota_gib = 40
 retained_revisions = 5
 
 [runtime]
-data_root = "C:/runtime/ida-re-mcp/data"
-log_root = "C:/runtime/ida-re-mcp/logs"
+data_root = "data"
+log_root = "logs"
 ida_dir = "C:/Program Files/IDA Professional 9.3"
 """.strip(),
         encoding="utf-8",
@@ -66,8 +65,36 @@ ida_dir = "C:/Program Files/IDA Professional 9.3"
     assert config.policy.debug_attach is True
     assert config.workers.analysis_limit == 2
     assert config.storage.quota_gib == 40
-    assert config.runtime.data_root == "C:/runtime/ida-re-mcp/data"
+    assert config.runtime.data_root == str((tmp_path / "data").resolve())
+    assert config.runtime.log_root == str((tmp_path / "logs").resolve())
     assert config.runtime.ida_dir == "C:/Program Files/IDA Professional 9.3"
+
+
+def test_relative_runtime_roots_use_config_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_dir = tmp_path / "repository"
+    unrelated_cwd = tmp_path / "elsewhere"
+    config_dir.mkdir()
+    unrelated_cwd.mkdir()
+    path = config_dir / "config.toml"
+    path.write_text(
+        """
+schema_version = "1"
+
+[runtime]
+data_root = "data"
+log_root = "logs"
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(unrelated_cwd)
+
+    config = load_config(path)
+
+    assert config.runtime.data_root == str((config_dir / "data").resolve())
+    assert config.runtime.log_root == str((config_dir / "logs").resolve())
 
 
 def test_shipped_config_is_valid() -> None:
@@ -77,9 +104,11 @@ def test_shipped_config_is_valid() -> None:
 
     assert isinstance(config, AppConfig)
     assert config.schema_version == "1"
-    assert config.runtime.data_root is not None
-    assert config.runtime.log_root is not None
+    assert config.runtime.data_root == str((project_root / "data").resolve())
+    assert config.runtime.log_root == str((project_root / "logs").resolve())
     assert config.runtime.ida_dir is not None
+    assert config.policy.debug_attach is True
+    assert config.policy.expert is True
 
 
 @pytest.mark.parametrize(
@@ -101,46 +130,126 @@ def test_config_rejects_everything_outside_schema(
         load_config(path)
 
 
+@pytest.mark.parametrize(
+    ("content", "expected"),
+    [
+        ('schema_version = "1"\nunknown = true\n', "unknown：此项不受支持"),
+        (
+            'schema_version = "1"\n[workers]\nanalysis_limit = "1"\n',
+            "workers.analysis_limit：必须填写整数",
+        ),
+        ('schema_version = "2"\n', 'schema_version：只能填写 "1"'),
+    ],
+)
+def test_config_validation_error_uses_plain_chinese(
+    tmp_path: Path,
+    content: str,
+    expected: str,
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(content, encoding="utf-8")
+
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+
+    message = str(caught.value)
+    assert expected in message
+    assert "Input should" not in message
+    assert "validation error" not in message
+    assert "配置不符合当前 schema" not in message
+
+
+def test_invalid_toml_error_explains_what_to_check(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text("[runtime\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError) as caught:
+        load_config(path)
+
+    assert str(caught.value) == ("config.toml 内容不是有效的 TOML。请检查表名、引号和等号")
+
+
 def test_explicit_missing_config_is_an_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="不存在"):
         load_config(tmp_path / "missing.toml")
 
 
-def test_runtime_paths_reject_working_tree(
+def test_runtime_paths_create_configured_directories_inside_working_tree(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class InsideDirs:
-        user_data_path = tmp_path / "runtime"
-        user_log_path = tmp_path / "logs"
-        user_config_path = tmp_path / "config"
+    working_tree = tmp_path / "repository"
+    working_tree.mkdir()
+    config_path = working_tree / "config.toml"
+    config_path.write_text(
+        """
+schema_version = "1"
 
-    def inside_dirs(
-        _application: str,
-        *,
-        appauthor: bool,
-        roaming: bool,
-    ) -> InsideDirs:
-        assert appauthor is False
-        assert roaming is False
-        return InsideDirs()
+[runtime]
+data_root = "data"
+log_root = "logs"
+""".strip(),
+        encoding="utf-8",
+    )
+    config = load_config(config_path)
+    data_root = working_tree / "data"
+    log_root = working_tree / "logs"
 
-    monkeypatch.setattr(config_module, "PlatformDirs", inside_dirs)
+    assert not data_root.exists()
+    assert not log_root.exists()
 
-    with pytest.raises(RuntimePathError, match="工作树"):
-        RuntimePaths.discover(working_tree=tmp_path)
+    paths = RuntimePaths.discover(
+        runtime=config.runtime,
+        working_tree=working_tree,
+        environment={},
+        session_id="session_test",
+    )
+    paths.ensure()
+
+    assert paths.data_root == data_root.resolve()
+    assert paths.log_root == (log_root / "sessions" / "session_test").resolve()
+    assert paths.shared_log_root == log_root.resolve()
+    assert paths.workspace_root.is_dir()
+    assert paths.artifact_root.is_dir()
+    assert paths.session_data_root.is_dir()
+    assert paths.log_root.is_dir()
 
 
 def test_runtime_paths_reject_working_tree_ancestor(tmp_path: Path) -> None:
     working_tree = tmp_path / "repository"
 
-    with pytest.raises(RuntimePathError, match="包含关系"):
+    with pytest.raises(RuntimePathError, match="项目目录"):
         RuntimePaths.discover(
             working_tree=working_tree,
             environment={
                 DATA_ROOT_ENV: str(tmp_path),
                 LOG_ROOT_ENV: str(tmp_path / "logs"),
             },
+        )
+
+
+@pytest.mark.parametrize("data_root", [".", ".."])
+def test_config_working_tree_is_checked_from_unrelated_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    data_root: str,
+) -> None:
+    working_tree = tmp_path / "repository"
+    unrelated_cwd = tmp_path / "elsewhere"
+    (working_tree / ".git").mkdir(parents=True)
+    unrelated_cwd.mkdir()
+    config_path = working_tree / "config.toml"
+    config_path.write_text(
+        (f'schema_version = "1"\n[runtime]\ndata_root = "{data_root}"\nlog_root = "logs"\n'),
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(unrelated_cwd)
+    config = load_config(config_path)
+
+    with pytest.raises(RuntimePathError, match="项目目录"):
+        RuntimePaths.discover(
+            runtime=config.runtime,
+            config_directory=config_path.parent,
+            environment={},
         )
 
 
@@ -195,6 +304,7 @@ def test_runtime_paths_accept_explicit_host_roots(tmp_path: Path) -> None:
 
     assert paths.data_root == data_root.resolve()
     assert paths.log_root == log_root.resolve() / "sessions" / "session_test"
+    assert paths.shared_log_root == log_root.resolve()
     assert paths.workspace_root == data_root.resolve() / "workspaces"
     assert paths.session_data_root == data_root.resolve() / "sessions" / "session_test"
     assert paths.checkout_root == paths.session_data_root / "checkouts"
@@ -251,7 +361,7 @@ def test_runtime_paths_reject_log_root_in_reserved_data_tree(
     data_root = tmp_path / "runtime" / "data"
     log_root = data_root if log_relative is None else data_root / log_relative
 
-    with pytest.raises(RuntimePathError, match=r"相同|保留树"):
+    with pytest.raises(RuntimePathError, match=r"相同|内部数据目录"):
         RuntimePaths.discover(
             runtime=RuntimeConfig(
                 data_root=str(data_root),
@@ -275,10 +385,16 @@ def test_runtime_paths_allow_dedicated_log_tree_inside_data_root(tmp_path: Path)
     assert paths.log_root == data_root.resolve() / "logs" / "sessions" / "session_test"
 
 
-@pytest.mark.parametrize("field", ["data_root", "log_root", "ida_dir"])
-def test_runtime_config_paths_must_be_absolute(field: str) -> None:
+def test_runtime_config_ida_dir_must_be_absolute() -> None:
     with pytest.raises(ValueError, match="绝对路径"):
-        RuntimeConfig.model_validate({field: "relative/path"}, strict=True)
+        RuntimeConfig.model_validate({"ida_dir": "relative/path"}, strict=True)
+
+
+@pytest.mark.parametrize("field", ["data_root", "log_root"])
+def test_runtime_config_roots_accept_relative_paths(field: str) -> None:
+    runtime = RuntimeConfig.model_validate({field: "relative/path"}, strict=True)
+
+    assert getattr(runtime, field) == "relative/path"
 
 
 @pytest.mark.parametrize(

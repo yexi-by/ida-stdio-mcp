@@ -102,15 +102,22 @@ _STANDARD_SPECS: Final = (
     _spec(
         "address.inspect",
         "检查地址",
-        "在显式 workspace revision 中检查一个已区分地址空间的地址及其事实。",
+        (
+            "查看指定分析项目和版本中某个地址的字节、指令、符号、交叉引用和所属函数。"
+            "调用前提供 workspace_id、revision 和 address；需要函数详情时再调用 "
+            "function.inspect。"
+        ),
         AddressInspectInput,
         AddressInspectOutput,
         read_only=True,
     ),
     _spec(
         "analysis.refine",
-        "细化分析",
-        "在 staging IDB 中执行有界再分析并异步发布新 revision。",
+        "重新分析指定位置",
+        (
+            "让 IDA 重新分析指定地址或函数。调用前提供 workspace_id、revision、targets "
+            "和 actions；返回 operation_id 后调用 operation.wait，成功后改用新的 revision。"
+        ),
         AnalysisRefineInput,
         AnalysisRefineOutput,
         read_only=False,
@@ -118,8 +125,12 @@ _STANDARD_SPECS: Final = (
     ),
     _spec(
         "change.apply",
-        "应用变更集",
-        "按 expected_revision 与 digest 原子应用已准备的变更集。成功后发布新 revision。",
+        "保存已经检查的修改",
+        (
+            "保存 change.prepare 已经检查过的修改。原样传入 workspace_id、"
+            "expected_revision、change_set_id 和 digest；成功后，所有后续查询都改用返回的"
+            "新 revision。"
+        ),
         ChangeApplyInput,
         ChangeApplyOutput,
         read_only=False,
@@ -128,8 +139,12 @@ _STANDARD_SPECS: Final = (
     ),
     _spec(
         "change.prepare",
-        "准备变更集",
-        "完整预检一组 IDB 变更并生成绑定 base revision 的不可变变更集和摘要。",
+        "检查准备保存的修改",
+        (
+            "检查重命名、注释、类型和字节修改是否能安全应用，但暂不保存。调用前提供 "
+            "workspace_id、base_revision 和 operations；检查 impact 后，把返回的 "
+            "change_set_id 与 digest 原样传给 change.apply。"
+        ),
         ChangePrepareInput,
         ChangePrepareOutput,
         read_only=False,
@@ -137,8 +152,12 @@ _STANDARD_SPECS: Final = (
     ),
     _spec(
         "dataflow.slice",
-        "查询函数内数据流",
-        "基于 Hex-Rays microcode 返回函数内有界 MAY/MUST 前向或后向切片及未知屏障。",
+        "查看函数内的数据流",
+        (
+            "查看某个值在函数中可能或必然来自哪里、流向哪里。调用前提供 workspace_id、"
+            "revision、function、seed、direction 和 semantics；结果中的 barriers 表示"
+            "无法继续判断的位置。"
+        ),
         DataflowSliceInput,
         DataflowSliceOutput,
         read_only=True,
@@ -146,7 +165,10 @@ _STANDARD_SPECS: Final = (
     _spec(
         "debug.breakpoints",
         "替换断点集合",
-        "在指定 suspended stop 上用 image/module RVA 语义替换会话断点并返回真实激活状态。",
+        (
+            "用 replace 中的断点完整替换当前调试会话的断点。只能在进程暂停时调用，并提供"
+            "当前 stop_id；检查返回的断点状态后，可调用 debug.control 继续执行。"
+        ),
         DebugBreakpointsInput,
         DebugBreakpointsOutput,
         read_only=False,
@@ -157,8 +179,9 @@ _STANDARD_SPECS: Final = (
         "debug.control",
         "控制调试进程",
         (
-            "执行 pause、continue、step_into、step_over 或 run_to; 只有观察到对应 IDA 事件, "
-            "或明确验证 DSTATE_RUN 状态后才完成。"
+            "暂停、继续、单步进入、单步越过或运行到指定地址。除 pause 外，调用时使用最近"
+            "一次暂停返回的 stop_id；暂停后使用新的 stop_id，运行时调用 debug.events "
+            "等待事件。"
         ),
         DebugControlInput,
         DebugControlOutput,
@@ -169,7 +192,10 @@ _STANDARD_SPECS: Final = (
     _spec(
         "debug.establish",
         "建立调试会话",
-        "为 workspace revision 启动或按策略附加 Windows x64 目标。观察到真实事件后才成功。",
+        (
+            "使用指定分析项目和版本启动程序，或在配置允许时附加进程。返回 suspended 时，"
+            "后续检查和控制使用返回的 stop_id；返回 running 时调用 debug.events 等待事件。"
+        ),
         DebugEstablishInput,
         DebugEstablishOutput,
         read_only=False,
@@ -180,8 +206,8 @@ _STANDARD_SPECS: Final = (
         "debug.events",
         "等待调试事件",
         (
-            "按单调 sequence 游标读取或长轮询调试事实; provenance 明确区分 IDA 事件、"
-            "debugger 状态观察和服务事件。"
+            "读取进程启动、暂停、断点、异常和退出等调试事件，也可通过 wait_ms 等待新事件。"
+            "再次调用时，把 after_sequence 设为上次返回的 last_sequence，避免重复读取。"
         ),
         DebugEventsInput,
         DebugEventsOutput,
@@ -191,7 +217,10 @@ _STANDARD_SPECS: Final = (
     _spec(
         "debug.finish",
         "结束调试会话",
-        "分离目标或仅在策略允许时终止本服务启动的目标并等待真实完成事件。",
+        (
+            "与附加的进程分离，或终止由本服务启动的进程。调用前提供 debug_session_id 和 "
+            "action；成功后不要再使用这个调试会话。"
+        ),
         DebugFinishInput,
         DebugFinishOutput,
         read_only=False,
@@ -201,8 +230,11 @@ _STANDARD_SPECS: Final = (
     ),
     _spec(
         "debug.inspect",
-        "检查暂停快照",
-        "只在匹配 stop_id 的 suspended 状态读取模块、线程、寄存器、调用栈或有限内存。",
+        "检查暂停时的进程状态",
+        (
+            "读取暂停时的模块、线程、寄存器、调用栈、内存或内存区域。调用时必须提供当前 "
+            "stop_id；进程继续执行后，这次返回的状态和 stop_id 都不能复用。"
+        ),
         DebugInspectInput,
         DebugInspectOutput,
         read_only=True,
@@ -211,7 +243,11 @@ _STANDARD_SPECS: Final = (
     _spec(
         "function.inspect",
         "检查函数",
-        "按需返回函数 chunks、指令、伪代码、ctree 映射、块、调用、字符串、栈、局部变量与类型视图。",
+        (
+            "读取指定函数的范围、指令、伪代码、基本块、调用、字符串、栈变量和类型。调用前"
+            "提供 workspace_id、revision、function 和 views；有 next_cursor 时继续读取"
+            "下一页。"
+        ),
         FunctionInspectInput,
         FunctionInspectOutput,
         read_only=True,
@@ -219,23 +255,33 @@ _STANDARD_SPECS: Final = (
     _spec(
         "graph.query",
         "查询关系图",
-        "返回有界 CFG、调用图或代码/数据 xref 图并显式报告未解析间接边。",
+        (
+            "查询控制流图、函数调用图或代码与数据的交叉引用图。调用前提供 workspace_id、"
+            "revision、graph 和 roots；结果会明确列出节点、边和无法解析的间接关系数量。"
+        ),
         GraphQueryInput,
         GraphQueryOutput,
         read_only=True,
     ),
     _spec(
         "operation.cancel",
-        "取消长操作",
-        "请求取消显式 operation。返回真实状态且不把已接收请求冒充已取消。",
+        "请求取消后台任务",
+        (
+            "请求取消 workspace.create、workspace.export、report.build 或 analysis.refine "
+            "启动的后台任务。请求被接受不代表任务已经结束；随后调用 operation.wait 查看"
+            "最终状态。"
+        ),
         OperationCancelInput,
         OperationCancelOutput,
         read_only=False,
     ),
     _spec(
         "operation.wait",
-        "等待长操作",
-        "查询或最多长轮询 30 秒以取得显式 operation 的当前状态。",
+        "等待后台任务",
+        (
+            "查看 operation_id 对应任务的状态，也可以用 wait_ms 最多等待 30 秒。"
+            "任务仍在排队或执行时继续调用；成功后从 result 读取 revision 或生成文件地址。"
+        ),
         OperationWaitInput,
         OperationWaitOutput,
         read_only=True,
@@ -243,7 +289,10 @@ _STANDARD_SPECS: Final = (
     _spec(
         "program.overview",
         "程序概览",
-        "读取镜像、段、入口、导入导出、fixup、unwind、函数和字符串的 revision 固定概览。",
+        (
+            "查看指定分析版本的文件格式、架构、段、入口点、导入导出、函数和字符串数量。"
+            "调用前提供 workspace_id 和 revision；需要具体函数或地址时再调用相应检查工具。"
+        ),
         ProgramOverviewInput,
         ProgramOverviewOutput,
         read_only=True,
@@ -252,8 +301,8 @@ _STANDARD_SPECS: Final = (
         "program.search",
         "搜索程序事实",
         (
-            "在 function、name、string 文本域与独立 bytes_query 字节域执行有界搜索; "
-            "空 text_query 枚举所选文本域。"
+            "按函数、名称、字符串或字节搜索指定分析版本。调用前提供 workspace_id、revision "
+            "和 domains，并提供 text_query 或 bytes_query；有 next_cursor 时继续读取下一页。"
         ),
         ProgramSearchInput,
         ProgramSearchOutput,
@@ -261,8 +310,12 @@ _STANDARD_SPECS: Final = (
     ),
     _spec(
         "report.build",
-        "构建逆向报告",
-        "从指定 revision 构建不可变 Markdown 或 JSON 报告 artifact。",
+        "生成分析报告",
+        (
+            "根据指定分析版本生成 Markdown 或 JSON 报告。调用前提供 workspace_id、revision、"
+            "format 和 sections；返回 operation_id 后调用 operation.wait，再用结果中的"
+            "文件地址读取报告。"
+        ),
         ReportBuildInput,
         ReportBuildOutput,
         read_only=False,
@@ -271,15 +324,23 @@ _STANDARD_SPECS: Final = (
     _spec(
         "type.inspect",
         "检查类型",
-        "按实体、精确名称或地址检查 IDA 类型与字段布局。",
+        (
+            "按实体编号、完整名称或地址查看 IDA 类型及字段位置。调用前提供 workspace_id、"
+            "revision 和 type；有 next_cursor 时继续读取下一页。"
+        ),
         TypeInspectInput,
         TypeInspectOutput,
         read_only=True,
     ),
     _spec(
         "workspace.create",
-        "创建工作区",
-        "复制并哈希原始 Native 样本。建立首个冷 IDB revision 并启动 headless 分析。",
+        "导入新样本",
+        (
+            "把本机样本复制到项目 data 目录，计算 SHA-256，并启动首次 IDA 分析。"
+            "调用前先用 workspace.list 确认样本没有重复导入；把返回的 "
+            "analysis_operation_id 作为 operation_id 调用 operation.wait，成功后取得"
+            "首个 revision。"
+        ),
         WorkspaceCreateInput,
         WorkspaceCreateOutput,
         read_only=False,
@@ -288,8 +349,11 @@ _STANDARD_SPECS: Final = (
     ),
     _spec(
         "workspace.export",
-        "导出工作区产物",
-        "从不可变 revision 异步导出 IDB, 并返回可逐块读取的不可变 artifact 索引。",
+        "导出分析数据库",
+        (
+            "把指定 workspace_id 和 revision 的 IDA 数据库导出为文件。返回 operation_id "
+            "后调用 operation.wait；成功后使用 result.artifact_uri 读取文件。"
+        ),
         WorkspaceExportInput,
         WorkspaceExportOutput,
         read_only=False,
@@ -297,16 +361,24 @@ _STANDARD_SPECS: Final = (
     ),
     _spec(
         "workspace.get",
-        "读取工作区",
-        "读取 workspace 当前 revision、样本身份与分页 revision 元数据。",
+        "查看分析项目",
+        (
+            "读取一个分析项目的样本信息、current_revision 和已有版本记录。Agent 接手已有"
+            "任务时应先调用此工具；有 next_cursor 时继续读取下一页，后续查询使用"
+            " current_revision。"
+        ),
         WorkspaceGetInput,
         WorkspaceGetOutput,
         read_only=True,
     ),
     _spec(
         "workspace.list",
-        "列出工作区",
-        "确定性分页列出当前数据目录内的 workspace。",
+        "列出已有分析项目",
+        (
+            "列出 data 目录中已经保存的分析项目。Agent 接手任务时先调用此工具查找 "
+            "workspace_id，再调用 workspace.get 读取 current_revision；有 next_cursor 时"
+            "继续读取下一页。"
+        ),
         WorkspaceListInput,
         WorkspaceListOutput,
         read_only=True,
@@ -317,8 +389,9 @@ EXPERT_TOOL_SPEC: Final = _spec(
     "expert.execute",
     "执行专家 IDAPython",
     (
-        "在 disposable staging worker 中执行有界 inline IDAPython, 写入只通过新 revision "
-        "发布; 开放世界执行不能阻止文件、网络或子进程访问。"
+        "在单独的 IDA 进程中执行 IDAPython，并把数据库修改保存为新 revision。此功能可以"
+        "访问文件、网络和子进程，只应运行可信代码；执行后读取 structuredContent 中的输出，"
+        "并让后续查询改用新 revision。"
     ),
     ExpertExecuteInput,
     ExpertExecuteOutput,

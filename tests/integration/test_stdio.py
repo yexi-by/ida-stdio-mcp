@@ -14,6 +14,7 @@ from mcp.client.stdio import stdio_client
 from pydantic import AnyUrl
 
 from ida_re_mcp.constants import RESOURCE_CHUNK_BYTES
+from ida_re_mcp.domain.base import JsonObject
 from ida_re_mcp.supervisor import ArtifactStore
 
 _PROBE_SERVER = Path(__file__).with_name("stdio_probe_server.py")
@@ -174,6 +175,14 @@ async def _official_client_scenario(data_root: Path) -> None:
                     "next_cursor": None,
                     "workspaces": [],
                 }
+                assert len(workspace_list.content) == 1
+                workspace_summary = workspace_list.content[0]
+                assert isinstance(workspace_summary, types.TextContent)
+                assert "没有找到已经保存的分析项目" in workspace_summary.text
+                assert "workspace.create" in workspace_summary.text
+                assert "structuredContent" in workspace_summary.text
+                with pytest.raises(json.JSONDecodeError):
+                    json.loads(workspace_summary.text)
                 concurrent = await asyncio.gather(
                     *(client.call_tool("workspace.list", {}) for _ in range(8))
                 )
@@ -193,10 +202,18 @@ async def _official_client_scenario(data_root: Path) -> None:
                 )
                 assert invalid_arguments.isError is True
                 assert invalid_arguments.structuredContent is None
-                invalid_content = invalid_arguments.content[0]
+                assert len(invalid_arguments.content) == 2
+                invalid_summary = invalid_arguments.content[0]
+                invalid_content = invalid_arguments.content[1]
+                assert isinstance(invalid_summary, types.TextContent)
                 assert isinstance(invalid_content, types.TextContent)
+                assert "操作失败：" in invalid_summary.text
+                assert "下一步：" in invalid_summary.text
                 invalid_payload = cast(dict[str, Any], json.loads(invalid_content.text))
                 assert invalid_payload["code"] == "invalid_arguments"
+                assert invalid_payload["message"] == (
+                    "工具参数不正确。请按照 tools/list 返回的 inputSchema 修改后重试。"
+                )
 
                 business_error = await client.call_tool(
                     "operation.wait",
@@ -204,16 +221,23 @@ async def _official_client_scenario(data_root: Path) -> None:
                 )
                 assert business_error.isError is True
                 assert business_error.structuredContent is None
-                business_content = business_error.content[0]
+                assert len(business_error.content) == 2
+                business_summary = business_error.content[0]
+                business_content = business_error.content[1]
+                assert isinstance(business_summary, types.TextContent)
                 assert isinstance(business_content, types.TextContent)
+                assert "找不到这个后台任务" in business_summary.text
                 business_payload = cast(dict[str, Any], json.loads(business_content.text))
                 assert business_payload["code"] == "operation_not_found"
+                assert "operation_id" in business_summary.text
 
                 try:
                     await client.call_tool("missing.tool", {})
                 except McpError as error:
                     assert error.error.code == types.INVALID_PARAMS
-                    assert error.error.message == "Unknown tool: missing.tool"
+                    assert error.error.message == (
+                        "找不到工具 `missing.tool`。请先读取 tools/list，并使用其中列出的工具名称。"
+                    )
                 else:
                     raise AssertionError("调用未知工具应返回 JSON-RPC Invalid params")
 
@@ -225,7 +249,10 @@ async def _official_client_scenario(data_root: Path) -> None:
                     await client.read_resource(AnyUrl(missing_uri))
                 except McpError as error:
                     assert error.error.code == -32002
-                    assert error.error.message == "Resource not found"
+                    assert error.error.message == (
+                        "找不到这个工具生成的文件。请重新调用生成文件的工具，"
+                        "并使用它返回的完整文件地址。"
+                    )
                 else:
                     raise AssertionError("读取不存在的 resource 应失败")
 
@@ -233,7 +260,10 @@ async def _official_client_scenario(data_root: Path) -> None:
                     await client.read_resource(AnyUrl("ida-re://unsupported/resource"))
                 except McpError as error:
                     assert error.error.code == types.INVALID_PARAMS
-                    assert error.error.message == "resource URI 无效"
+                    assert error.error.message == (
+                        "无法读取工具生成的文件：文件地址格式不正确。"
+                        "请使用生成文件的工具返回的完整文件地址。"
+                    )
                 else:
                     raise AssertionError("无效 resource URI 应返回 JSON-RPC Invalid params")
 
@@ -243,6 +273,99 @@ async def _official_client_scenario(data_root: Path) -> None:
 
 def test_official_sdk_client_negotiates_real_stdio(tmp_path: Path) -> None:
     asyncio.run(_official_client_scenario(tmp_path))
+
+
+def test_real_stdio_preserves_full_structured_data_beside_chinese_summary(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        state_path = tmp_path / "full-state.txt"
+        error_path = tmp_path / "full-stderr.log"
+        expected: JsonObject = {
+            "result_artifact": None,
+            "image": {
+                "image_id": "image_stdio",
+                "format": "pe32+",
+                "architecture": "x86_64",
+                "bitness": 64,
+                "endian": "little",
+                "image_base": "0x140000000",
+                "image_size": 4096,
+                "sha256": "a" * 64,
+            },
+            "counts": {
+                "functions": 1,
+                "strings": 0,
+                "imports": 0,
+                "exports": 1,
+                "fixups": 0,
+                "unwind_regions": 0,
+                "exception_regions": 0,
+            },
+            "segments": [],
+            "entry_points": [
+                {
+                    "entity_id": "function_stdio",
+                    "name": "entry",
+                    "address": {
+                        "kind": "image",
+                        "image_id": "image_stdio",
+                        "rva": "0x401000",
+                    },
+                }
+            ],
+            "imports": [],
+            "exports": [],
+            "fixups": [],
+            "unwind_regions": [],
+            "functions": [],
+            "strings": [],
+            "coverage": {
+                "status": "complete",
+                "sampled": False,
+                "truncated": False,
+                "reasons": [],
+            },
+            "provenance": {
+                "workspace_id": "workspace_stdio",
+                "revision": "revision_stdio",
+                "backend": "ida",
+                "evidence": [],
+                "warnings": [],
+            },
+        }
+        with error_path.open("w+", encoding="utf-8") as error_log:
+            async with stdio_client(
+                _probe_parameters(tmp_path / "full", state_path),
+                errlog=error_log,
+            ) as streams:
+                async with ClientSession(*streams) as client:
+                    await client.initialize()
+                    result = await client.call_tool(
+                        "program.overview",
+                        {
+                            "workspace_id": "workspace_stdio",
+                            "revision": "revision_stdio",
+                            "include": ["entry_points"],
+                        },
+                    )
+
+                    assert result.isError is False
+                    assert result.structuredContent == expected
+                    assert len(result.content) == 1
+                    summary = result.content[0]
+                    assert isinstance(summary, types.TextContent)
+                    assert "程序概览读取完成" in summary.text
+                    assert "structuredContent" in summary.text
+                    assert "0x401000" not in summary.text
+                    assert "a" * 64 not in summary.text
+                    with pytest.raises(json.JSONDecodeError):
+                        json.loads(summary.text)
+
+            error_log.seek(0)
+            assert error_log.read() == ""
+
+    asyncio.run(scenario())
 
 
 def test_two_stdio_agents_share_artifacts_and_isolate_runtime_sessions(
@@ -393,7 +516,10 @@ def test_real_stdio_sanitizes_internal_protocol_error(tmp_path: Path) -> None:
                     with pytest.raises(McpError) as error:
                         await client.call_tool("probe.wait", {"delay_ms": 1})
                     assert error.value.error.code == types.INTERNAL_ERROR
-                    assert error.value.error.message == "Internal server error"
+                    assert error.value.error.message == (
+                        "工具执行失败，服务内部出现错误。请重试；"
+                        "如果仍然失败，请运行 doctor 检查配置并查看日志。"
+                    )
                     serialized = error.value.error.model_dump_json()
                     assert "sensitive-probe-internal-detail" not in serialized
                     assert "RuntimeError" not in serialized
