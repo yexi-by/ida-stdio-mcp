@@ -133,6 +133,7 @@ class _FakeIdaBackend:
         self.refine_started = threading.Event()
         self.analysis_open_count = 0
         self.analysis_close_count = 0
+        self.analysis_timeouts: list[float] = []
 
     async def bootstrap(
         self,
@@ -162,7 +163,7 @@ class _FakeIdaBackend:
         input: Mapping[str, JsonValue],
         timeout_seconds: float,
     ) -> JsonObject:
-        del timeout_seconds
+        self.analysis_timeouts.append(timeout_seconds)
         assert checkout_path.is_file()
         is_cold_staging = ".staging" in checkout_path.parts and operation == "program.overview"
         if is_cold_staging:
@@ -2034,6 +2035,7 @@ class _LifecycleBootstrapBackend(_FakeIdaBackend):
         self.fail_bootstrap = fail_bootstrap
         self.bootstrap_started = asyncio.Event()
         self.allow_bootstrap = asyncio.Event()
+        self.bootstrap_timeout_seconds: float | None = None
 
     async def bootstrap(
         self,
@@ -2042,7 +2044,8 @@ class _LifecycleBootstrapBackend(_FakeIdaBackend):
         staging_path: Path,
         timeout_seconds: float,
     ) -> JsonObject:
-        del sample_path, timeout_seconds
+        del sample_path
+        self.bootstrap_timeout_seconds = timeout_seconds
         self.bootstrap_started.set()
         if self.block_bootstrap:
             await self.allow_bootstrap.wait()
@@ -2093,8 +2096,16 @@ def _lifecycle_application(
     paths: RuntimePaths | None = None,
     block_bootstrap: bool = False,
     fail_bootstrap: bool = False,
+    operation_timeout_seconds: int = 120,
+    initial_analysis_timeout_seconds: int = 3_600,
 ) -> tuple[_LifecycleApplication, Path, _LifecycleBootstrapBackend]:
-    config = AppConfig(workers=WorkerConfig(analysis_limit=1))
+    config = AppConfig(
+        workers=WorkerConfig(
+            analysis_limit=1,
+            operation_timeout_seconds=operation_timeout_seconds,
+            initial_analysis_timeout_seconds=initial_analysis_timeout_seconds,
+        )
+    )
     runtime_paths = paths or _paths(tmp_path)
     storage = SupervisorStorage.open(config=config, paths=runtime_paths)
     source = tmp_path / f"lifecycle-{runtime_paths.session_data_root.name}.dll"
@@ -2117,6 +2128,31 @@ def _lifecycle_application(
         backend=backend,
     )
     return application, source, backend
+
+
+def test_workspace_create_uses_configured_worker_timeouts(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, source, backend = _lifecycle_application(
+            tmp_path,
+            operation_timeout_seconds=37,
+            initial_analysis_timeout_seconds=7_200,
+        )
+        started = await application.execute_tool(
+            "workspace.create",
+            WorkspaceCreateInput(sample_path=str(source)),
+        )
+        assert isinstance(started, WorkspaceCreateOutput)
+        completed = await application.execute_tool(
+            "operation.wait",
+            OperationWaitInput(operation_id=started.analysis_operation_id, wait_ms=1_000),
+        )
+        assert isinstance(completed, OperationWaitOutput)
+        assert completed.state == "succeeded"
+        assert backend.bootstrap_timeout_seconds == 7_200
+        assert backend.analysis_timeouts == [37]
+        await application.aclose()
+
+    asyncio.run(scenario())
 
 
 async def _wait_for_operation_state(

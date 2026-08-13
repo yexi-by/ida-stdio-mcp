@@ -27,6 +27,8 @@ def test_default_policy_is_constrained_autonomy() -> None:
     assert config.policy.expert is False
     assert config.workers.analysis_limit == 1
     assert config.workers.debug_limit == 1
+    assert config.workers.operation_timeout_seconds == 120
+    assert config.workers.initial_analysis_timeout_seconds == 3_600
     assert config.storage.retained_revisions == 3
     assert config.storage.quota_gib == 20
 
@@ -47,6 +49,8 @@ expert = false
 analysis_limit = 2
 debug_limit = 1
 idle_seconds = 120
+operation_timeout_seconds = 90
+initial_analysis_timeout_seconds = 7200
 
 [storage]
 quota_gib = 40
@@ -64,6 +68,8 @@ ida_dir = "C:/Program Files/IDA Professional 9.3"
 
     assert config.policy.debug_attach is True
     assert config.workers.analysis_limit == 2
+    assert config.workers.operation_timeout_seconds == 90
+    assert config.workers.initial_analysis_timeout_seconds == 7_200
     assert config.storage.quota_gib == 40
     assert config.runtime.data_root == str((tmp_path / "data").resolve())
     assert config.runtime.log_root == str((tmp_path / "logs").resolve())
@@ -109,6 +115,8 @@ def test_shipped_config_is_valid() -> None:
     assert config.runtime.ida_dir is not None
     assert config.policy.debug_attach is True
     assert config.policy.expert is True
+    assert config.workers.operation_timeout_seconds == 120
+    assert config.workers.initial_analysis_timeout_seconds == 3_600
 
 
 @pytest.mark.parametrize(
@@ -116,6 +124,7 @@ def test_shipped_config_is_valid() -> None:
     [
         'schema_version = "1"\nunknown = true\n',
         'schema_version = "1"\n[workers]\nanalysis_limit = "1"\n',
+        'schema_version = "1"\n[workers]\ninitial_analysis_timeout_seconds = 0\n',
         "[policy]\nauthoring = true\n",
     ],
 )

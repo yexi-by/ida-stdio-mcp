@@ -242,7 +242,6 @@ _DEBUG_TOOL_NAMES = frozenset(
         "debug.finish",
     }
 )
-_WORKER_TIMEOUT_SECONDS = 120.0
 _MAX_RESOURCE_CONTENTS = 64
 _OPERATION_WAIT_POLL_SECONDS = 0.05
 _TERMINAL_OPERATION_STATES = frozenset(
@@ -1412,7 +1411,7 @@ class Application:
                 result = await session.backend.execute(
                     operation=request.operation,
                     input=request.input,
-                    timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                    timeout_seconds=self.config.workers.operation_timeout_seconds,
                 )
                 results.append(cast(Mapping[str, object], result))
             output = adapt_static_results(
@@ -2023,7 +2022,7 @@ class Application:
                         lambda: self.backend.mutate(
                             staging_path=staging.database_path,
                             operations=execution.worker_operations,
-                            timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                            timeout_seconds=self.config.workers.operation_timeout_seconds,
                         )
                     )
                     impact = parse_preflight_impact(
@@ -2181,7 +2180,7 @@ class Application:
                             lambda: self.backend.mutate(
                                 staging_path=staging.database_path,
                                 operations=execution.worker_operations,
-                                timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                                timeout_seconds=self.config.workers.operation_timeout_seconds,
                             )
                         )
                         parse_worker_impact(change_set.operations, raw)
@@ -2923,7 +2922,7 @@ class Application:
                     lambda: self.backend.refine(
                         staging_path=staging.database_path,
                         input=request.input,
-                        timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                        timeout_seconds=self.config.workers.operation_timeout_seconds,
                     )
                 )
                 result = adapt_refine_worker_result(
@@ -3004,7 +3003,7 @@ class Application:
                 lambda: self.backend.bootstrap(
                     sample_path=workspace.sample_path,
                     staging_path=staging.database_path,
-                    timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                    timeout_seconds=self.config.workers.initial_analysis_timeout_seconds,
                 )
             )
             if result.get("input_sha256") != workspace.sample_sha256:
@@ -3154,7 +3153,7 @@ class Application:
             overview = await backend.execute(
                 operation="program.overview",
                 input={"limit": 1},
-                timeout_seconds=_WORKER_TIMEOUT_SECONDS,
+                timeout_seconds=self.config.workers.operation_timeout_seconds,
             )
         finally:
             try:

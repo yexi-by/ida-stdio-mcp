@@ -15,9 +15,11 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, ValidationIn
 
 from ida_re_mcp.constants import (
     CONFIG_SCHEMA_VERSION,
+    DEFAULT_INITIAL_ANALYSIS_TIMEOUT_SECONDS,
     DEFAULT_RETAINED_REVISIONS,
     DEFAULT_STORAGE_GIB,
     DEFAULT_WORKER_IDLE_SECONDS,
+    DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS,
     PRODUCT_NAME,
 )
 
@@ -58,13 +60,23 @@ class PolicyConfig(BaseModel):
 
 
 class WorkerConfig(BaseModel):
-    """进程隔离 worker 的并发与回收限制。"""
+    """进程隔离 worker 的并发、超时与回收限制。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     analysis_limit: int = Field(default=1, ge=1, le=64)
     debug_limit: int = Field(default=1, ge=1, le=64)
     idle_seconds: int = Field(default=DEFAULT_WORKER_IDLE_SECONDS, ge=1, le=86_400)
+    operation_timeout_seconds: int = Field(
+        default=DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS,
+        ge=1,
+        le=86_400,
+    )
+    initial_analysis_timeout_seconds: int = Field(
+        default=DEFAULT_INITIAL_ANALYSIS_TIMEOUT_SECONDS,
+        ge=1,
+        le=86_400,
+    )
 
 
 class StorageConfig(BaseModel):

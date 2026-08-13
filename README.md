@@ -47,7 +47,12 @@ PE / ELF 文件。
    tool_timeout_sec = 3600.0
    ```
 
-   其他客户端同理，工作目录指向本项目即可。
+   其他客户端同理，工作目录指向本项目即可。这里的
+   `startup_timeout_sec` 和 `tool_timeout_sec` 只限制客户端等待 MCP 服务的时间。
+   IDA 子进程的单次操作时限由本项目 `config.toml` 的 `[workers]` 控制：
+   `operation_timeout_seconds` 用于普通查询、分析细化和 IDB 修改，
+   `initial_analysis_timeout_seconds` 单独用于首次导入时的 IDA 自动分析。
+   大型原生库首次分析超时时，应调整后者并重启 MCP 服务。
 
 ## 工作原理
 
