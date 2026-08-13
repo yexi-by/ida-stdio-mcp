@@ -52,7 +52,7 @@ PE / ELF 文件。
    IDA 子进程的单次操作时限由本项目 `config.toml` 的 `[workers]` 控制：
    `operation_timeout_seconds` 用于普通查询、分析细化和 IDB 修改，
    `initial_analysis_timeout_seconds` 单独用于首次导入时的 IDA 自动分析。
-   大型原生库首次分析超时时，应调整后者并重启 MCP 服务。
+   默认分别为 1 小时和 3 小时；修改后需要重启 MCP 服务。
 
 ## 工作原理
 

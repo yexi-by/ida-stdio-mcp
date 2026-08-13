@@ -39,10 +39,10 @@ debug_limit = 1
 idle_seconds = 300
 
 # 普通查询、分析细化和 IDB 修改允许单次占用 IDA 子进程的最长时间。
-operation_timeout_seconds = 120
+operation_timeout_seconds = 3600
 
-# 首次导入样本时，IDA 自动分析允许运行的最长时间。大型原生库可能需要数十分钟。
-initial_analysis_timeout_seconds = 3600
+# 首次导入样本时，IDA 自动分析允许运行的最长时间。大型项目默认允许 3 小时。
+initial_analysis_timeout_seconds = 10800
 
 [storage]
 # data_root 建议最多使用多少 GiB。doctor 和 gc 会报告是否超过此值，

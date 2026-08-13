@@ -2096,8 +2096,8 @@ def _lifecycle_application(
     paths: RuntimePaths | None = None,
     block_bootstrap: bool = False,
     fail_bootstrap: bool = False,
-    operation_timeout_seconds: int = 120,
-    initial_analysis_timeout_seconds: int = 3_600,
+    operation_timeout_seconds: int = 3_600,
+    initial_analysis_timeout_seconds: int = 10_800,
 ) -> tuple[_LifecycleApplication, Path, _LifecycleBootstrapBackend]:
     config = AppConfig(
         workers=WorkerConfig(

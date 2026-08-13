@@ -27,8 +27,8 @@ def test_default_policy_is_constrained_autonomy() -> None:
     assert config.policy.expert is False
     assert config.workers.analysis_limit == 1
     assert config.workers.debug_limit == 1
-    assert config.workers.operation_timeout_seconds == 120
-    assert config.workers.initial_analysis_timeout_seconds == 3_600
+    assert config.workers.operation_timeout_seconds == 3_600
+    assert config.workers.initial_analysis_timeout_seconds == 10_800
     assert config.storage.retained_revisions == 3
     assert config.storage.quota_gib == 20
 
@@ -115,8 +115,8 @@ def test_shipped_config_is_valid() -> None:
     assert config.runtime.ida_dir is not None
     assert config.policy.debug_attach is True
     assert config.policy.expert is True
-    assert config.workers.operation_timeout_seconds == 120
-    assert config.workers.initial_analysis_timeout_seconds == 3_600
+    assert config.workers.operation_timeout_seconds == 3_600
+    assert config.workers.initial_analysis_timeout_seconds == 10_800
 
 
 @pytest.mark.parametrize(
