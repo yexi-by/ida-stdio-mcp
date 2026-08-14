@@ -444,6 +444,7 @@ class Application:
             enable_authoring=config.policy.authoring,
             enable_debug=config.policy.debug_launch or config.policy.debug_attach,
             enable_expert=config.policy.expert,
+            operation_timeout_seconds=config.workers.operation_timeout_seconds,
         )
         self._catalog_by_name = {spec.name: spec for spec in catalog}
         self._mcp = McpRuntime(
@@ -2876,6 +2877,16 @@ class Application:
         self,
         arguments: ExpertExecuteInput,
     ) -> ExpertExecuteOutput:
+        maximum_timeout = self.config.workers.operation_timeout_seconds
+        if arguments.timeout_seconds > maximum_timeout:
+            raise ToolExecutionError(
+                BusinessErrorCode.PRECONDITION_FAILED,
+                (
+                    "timeout_seconds 超过当前服务允许的普通操作时限。"
+                    "请重新读取 tools/list，并使用其中列出的最大值。"
+                ),
+                details={"maximum_timeout_seconds": maximum_timeout},
+            )
         await asyncio.to_thread(
             self.storage.workspaces.get_revision,
             arguments.workspace_id,

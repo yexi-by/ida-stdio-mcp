@@ -12,10 +12,10 @@ import pytest
 from pydantic import JsonValue, ValidationError
 
 from ida_re_mcp.application import Application
-from ida_re_mcp.config import AppConfig, RuntimePaths, StorageConfig, WorkerConfig
+from ida_re_mcp.config import AppConfig, PolicyConfig, RuntimePaths, StorageConfig, WorkerConfig
 from ida_re_mcp.constants import MAX_INLINE_RESULT_BYTES
 from ida_re_mcp.domain.address import DatabaseAddress
-from ida_re_mcp.domain.base import JsonObject
+from ida_re_mcp.domain.base import JsonObject, StrictModel
 from ida_re_mcp.domain.errors import BusinessErrorCode, ToolExecutionError
 from ida_re_mcp.domain.tools import (
     AnalysisRefineInput,
@@ -26,6 +26,8 @@ from ida_re_mcp.domain.tools import (
     ChangeImpact,
     ChangePrepareInput,
     ChangePrepareOutput,
+    ExpertExecuteInput,
+    ExpertExecuteOutput,
     ImageSummary,
     OperationCancelInput,
     OperationCancelOutput,
@@ -60,6 +62,7 @@ from ida_re_mcp.supervisor.changes import ChangeSetStore
 from ida_re_mcp.supervisor.cursors import CursorCodec
 from ida_re_mcp.supervisor.native_formats import NativeImageIdentity, inspect_native_image
 from ida_re_mcp.supervisor.storage import SupervisorStorage
+from ida_re_mcp.supervisor.workers import WorkerProcessError
 from ida_re_mcp.supervisor.workspaces import (
     ColdValidationReceipt,
     ImageIdentity,
@@ -118,6 +121,8 @@ class _FakeIdaBackend:
         cold_sample_sha256: str | None = None,
         cold_mismatch_call: int | None = None,
         cold_container: str | None = None,
+        successful_expert: bool = False,
+        fail_expert_with_timeout: bool = False,
     ) -> None:
         self.sample_sha256 = sample_sha256
         self.fail_mutation_call = fail_mutation_call
@@ -129,6 +134,8 @@ class _FakeIdaBackend:
         self.cold_sample_sha256 = cold_sample_sha256
         self.cold_mismatch_call = cold_mismatch_call
         self.cold_container = cold_container
+        self.successful_expert = successful_expert
+        self.fail_expert_with_timeout = fail_expert_with_timeout
         self.cold_analysis_calls = 0
         self.mutation_calls = 0
         self.search_requests: list[tuple[int, int]] = []
@@ -136,6 +143,7 @@ class _FakeIdaBackend:
         self.analysis_open_count = 0
         self.analysis_close_count = 0
         self.analysis_timeouts: list[float] = []
+        self.expert_timeouts: list[float] = []
 
     async def bootstrap(
         self,
@@ -360,8 +368,21 @@ class _FakeIdaBackend:
         code: str,
         timeout_seconds: float,
     ) -> JsonObject:
-        del staging_path, code, timeout_seconds
-        raise AssertionError("测试不应调用 expert")
+        self.expert_timeouts.append(timeout_seconds)
+        if self.fail_expert_with_timeout:
+            raise WorkerProcessError("worker_timeout", "worker 操作超时并已终止")
+        if not self.successful_expert:
+            raise AssertionError("测试不应调用 expert")
+        staging_path.write_bytes(staging_path.read_bytes() + b"|expert")
+        return {
+            "staging_path": str(staging_path.resolve()),
+            "staging_sha256": _sha256(staging_path),
+            "saved": True,
+            "stdout": "",
+            "stderr": "",
+            "result_repr": repr(code),
+            "cold_verification_required": True,
+        }
 
     async def open_debug(
         self,
@@ -418,6 +439,9 @@ class _TestApplication(Application):
     @property
     def analysis_opening_count_for_test(self) -> int:
         return self._analysis_opening_count
+
+    def tool_input_model_for_test(self, name: str) -> type[StrictModel]:
+        return self._catalog_by_name[name].input_model
 
     async def hold_analysis_opening_guard_for_test(self) -> None:
         await self._analysis_sessions_guard.acquire()
@@ -498,8 +522,14 @@ def _application(
     cold_sample_sha256: str | None = None,
     cold_mismatch_call: int | None = None,
     cold_container: str | None = None,
+    operation_timeout_seconds: int = 3_600,
+    successful_expert: bool = False,
+    fail_expert_with_timeout: bool = False,
 ) -> tuple[_TestApplication, WorkspaceSnapshot, bytes, _FakeIdaBackend]:
-    config = AppConfig()
+    config = AppConfig(
+        policy=PolicyConfig(expert=successful_expert or fail_expert_with_timeout),
+        workers=WorkerConfig(operation_timeout_seconds=operation_timeout_seconds),
+    )
     paths = _paths(tmp_path)
     storage = SupervisorStorage.open(config=config, paths=paths)
     sample_bytes = b"MZ" + b"\0" * 510
@@ -536,6 +566,8 @@ def _application(
         cold_sample_sha256=cold_sample_sha256,
         cold_mismatch_call=cold_mismatch_call,
         cold_container=cold_container,
+        successful_expert=successful_expert,
+        fail_expert_with_timeout=fail_expert_with_timeout,
     )
     application = _TestApplication(
         config=config,
@@ -548,6 +580,97 @@ def _application(
         backend=backend,
     )
     return application, workspace, sample_bytes, backend
+
+
+def test_expert_uses_configured_worker_timeout_and_shorter_override(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, workspace, _sample_bytes, backend = _application(
+            tmp_path,
+            operation_timeout_seconds=37,
+            successful_expert=True,
+        )
+        assert workspace.current_revision is not None
+        input_model = application.tool_input_model_for_test("expert.execute")
+        default_arguments = input_model.model_validate(
+            {
+                "workspace_id": workspace.workspace_id,
+                "revision": workspace.current_revision,
+                "code": "1 + 1",
+            }
+        )
+        assert isinstance(default_arguments, ExpertExecuteInput)
+        assert default_arguments.timeout_seconds == 37
+
+        first = await application.execute_tool("expert.execute", default_arguments)
+        assert isinstance(first, ExpertExecuteOutput)
+        shorter_arguments = input_model.model_validate(
+            {
+                "workspace_id": workspace.workspace_id,
+                "revision": first.revision,
+                "code": "2 + 2",
+                "timeout_seconds": 11,
+            }
+        )
+        second = await application.execute_tool("expert.execute", shorter_arguments)
+
+        assert isinstance(second, ExpertExecuteOutput)
+        assert backend.expert_timeouts == [37, 11]
+        assert backend.analysis_timeouts == [37, 37]
+        with pytest.raises(ToolExecutionError) as rejected:
+            await application.execute_tool(
+                "expert.execute",
+                ExpertExecuteInput(
+                    workspace_id=workspace.workspace_id,
+                    revision=second.revision,
+                    code="3 + 3",
+                    timeout_seconds=38,
+                ),
+            )
+        assert rejected.value.code == BusinessErrorCode.PRECONDITION_FAILED
+        assert rejected.value.details == {"maximum_timeout_seconds": 37}
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_expert_timeout_aborts_staging_and_keeps_head_unchanged(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, workspace, sample_bytes, backend = _application(
+            tmp_path,
+            operation_timeout_seconds=37,
+            fail_expert_with_timeout=True,
+        )
+        assert workspace.current_revision is not None
+        base_revision = workspace.current_revision
+        base = application.storage.workspaces.get_revision(
+            workspace.workspace_id,
+            base_revision,
+        )
+        input_model = application.tool_input_model_for_test("expert.execute")
+        arguments = input_model.model_validate(
+            {
+                "workspace_id": workspace.workspace_id,
+                "revision": base_revision,
+                "code": "while True:\n    pass",
+            }
+        )
+
+        with pytest.raises(ToolExecutionError) as raised:
+            await application.execute_tool("expert.execute", arguments)
+
+        assert raised.value.code == BusinessErrorCode.WORKER_CRASHED
+        assert backend.expert_timeouts == [37]
+        current = application.storage.workspaces.get(workspace.workspace_id)
+        assert current.current_revision == base_revision
+        assert base.database_path.read_bytes() == b"cold-base"
+        assert workspace.sample_path.read_bytes() == sample_bytes
+        staging_root = (
+            application.storage.paths.workspace_root / workspace.workspace_id / ".staging"
+        )
+        assert not tuple(staging_root.iterdir())
+        await application.aclose()
+
+    asyncio.run(scenario())
 
 
 def _prepare(workspace: WorkspaceSnapshot) -> ChangePrepareInput:

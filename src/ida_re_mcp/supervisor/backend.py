@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import sys
 import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Protocol, cast
 
+from ida_re_mcp.supervisor._python_process import prepare_python_process_launch
 from ida_re_mcp.supervisor.workers import WorkerKind, WorkerProcess
 from ida_re_mcp.worker.ipc import JsonObject, JsonValue
 
@@ -303,9 +303,10 @@ class SubprocessIdaBackend:
     async def doctor(self) -> JsonObject:
         environment = os.environ.copy()
         environment.update(self._environment)
+        python_executable, environment = prepare_python_process_launch(environment)
         launch = asyncio.create_task(
             asyncio.create_subprocess_exec(
-                sys.executable,
+                python_executable,
                 "-m",
                 "ida_re_mcp.worker",
                 "probe",

@@ -38,10 +38,11 @@ debug_limit = 1
 # IDA 子进程空闲多少秒后退出；下次需要时会自动重新启动。
 idle_seconds = 300
 
-# 普通查询、分析细化和 IDB 修改允许单次占用 IDA 子进程的最长时间。
+# 普通查询、分析细化、IDB 修改和 expert.execute 单次占用 IDA 子进程的最长时间。
+# 可配置范围最大为 1 小时。
 operation_timeout_seconds = 3600
 
-# 首次导入样本时，IDA 自动分析允许运行的最长时间。大型项目默认允许 3 小时。
+# 首次导入样本时，IDA 自动分析允许运行的最长时间。可配置范围最大为 3 小时。
 initial_analysis_timeout_seconds = 10800
 
 [storage]

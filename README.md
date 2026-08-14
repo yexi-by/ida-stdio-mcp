@@ -44,15 +44,17 @@ PE / ELF 文件。
    args = ["run", "ida-re-mcp", "serve", "--config", "config.toml"]
    cwd = 'D:\path\to\ida-re-mcp'
    startup_timeout_sec = 240.0
-   tool_timeout_sec = 3600.0
+   tool_timeout_sec = 3900.0
    ```
 
    其他客户端同理，工作目录指向本项目即可。这里的
    `startup_timeout_sec` 和 `tool_timeout_sec` 只限制客户端等待 MCP 服务的时间。
    IDA 子进程的单次操作时限由本项目 `config.toml` 的 `[workers]` 控制：
-   `operation_timeout_seconds` 用于普通查询、分析细化和 IDB 修改，
+   `operation_timeout_seconds` 用于普通查询、分析细化、IDB 修改和 `expert.execute`，
    `initial_analysis_timeout_seconds` 单独用于首次导入时的 IDA 自动分析。
-   默认分别为 1 小时和 3 小时；修改后需要重启 MCP 服务。
+   默认值和最大值分别为 1 小时和 3 小时。`expert.execute.timeout_seconds`
+   可以缩短单次 Expert worker 操作，但不能超过 `operation_timeout_seconds`；
+   修改配置后需要重启 MCP 服务。
 
 ## 工作原理
 

@@ -276,6 +276,62 @@ def test_official_sdk_client_negotiates_real_stdio(tmp_path: Path) -> None:
     asyncio.run(_official_client_scenario(tmp_path))
 
 
+def test_real_stdio_expert_schema_uses_configured_worker_timeout(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config_path = tmp_path / "expert-config.toml"
+        config_path.write_text(
+            (
+                'schema_version = "1"\n'
+                "[policy]\n"
+                "expert = true\n"
+                "[workers]\n"
+                "operation_timeout_seconds = 37\n"
+            ),
+            encoding="utf-8",
+        )
+        parameters = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "ida_re_mcp", "serve", "--config", str(config_path)],
+            env=_environment(tmp_path),
+            cwd=Path.cwd(),
+        )
+        error_path = tmp_path / "expert-schema-stderr.log"
+        with error_path.open("w+", encoding="utf-8") as error_log:
+            async with stdio_client(parameters, errlog=error_log) as streams:
+                async with ClientSession(*streams) as client:
+                    await client.initialize()
+                    tools = await client.list_tools()
+                    expert = next(tool for tool in tools.tools if tool.name == "expert.execute")
+                    properties = cast(dict[str, object], expert.inputSchema["properties"])
+                    timeout_schema = cast(dict[str, object], properties["timeout_seconds"])
+
+                    assert timeout_schema["default"] == 37
+                    assert timeout_schema["minimum"] == 1
+                    assert timeout_schema["maximum"] == 37
+
+                    invalid = await client.call_tool(
+                        "expert.execute",
+                        {
+                            "workspace_id": "workspace_integration",
+                            "revision": "revision_integration",
+                            "code": "1 + 1",
+                            "timeout_seconds": 38,
+                        },
+                    )
+                    assert invalid.isError is True
+                    assert invalid.structuredContent is None
+                    assert len(invalid.content) == 2
+                    payload_content = invalid.content[1]
+                    assert isinstance(payload_content, types.TextContent)
+                    payload = cast(dict[str, object], json.loads(payload_content.text))
+                    assert payload["code"] == "invalid_arguments"
+
+            error_log.seek(0)
+            assert error_log.read() == ""
+
+    asyncio.run(scenario())
+
+
 def test_real_stdio_preserves_full_structured_data_beside_chinese_summary(
     tmp_path: Path,
 ) -> None:

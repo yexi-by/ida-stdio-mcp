@@ -20,6 +20,8 @@ from ida_re_mcp.constants import (
     DEFAULT_STORAGE_GIB,
     DEFAULT_WORKER_IDLE_SECONDS,
     DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS,
+    MAX_INITIAL_ANALYSIS_TIMEOUT_SECONDS,
+    MAX_WORKER_OPERATION_TIMEOUT_SECONDS,
     PRODUCT_NAME,
 )
 
@@ -70,12 +72,12 @@ class WorkerConfig(BaseModel):
     operation_timeout_seconds: int = Field(
         default=DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS,
         ge=1,
-        le=86_400,
+        le=MAX_WORKER_OPERATION_TIMEOUT_SECONDS,
     )
     initial_analysis_timeout_seconds: int = Field(
         default=DEFAULT_INITIAL_ANALYSIS_TIMEOUT_SECONDS,
         ge=1,
-        le=86_400,
+        le=MAX_INITIAL_ANALYSIS_TIMEOUT_SECONDS,
     )
 
 

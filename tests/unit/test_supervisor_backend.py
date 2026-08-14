@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -9,6 +10,7 @@ from typing import cast
 import pytest
 
 from ida_re_mcp.supervisor import backend as backend_module
+from ida_re_mcp.supervisor._python_process import prepare_python_process_launch
 from ida_re_mcp.supervisor.backend import (
     DebugRequestCancelled,
     SubprocessIdaBackend,
@@ -400,6 +402,47 @@ def test_doctor_cancellation_terminates_and_reaps_probe_before_propagating(
         assert "communicate.done" in process.actions
         assert "wait.done" in process.actions
         assert process.actions.index("terminate") < process.actions.index("wait.done")
+
+    asyncio.run(scenario())
+
+
+def test_doctor_launches_the_real_venv_python_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        process = _CompletedProbeProcess(returncode=0, stdout=b'{"available":true}')
+        captured_args: tuple[str, ...] | None = None
+        captured_environment: dict[str, str] | None = None
+
+        async def create_subprocess_exec(
+            *args: str,
+            **kwargs: object,
+        ) -> asyncio.subprocess.Process:
+            nonlocal captured_args, captured_environment
+            captured_args = args
+            environment = kwargs.get("env")
+            assert isinstance(environment, dict)
+            captured_environment = cast(dict[str, str], environment)
+            return cast(asyncio.subprocess.Process, cast(object, process))
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
+        backend = SubprocessIdaBackend(log_root=tmp_path / "logs")
+
+        report = await backend.doctor()
+
+        expected_executable, expected_environment = prepare_python_process_launch(os.environ)
+        assert report["available"] is True
+        assert captured_args == (
+            expected_executable,
+            "-m",
+            "ida_re_mcp.worker",
+            "probe",
+        )
+        assert captured_environment is not None
+        assert captured_environment.get("__PYVENV_LAUNCHER__") == expected_environment.get(
+            "__PYVENV_LAUNCHER__"
+        )
 
     asyncio.run(scenario())
 

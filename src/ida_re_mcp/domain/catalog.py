@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Final
 
+from ida_re_mcp.constants import DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS
 from ida_re_mcp.domain.base import StrictModel
 from ida_re_mcp.domain.tools import (
     AddressInspectInput,
@@ -29,7 +30,6 @@ from ida_re_mcp.domain.tools import (
     DebugFinishOutput,
     DebugInspectInput,
     DebugInspectOutput,
-    ExpertExecuteInput,
     ExpertExecuteOutput,
     FunctionInspectInput,
     FunctionInspectOutput,
@@ -57,6 +57,7 @@ from ida_re_mcp.domain.tools import (
     WorkspaceListOutput,
     WorkspaceRetryInput,
     WorkspaceRetryOutput,
+    configured_expert_execute_input,
 )
 
 
@@ -400,21 +401,26 @@ _STANDARD_SPECS: Final = (
     ),
 )
 
-EXPERT_TOOL_SPEC: Final = _spec(
-    "expert.execute",
-    "执行专家 IDAPython",
-    (
-        "在单独的 IDA 进程中执行 IDAPython，并把数据库修改保存为新 revision。此功能可以"
-        "访问文件、网络和子进程，只应运行可信代码；执行后读取 structuredContent 中的输出，"
-        "并让后续查询改用新 revision。"
-    ),
-    ExpertExecuteInput,
-    ExpertExecuteOutput,
-    read_only=False,
-    destructive=True,
-    idempotent=False,
-    open_world=True,
-)
+
+def _expert_tool_spec(operation_timeout_seconds: int) -> ToolSpec:
+    return _spec(
+        "expert.execute",
+        "执行专家 IDAPython",
+        (
+            "在单独的 IDA 进程中执行 IDAPython，并把数据库修改保存为新 revision。此功能可以"
+            "访问文件、网络和子进程，只应运行可信代码；执行后读取 structuredContent 中的输出，"
+            "并让后续查询改用新 revision。"
+        ),
+        configured_expert_execute_input(operation_timeout_seconds),
+        ExpertExecuteOutput,
+        read_only=False,
+        destructive=True,
+        idempotent=False,
+        open_world=True,
+    )
+
+
+EXPERT_TOOL_SPEC: Final = _expert_tool_spec(DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS)
 
 
 _AUTHORING_NAMES: Final = frozenset(
@@ -451,6 +457,7 @@ def build_tool_catalog(
     enable_authoring: bool = True,
     enable_debug: bool = True,
     enable_expert: bool = False,
+    operation_timeout_seconds: int = DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS,
 ) -> tuple[ToolSpec, ...]:
     """构建一次性的、按名称排序且无重复项的目录。"""
 
@@ -458,7 +465,7 @@ def build_tool_catalog(
         *CORE_TOOL_SPECS,
         *(AUTHORING_TOOL_SPECS if enable_authoring else ()),
         *(DEBUG_TOOL_SPECS if enable_debug else ()),
-        *((EXPERT_TOOL_SPEC,) if enable_expert else ()),
+        *((_expert_tool_spec(operation_timeout_seconds),) if enable_expert else ()),
     )
     ordered = tuple(sorted(specs, key=lambda item: item.name))
     names = tuple(item.name for item in ordered)

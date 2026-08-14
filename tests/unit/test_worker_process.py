@@ -2,14 +2,15 @@ import ast
 import base64
 import os
 import subprocess
-import sys
 import threading
+import time
 from collections.abc import Mapping
 from pathlib import Path
 from typing import BinaryIO, cast
 
 import pytest
 
+from ida_re_mcp.supervisor._python_process import prepare_python_process_launch
 from ida_re_mcp.supervisor.workers import (
     ProcessHandle,
     ProcessLaunch,
@@ -54,6 +55,30 @@ class _EscalatingProcess(_Process):
 
     def terminate(self) -> None:
         self.actions.append("terminate")
+
+
+class _SlowReapProcess(_Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.killed = False
+        self.reaped = threading.Event()
+        self.wait_timeouts: list[float | None] = []
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.actions.append("wait")
+        self.wait_timeouts.append(timeout)
+        if self.killed and timeout is None:
+            self.exit_code = -9
+            self.reaped.set()
+            return self.exit_code
+        raise subprocess.TimeoutExpired("worker", timeout or 0.0)
+
+    def terminate(self) -> None:
+        self.actions.append("terminate")
+
+    def kill(self) -> None:
+        self.actions.append("kill")
+        self.killed = True
 
 
 class _Client:
@@ -227,7 +252,11 @@ def test_launch_uses_exact_current_worker_arguments_and_environment_auth(
     launch = launcher.launches[0]
     command = launch.command
 
-    assert command[:4] == (sys.executable, "-m", "ida_re_mcp.worker", "serve")
+    expected_executable, expected_environment = prepare_python_process_launch(os.environ)
+    assert command[:4] == (expected_executable, "-m", "ida_re_mcp.worker", "serve")
+    assert launch.environment.get("__PYVENV_LAUNCHER__") == expected_environment.get(
+        "__PYVENV_LAUNCHER__"
+    )
     assert command[command.index("--kind") + 1] == kind
     auth_name = command[command.index("--authkey-env") + 1]
     assert auth_name.startswith("IDA_RE_MCP_WORKER_AUTH_")
@@ -317,17 +346,20 @@ def test_operation_timeout_closes_ipc_and_terminates_worker(tmp_path: Path) -> N
     client = _BlockingClient()
     worker, _, _ = _launch(tmp_path, process=process, client=client)
 
+    started = time.monotonic()
     with pytest.raises(WorkerProcessError) as raised:
-        worker.execute("debug.control", {}, timeout_seconds=0.01)
+        worker.execute("debug.control", {}, timeout_seconds=0.05)
+    elapsed = time.monotonic() - started
 
     assert raised.value.code == "worker_timeout"
+    assert 0.04 <= elapsed < 1.0
     assert worker.closed
     assert client.close_calls >= 1
     assert "terminate" in process.actions
 
 
 def test_expert_timeout_uses_process_termination(tmp_path: Path) -> None:
-    process = _Process()
+    process = _SlowReapProcess()
     client = _BlockingClient()
     worker, _, _ = _launch(
         tmp_path,
@@ -346,14 +378,16 @@ def test_expert_timeout_uses_process_termination(tmp_path: Path) -> None:
     assert raised.value.code == "worker_timeout"
     assert worker.closed
     assert client.close_calls >= 1
-    assert "terminate" in process.actions
+    assert process.reaped.is_set()
+    assert process.actions[-2:] == ["kill", "wait"]
+    assert process.wait_timeouts[-1] is None
 
 
 def test_ipc_disconnect_maps_to_worker_crashed(tmp_path: Path) -> None:
     worker, _, _ = _launch(tmp_path, client=_CrashedClient())
 
     with pytest.raises(WorkerProcessError) as raised:
-        worker.execute("program.overview", {})
+        worker.execute("program.overview", {}, timeout_seconds=5)
 
     assert raised.value.code == "worker_crashed"
     assert worker.closed
@@ -362,8 +396,8 @@ def test_ipc_disconnect_maps_to_worker_crashed(tmp_path: Path) -> None:
 def test_debug_worker_is_persistent_across_multiple_execute_calls(tmp_path: Path) -> None:
     worker, _, client = _launch(tmp_path, kind="debug")
 
-    first = worker.execute("debug.events", {}, request_id="one")
-    second = worker.execute("debug.inspect", {}, request_id="two")
+    first = worker.execute("debug.events", {}, timeout_seconds=5, request_id="one")
+    second = worker.execute("debug.inspect", {}, timeout_seconds=5, request_id="two")
 
     assert first["call"] == 1
     assert second["call"] == 2

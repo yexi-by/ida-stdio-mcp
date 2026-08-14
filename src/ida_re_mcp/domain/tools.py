@@ -2,18 +2,28 @@
 
 from __future__ import annotations
 
+from functools import cache
 from typing import Annotated, Literal, Self
 
-from pydantic import AfterValidator, Field, JsonValue, StringConstraints, model_validator
+from pydantic import (
+    AfterValidator,
+    Field,
+    JsonValue,
+    StringConstraints,
+    create_model,
+    model_validator,
+)
 
 from ida_re_mcp.constants import (
     DEFAULT_GRAPH_NODES,
     DEFAULT_PAGE_SIZE,
+    DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS,
     MAX_GRAPH_NODES,
     MAX_IL2CPP_TYPE_RESOLUTIONS,
     MAX_MEMORY_READ_BYTES,
     MAX_OPERATION_WAIT_MS,
     MAX_PAGE_SIZE,
+    MAX_WORKER_OPERATION_TIMEOUT_SECONDS,
 )
 from ida_re_mcp.domain.address import (
     AddressRef,
@@ -1570,10 +1580,31 @@ class ExpertExecuteInput(StrictModel):
         description=("要运行的 IDAPython 代码。它可以访问本机文件、网络和子进程，不是隔离环境。"),
     )
     timeout_seconds: int = Field(
-        default=30,
+        default=DEFAULT_WORKER_OPERATION_TIMEOUT_SECONDS,
         ge=1,
-        le=120,
-        description="代码最多运行多少秒。",
+        le=MAX_WORKER_OPERATION_TIMEOUT_SECONDS,
+        description=("本次 Expert worker 操作最多运行多少秒；不能超过服务配置的普通操作时限。"),
+    )
+
+
+@cache
+def configured_expert_execute_input(
+    operation_timeout_seconds: int,
+) -> type[ExpertExecuteInput]:
+    """构造与当前 worker 配置一致的 Expert 公开输入模型。"""
+
+    if not 1 <= operation_timeout_seconds <= MAX_WORKER_OPERATION_TIMEOUT_SECONDS:
+        raise ValueError("operation_timeout_seconds 超出 Expert 允许范围")
+    timeout_field = Field(
+        default=operation_timeout_seconds,
+        ge=1,
+        le=operation_timeout_seconds,
+        description=("本次 Expert worker 操作最多运行多少秒；不能超过服务配置的普通操作时限。"),
+    )
+    return create_model(
+        ExpertExecuteInput.__name__,
+        __base__=ExpertExecuteInput,
+        timeout_seconds=(int, timeout_field),
     )
 
 

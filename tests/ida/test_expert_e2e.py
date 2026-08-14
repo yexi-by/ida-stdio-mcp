@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
+import time
 from pathlib import Path
 
 import pytest
@@ -77,7 +78,9 @@ def test_expert_saves_only_successful_disposable_staging(
         failed_worker.close()
     assert _sha256(failed_staging) == base_hash
 
-    timed_out_staging = tmp_path / "timed-out.i64"
+    timed_out_directory = tmp_path / "timed-out-staging"
+    timed_out_directory.mkdir()
+    timed_out_staging = timed_out_directory / "database.i64"
     shutil.copy2(base, timed_out_staging)
     timed_out_worker = WorkerProcess.launch(
         kind="expert",
@@ -86,6 +89,7 @@ def test_expert_saves_only_successful_disposable_staging(
         connect_timeout_seconds=60,
     )
     try:
+        started = time.monotonic()
         with pytest.raises(WorkerProcessError) as timed_out:
             timed_out_worker.execute(
                 "expert.execute",
@@ -95,10 +99,14 @@ def test_expert_saves_only_successful_disposable_staging(
                 },
                 timeout_seconds=0.5,
             )
+        elapsed = time.monotonic() - started
         assert timed_out.value.code == "worker_timeout"
+        assert 0.4 <= elapsed < 15
     finally:
         timed_out_worker.close()
     assert _sha256(timed_out_staging) == base_hash
+    shutil.rmtree(timed_out_directory)
+    assert not timed_out_directory.exists()
 
     successful_staging = tmp_path / "successful.i64"
     shutil.copy2(base, successful_staging)

@@ -5,7 +5,6 @@ import math
 import os
 import secrets
 import subprocess
-import sys
 import threading
 import time
 import uuid
@@ -15,6 +14,7 @@ from pathlib import Path
 from queue import Empty, Queue
 from typing import BinaryIO, Final, Literal, Protocol, Self, cast
 
+from ida_re_mcp.supervisor._python_process import prepare_python_process_launch
 from ida_re_mcp.supervisor.errors import SupervisorError
 from ida_re_mcp.worker.errors import WorkerError
 from ida_re_mcp.worker.ipc import IpcEndpoint, JsonObject, JsonValue, WorkerClient
@@ -24,10 +24,8 @@ type WorkerProcessErrorCode = Literal["worker_crashed", "worker_timeout"]
 
 _AUTH_ENV_PREFIX: Final = "IDA_RE_MCP_WORKER_AUTH_"
 _CONNECT_RETRY_SECONDS: Final = 0.025
-_DEFAULT_OPERATION_TIMEOUT_SECONDS: Final = 30.0
 _GRACEFUL_CLOSE_SECONDS: Final = 2.0
 _TERMINATE_SECONDS: Final = 1.0
-_KILL_SECONDS: Final = 1.0
 _TRANSPORT_ERROR_CODES: Final = frozenset(
     {
         "ipc_disconnected",
@@ -240,9 +238,10 @@ def _build_command(
     inputs: _WorkerInputs,
     endpoint: IpcEndpoint,
     auth_environment_name: str,
+    python_executable: str,
 ) -> tuple[str, ...]:
     command = [
-        sys.executable,
+        python_executable,
         "-m",
         "ida_re_mcp.worker",
         "serve",
@@ -354,7 +353,13 @@ class WorkerProcess:
         worker_environment[auth_environment_name] = base64.b64encode(endpoint.authkey).decode(
             "ascii"
         )
-        command = _build_command(inputs, endpoint, auth_environment_name)
+        python_executable, worker_environment = prepare_python_process_launch(worker_environment)
+        command = _build_command(
+            inputs,
+            endpoint,
+            auth_environment_name,
+            python_executable,
+        )
         creation_flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         launch = ProcessLaunch(
             command=command,
@@ -455,7 +460,7 @@ class WorkerProcess:
         operation: str,
         input: Mapping[str, JsonValue],
         *,
-        timeout_seconds: float = _DEFAULT_OPERATION_TIMEOUT_SECONDS,
+        timeout_seconds: float,
         request_id: str | None = None,
     ) -> JsonObject:
         """在 daemon 调用线程中执行同步 IPC; 并以进程终止处理超时。"""
@@ -507,7 +512,7 @@ class WorkerProcess:
             thread.join(timeout_seconds)
             if thread.is_alive():
                 self._abort()
-                thread.join(timeout=_TERMINATE_SECONDS)
+                thread.join()
                 raise WorkerProcessError(
                     "worker_timeout",
                     "worker 操作超时并已终止",
@@ -603,11 +608,14 @@ class WorkerProcess:
         try:
             _safe_client_close(self._client)
         finally:
-            self._terminate_then_kill()
-            self._close_logs()
+            try:
+                self._terminate_then_kill()
+            finally:
+                self._close_logs()
 
     def _terminate_then_kill(self) -> None:
         if self._process.poll() is not None:
+            self._process.wait()
             return
         try:
             self._process.terminate()
@@ -623,10 +631,7 @@ class WorkerProcess:
                 self._process.kill()
             except OSError:
                 pass
-        try:
-            self._process.wait(timeout=_KILL_SECONDS)
-        except (OSError, subprocess.TimeoutExpired):
-            pass
+        self._process.wait()
 
     def _close_logs(self) -> None:
         for stream in (self._stdout_log, self._stderr_log):

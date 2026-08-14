@@ -4,8 +4,12 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import cast
 
+import pytest
+from pydantic import ValidationError
+
 from ida_re_mcp.domain.base import tool_json_schema
 from ida_re_mcp.domain.catalog import TOOL_CATALOG, build_tool_catalog
+from ida_re_mcp.domain.tools import ExpertExecuteInput
 
 EXPECTED_CORE_TOOLS = {
     "address.inspect",
@@ -61,6 +65,53 @@ def test_expert_tool_is_absent_by_default_and_explicitly_enabled() -> None:
     enabled = build_tool_catalog(enable_expert=True)
     assert [spec.name for spec in enabled] == sorted(spec.name for spec in enabled)
     assert {spec.name for spec in enabled} == EXPECTED_CORE_TOOLS | {"expert.execute"}
+
+
+def test_expert_timeout_schema_uses_configured_worker_limit() -> None:
+    catalog = build_tool_catalog(
+        enable_expert=True,
+        operation_timeout_seconds=37,
+    )
+    expert = next(spec for spec in catalog if spec.name == "expert.execute")
+    schema = tool_json_schema(expert.input_model)
+    properties = cast(dict[str, object], schema["properties"])
+    timeout_schema = cast(dict[str, object], properties["timeout_seconds"])
+
+    assert timeout_schema["default"] == 37
+    assert timeout_schema["minimum"] == 1
+    assert timeout_schema["maximum"] == 37
+    default_input = cast(
+        ExpertExecuteInput,
+        expert.input_model.model_validate(
+            {
+                "workspace_id": "workspace_test",
+                "revision": "revision_test",
+                "code": "1 + 1",
+            }
+        ),
+    )
+    shorter_input = cast(
+        ExpertExecuteInput,
+        expert.input_model.model_validate(
+            {
+                "workspace_id": "workspace_test",
+                "revision": "revision_test",
+                "code": "1 + 1",
+                "timeout_seconds": 36,
+            }
+        ),
+    )
+    assert default_input.timeout_seconds == 37
+    assert shorter_input.timeout_seconds == 36
+    with pytest.raises(ValidationError):
+        expert.input_model.model_validate(
+            {
+                "workspace_id": "workspace_test",
+                "revision": "revision_test",
+                "code": "1 + 1",
+                "timeout_seconds": 38,
+            }
+        )
 
 
 def test_authoring_and_debug_facets_are_startup_catalog_switches() -> None:

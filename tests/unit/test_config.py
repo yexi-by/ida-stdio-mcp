@@ -125,6 +125,8 @@ def test_shipped_config_is_valid() -> None:
         'schema_version = "1"\nunknown = true\n',
         'schema_version = "1"\n[workers]\nanalysis_limit = "1"\n',
         'schema_version = "1"\n[workers]\ninitial_analysis_timeout_seconds = 0\n',
+        'schema_version = "1"\n[workers]\noperation_timeout_seconds = 3601\n',
+        'schema_version = "1"\n[workers]\ninitial_analysis_timeout_seconds = 10801\n',
         "[policy]\nauthoring = true\n",
     ],
 )
