@@ -11,6 +11,7 @@ from typing import cast
 import pytest
 
 from ida_re_mcp.supervisor import (
+    AnalysisRetryUnavailableError,
     StorageCorruptionError,
     WorkspaceNotFoundError,
     WorkspaceRegistry,
@@ -79,6 +80,32 @@ def test_workspace_missing_is_explicit(tmp_path: Path) -> None:
         registry.get("ws_missing")
 
 
+def test_workspace_list_does_not_wait_for_active_worker_lease(tmp_path: Path) -> None:
+    source = tmp_path / "sample.bin"
+    source.write_bytes(b"trusted sample")
+    registry = WorkspaceRegistry(tmp_path / "workspaces")
+    workspace = registry.create(source)
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_worker_lease() -> None:
+        with registry.workspace_lease_lock(workspace.workspace_id):
+            acquired.set()
+            release.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_worker_lease)
+    holder.start()
+    assert acquired.wait(timeout=1)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            listed = executor.submit(registry.list).result(timeout=1)
+        assert listed == (registry.get(workspace.workspace_id),)
+    finally:
+        release.set()
+        holder.join(timeout=1)
+    assert not holder.is_alive()
+
+
 def test_workspace_rejects_tampered_private_sample(tmp_path: Path) -> None:
     source = tmp_path / "sample.bin"
     source.write_bytes(b"trusted sample")
@@ -88,6 +115,34 @@ def test_workspace_rejects_tampered_private_sample(tmp_path: Path) -> None:
 
     with pytest.raises(StorageCorruptionError, match="原样本"):
         registry.get(workspace.workspace_id)
+
+
+def test_prepare_analysis_retry_clears_only_expected_failed_outcome(tmp_path: Path) -> None:
+    source = tmp_path / "sample.bin"
+    source.write_bytes(b"trusted sample")
+    registry = WorkspaceRegistry(tmp_path / "workspaces")
+    workspace = registry.create(source)
+    registry.record_analysis_outcome(
+        workspace.workspace_id,
+        state="failed",
+        reason="首次分析失败",
+    )
+    failed = registry.get(workspace.workspace_id)
+    assert failed.analysis_outcome is not None
+
+    prepared = registry.prepare_analysis_retry(
+        workspace.workspace_id,
+        expected_outcome=failed.analysis_outcome,
+    )
+
+    assert prepared.workspace_id == workspace.workspace_id
+    assert prepared.sample_sha256 == workspace.sample_sha256
+    assert prepared.analysis_outcome is None
+    with pytest.raises(AnalysisRetryUnavailableError, match="没有可重试"):
+        registry.prepare_analysis_retry(
+            workspace.workspace_id,
+            expected_outcome=failed.analysis_outcome,
+        )
 
 
 def test_workspace_gc_removes_crash_left_creating_directory(tmp_path: Path) -> None:

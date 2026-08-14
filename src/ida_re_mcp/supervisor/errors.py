@@ -35,6 +35,10 @@ class WorkspaceNotFoundError(SupervisorError):
     """workspace 不存在。"""
 
 
+class AnalysisRetryUnavailableError(SupervisorError):
+    """workspace 当前状态不允许重试首次分析。"""
+
+
 class RevisionNotFoundError(SupervisorError):
     """revision 不存在或已被回收。"""
 

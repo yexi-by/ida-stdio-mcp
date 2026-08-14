@@ -11,6 +11,7 @@ from ida_re_mcp.supervisor.artifacts import (
     parse_artifact_uri,
 )
 from ida_re_mcp.supervisor.errors import (
+    AnalysisRetryUnavailableError,
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     InvalidIdentifierError,
@@ -45,6 +46,7 @@ from ida_re_mcp.supervisor.workspaces import (
 
 __all__ = [
     "AnalysisOutcome",
+    "AnalysisRetryUnavailableError",
     "ArtifactChunk",
     "ArtifactFileInput",
     "ArtifactGarbageCollectionResult",

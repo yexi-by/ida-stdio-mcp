@@ -45,6 +45,8 @@ from ida_re_mcp.domain.tools import (
     WorkspaceGetOutput,
     WorkspaceListInput,
     WorkspaceListOutput,
+    WorkspaceRetryInput,
+    WorkspaceRetryOutput,
     WorkspaceSummary,
 )
 from ida_re_mcp.supervisor._fs import atomic_write_json
@@ -2588,5 +2590,162 @@ def test_workspace_create_cancelled_outcome_is_visible_across_sessions(
         assert summary.analysis_outcome.reason == "首次分析已取消"
         assert summary.analysis_outcome.recorded_at > 0
         await second.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_retry_reuses_failed_workspace_and_rejects_duplicate(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        application, source, backend = _lifecycle_application(
+            tmp_path,
+            fail_bootstrap=True,
+        )
+        started = await application.execute_tool(
+            "workspace.create",
+            WorkspaceCreateInput(sample_path=str(source)),
+        )
+        assert isinstance(started, WorkspaceCreateOutput)
+        failed = await application.execute_tool(
+            "operation.wait",
+            OperationWaitInput(operation_id=started.analysis_operation_id, wait_ms=1_000),
+        )
+        assert isinstance(failed, OperationWaitOutput)
+        assert failed.state == "failed"
+
+        backend.fail_bootstrap = False
+        backend.block_bootstrap = True
+        backend.bootstrap_started.clear()
+        retried = await application.execute_tool(
+            "workspace.retry",
+            WorkspaceRetryInput(workspace_id=started.workspace_id),
+        )
+        assert isinstance(retried, WorkspaceRetryOutput)
+        assert retried.workspace_id == started.workspace_id
+        assert retried.sample_sha256 == started.sample_sha256
+        assert retried.analysis_operation_id != started.analysis_operation_id
+        await asyncio.wait_for(backend.bootstrap_started.wait(), timeout=2)
+
+        listed = await application.execute_tool("workspace.list", WorkspaceListInput())
+        assert isinstance(listed, WorkspaceListOutput)
+        summary = next(
+            item for item in listed.workspaces if item.workspace_id == started.workspace_id
+        )
+        assert summary.state == "analyzing"
+        assert summary.analysis_outcome is None
+
+        with pytest.raises(ToolExecutionError) as duplicate:
+            await application.execute_tool(
+                "workspace.retry",
+                WorkspaceRetryInput(workspace_id=started.workspace_id),
+            )
+        assert duplicate.value.code is BusinessErrorCode.PRECONDITION_FAILED
+        assert "正在执行其他操作" in duplicate.value.message
+
+        backend.allow_bootstrap.set()
+        completed = await application.execute_tool(
+            "operation.wait",
+            OperationWaitInput(operation_id=retried.analysis_operation_id, wait_ms=1_000),
+        )
+        assert isinstance(completed, OperationWaitOutput)
+        assert completed.state == "succeeded"
+        workspace = application.storage.workspaces.get(started.workspace_id)
+        assert workspace.current_revision is not None
+        assert workspace.analysis_outcome is None
+
+        with pytest.raises(ToolExecutionError) as ready:
+            await application.execute_tool(
+                "workspace.retry",
+                WorkspaceRetryInput(workspace_id=started.workspace_id),
+            )
+        assert ready.value.code is BusinessErrorCode.PRECONDITION_FAILED
+        assert ready.value.details == {"current_revision": workspace.current_revision}
+        await application.aclose()
+
+    async def bounded_scenario() -> None:
+        await asyncio.wait_for(scenario(), timeout=10)
+
+    asyncio.run(bounded_scenario())
+
+
+def test_workspace_retry_rejects_changed_saved_sample(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        application, source, _backend = _lifecycle_application(
+            tmp_path,
+            fail_bootstrap=True,
+        )
+        started = await application.execute_tool(
+            "workspace.create",
+            WorkspaceCreateInput(sample_path=str(source)),
+        )
+        assert isinstance(started, WorkspaceCreateOutput)
+        failed = await application.execute_tool(
+            "operation.wait",
+            OperationWaitInput(operation_id=started.analysis_operation_id, wait_ms=1_000),
+        )
+        assert isinstance(failed, OperationWaitOutput)
+        assert failed.state == "failed"
+
+        workspace = application.storage.workspaces.get(started.workspace_id)
+        tampered = bytearray(workspace.sample_path.read_bytes())
+        tampered[-1] ^= 0xFF
+        workspace.sample_path.write_bytes(tampered)
+        with pytest.raises(ToolExecutionError) as raised:
+            await application.execute_tool(
+                "workspace.retry",
+                WorkspaceRetryInput(workspace_id=started.workspace_id),
+            )
+        assert raised.value.code is BusinessErrorCode.EXECUTION_FAILED
+        assert "完整性检查" in raised.value.message
+        await application.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_workspace_retry_schedule_failure_restores_failed_outcome(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        application, source, _backend = _lifecycle_application(
+            tmp_path,
+            fail_bootstrap=True,
+        )
+        started = await application.execute_tool(
+            "workspace.create",
+            WorkspaceCreateInput(sample_path=str(source)),
+        )
+        assert isinstance(started, WorkspaceCreateOutput)
+        failed = await application.execute_tool(
+            "operation.wait",
+            OperationWaitInput(operation_id=started.analysis_operation_id, wait_ms=1_000),
+        )
+        assert isinstance(failed, OperationWaitOutput)
+        assert failed.state == "failed"
+
+        def fail_schedule(
+            workspace: WorkspaceSnapshot,
+            *,
+            native_identity: NativeImageIdentity,
+        ) -> str:
+            del workspace, native_identity
+            raise RuntimeError("schedule failed")
+
+        monkeypatch.setattr(application, "_schedule_workspace_initialization", fail_schedule)
+        with pytest.raises(RuntimeError, match="schedule failed"):
+            await application.execute_tool(
+                "workspace.retry",
+                WorkspaceRetryInput(workspace_id=started.workspace_id),
+            )
+
+        workspace = application.storage.workspaces.get(started.workspace_id)
+        assert workspace.current_revision is None
+        assert workspace.analysis_outcome is not None
+        assert workspace.analysis_outcome.state == "failed"
+        assert workspace.analysis_outcome.reason == (
+            "首次分析重试任务未能启动。请查看 logs 目录中的本次运行日志，然后重试。"
+        )
+        await application.aclose()
 
     asyncio.run(scenario())

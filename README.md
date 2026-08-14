@@ -67,6 +67,8 @@ Agent ──stdio/MCP──▶ supervisor ──IPC──▶ IDA headless worker
 - 导入的样本副本、IDB、每次修改生成的 revision 都写入 `data/`，日志写入 `logs/`；
   相对路径以 `config.toml` 所在目录为准。
 - 长任务（首次分析、报告生成）返回 `operation` 编号，用 `operation.wait` 等待完成。
+- 首次分析失败或取消且尚未产生 revision 时，使用 `workspace.retry` 重新分析已有
+  workspace；不要再次导入同一份样本。
 - 所有修改走 `change.prepare` → `change.apply` 两段提交，prepare 先校验，
   apply 成功后才产生新 revision。
 - 工具结果的完整数据在 `structuredContent` 中，附带的中文文本只是摘要；

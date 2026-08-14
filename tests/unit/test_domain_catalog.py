@@ -31,6 +31,7 @@ EXPECTED_CORE_TOOLS = {
     "workspace.export",
     "workspace.get",
     "workspace.list",
+    "workspace.retry",
 }
 
 

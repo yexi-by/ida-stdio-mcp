@@ -20,6 +20,8 @@ from ida_re_mcp.domain.tools import (
     ProgramCounts,
     ProgramOverviewInput,
     ProgramOverviewOutput,
+    WorkspaceRetryInput,
+    WorkspaceRetryOutput,
 )
 from ida_re_mcp.protocol import McpRuntime
 
@@ -45,6 +47,12 @@ class ProbeHandler:
         name: str,
         arguments: StrictModel,
     ) -> StrictModel | JsonObject:
+        if name == "workspace.retry" and isinstance(arguments, WorkspaceRetryInput):
+            return WorkspaceRetryOutput(
+                workspace_id=arguments.workspace_id,
+                sample_sha256="b" * 64,
+                analysis_operation_id="operation_stdio_retry",
+            )
         if name == "program.overview" and isinstance(arguments, ProgramOverviewInput):
             address = ImageAddress(
                 kind="image",
@@ -139,6 +147,17 @@ async def _run() -> None:
                 read_only=True,
                 destructive=False,
                 idempotent=True,
+                open_world=False,
+            ),
+            ToolSpec(
+                name="workspace.retry",
+                title="重试首次分析",
+                description="重新分析已有失败项目，并返回后台任务编号供客户端等待。",
+                input_model=WorkspaceRetryInput,
+                output_model=WorkspaceRetryOutput,
+                read_only=False,
+                destructive=False,
+                idempotent=False,
                 open_world=False,
             ),
         ),

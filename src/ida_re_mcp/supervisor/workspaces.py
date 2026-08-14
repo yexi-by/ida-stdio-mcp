@@ -35,6 +35,7 @@ from ida_re_mcp.supervisor._process_lock import (
     interprocess_file_lock,
 )
 from ida_re_mcp.supervisor.errors import (
+    AnalysisRetryUnavailableError,
     InvalidIdentifierError,
     RevisionConflictError,
     RevisionNotFoundError,
@@ -381,7 +382,8 @@ class WorkspaceRegistry:
             if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode) or not path.name.startswith("ws_"):
                 raise StorageCorruptionError("workspace 根目录包含非法条目")
             lease = self.workspace_lease_lock(path.name)
-            with lease:
+            lease_acquired = lease.try_acquire()
+            try:
                 if not path.exists():
                     continue
                 try:
@@ -391,6 +393,9 @@ class WorkspaceRegistry:
                         raise StorageCorruptionError(
                             f"workspace manifest 缺失: {path.name}"
                         ) from exc
+            finally:
+                if lease_acquired:
+                    lease.release()
         return tuple(snapshots)
 
     def get(self, workspace_id: str) -> WorkspaceSnapshot:
@@ -446,6 +451,28 @@ class WorkspaceRegistry:
             )
             next_manifest = manifest.model_copy(update={"analysis_outcome": outcome})
             self._commit_manifest(workspace_id, next_manifest)
+
+    def prepare_analysis_retry(
+        self,
+        workspace_id: str,
+        *,
+        expected_outcome: AnalysisOutcome,
+    ) -> WorkspaceSnapshot:
+        """校验失败终态未变化，清除它并返回可重新分析的样本快照。"""
+
+        workspace_id = validate_identifier(workspace_id, field="workspace_id")
+        lock = self._lock_for(workspace_id)
+        with lock:
+            manifest = self._read_workspace_manifest(workspace_id)
+            if manifest.current_revision is not None or manifest.revision_ids:
+                raise AnalysisRetryUnavailableError("已有 revision 的 workspace 不能重试首次分析")
+            if manifest.analysis_outcome is None:
+                raise AnalysisRetryUnavailableError("workspace 没有可重试的首次分析失败终态")
+            if manifest.analysis_outcome != expected_outcome:
+                raise AnalysisRetryUnavailableError("workspace 的首次分析状态已经变化")
+            next_manifest = manifest.model_copy(update={"analysis_outcome": None})
+            self._commit_manifest(workspace_id, next_manifest)
+            return self._workspace_snapshot(next_manifest)
 
     def get_revision(self, workspace_id: str, revision: str) -> RevisionSnapshot:
         workspace_id = validate_identifier(workspace_id, field="workspace_id")

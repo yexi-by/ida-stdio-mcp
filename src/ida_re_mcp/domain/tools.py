@@ -165,6 +165,18 @@ class WorkspaceCreateOutput(StrictModel):
     analysis_operation_id: OperationId
 
 
+class WorkspaceRetryInput(StrictModel):
+    """重新分析尚未产生 revision 的失败项目。"""
+
+    workspace_id: WorkspaceId = Field(description="要重试首次分析的项目编号。")
+
+
+class WorkspaceRetryOutput(StrictModel):
+    workspace_id: WorkspaceId
+    sample_sha256: Sha256
+    analysis_operation_id: OperationId
+
+
 class WorkspaceListInput(StrictModel):
     """列出 data 目录中已经保存的分析项目。"""
 

@@ -525,6 +525,7 @@ def test_runtime_instructions_explain_handoff_and_storage_paths() -> None:
     assert "先调用 workspace.list" in instructions
     assert "再调用 workspace.get" in instructions
     assert "不要重复导入或重新分析" in instructions
+    assert "workspace.retry" in instructions
     assert "structuredContent" in instructions
     assert r"D:\work\ida-stdio-mcp\data" in instructions
     assert r"D:\work\ida-stdio-mcp\data\logs" in instructions
@@ -548,6 +549,18 @@ def test_all_public_tools_have_deterministic_bounded_success_summaries() -> None
 
 
 def test_success_summaries_include_next_steps_without_copying_large_fields() -> None:
+    retried = success_summary(
+        "workspace.retry",
+        {
+            "workspace_id": "workspace_retry",
+            "sample_sha256": "c" * 64,
+            "analysis_operation_id": "operation_retry",
+        },
+    )
+    assert "workspace_retry" in retried
+    assert "operation_retry" in retried
+    assert "operation.wait" in retried
+
     queued = success_summary(
         "analysis.refine",
         {

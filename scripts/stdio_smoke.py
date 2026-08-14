@@ -57,11 +57,15 @@ async def _run(executable: Path) -> None:
 
                             listed = await client.list_tools()
                             names = [tool.name for tool in listed.tools]
-                            if len(names) != 23 or names != sorted(names):
+                            if len(names) != 24 or names != sorted(names):
                                 raise RuntimeError(
                                     "tools/list 未返回完整且确定性排序的默认工具目录"
                                 )
-                            if "expert.execute" in names or "workspace.list" not in names:
+                            if (
+                                "expert.execute" in names
+                                or "workspace.list" not in names
+                                or "workspace.retry" not in names
+                            ):
                                 raise RuntimeError("tools/list 的默认策略目录不正确")
 
                             result = await client.call_tool("workspace.list", {})

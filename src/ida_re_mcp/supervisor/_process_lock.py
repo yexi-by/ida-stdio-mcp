@@ -155,6 +155,41 @@ class AsyncInterprocessFileLock:
             self._local_lock.release()
             raise
 
+    async def try_acquire(self) -> bool:
+        """尝试一次加锁；已有本地或跨进程持有者时立即返回 False。"""
+
+        if self._closed:
+            raise RuntimeError("异步文件锁已经关闭")
+        if self._local_lock.locked():
+            return False
+        await self._local_lock.acquire()
+        acquired = False
+        try:
+            loop = asyncio.get_running_loop()
+            attempt = loop.run_in_executor(
+                self._executor,
+                self._process_lock.try_acquire,
+            )
+            try:
+                acquired = await asyncio.shield(attempt)
+            except asyncio.CancelledError:
+                acquired = await _await_without_cancellation(attempt)
+                if acquired:
+                    release = loop.run_in_executor(
+                        self._executor,
+                        self._process_lock.release,
+                    )
+                    await _await_without_cancellation(release)
+                    acquired = False
+                raise
+            if not acquired:
+                return False
+            self._held = True
+            return True
+        finally:
+            if not acquired:
+                self._local_lock.release()
+
     async def release(self) -> None:
         """完整释放进程锁后才允许本进程内的下一位等待者进入。"""
 

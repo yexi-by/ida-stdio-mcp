@@ -161,6 +161,62 @@ def test_async_file_lock_wait_is_nonblocking_and_cancellation_safe(tmp_path: Pat
         holder.join(timeout=1)
 
 
+def test_async_file_lock_try_acquire_returns_without_waiting(tmp_path: Path) -> None:
+    first_process_lock = interprocess_file_lock(tmp_path / "workspace.lease.lock")
+    second_process_lock = interprocess_file_lock(tmp_path / "workspace.lease.lock")
+
+    async def scenario() -> None:
+        first = AsyncInterprocessFileLock(first_process_lock)
+        second = AsyncInterprocessFileLock(second_process_lock)
+        assert await first.try_acquire()
+        started = time.monotonic()
+        assert not await second.try_acquire()
+        assert time.monotonic() - started < 0.5
+        assert not await first.try_acquire()
+
+        await first.release()
+        assert await second.try_acquire()
+        await second.release()
+        await asyncio.gather(first.aclose(), second.aclose())
+
+    asyncio.run(scenario())
+
+
+def test_async_file_lock_try_acquire_cancellation_releases_late_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process_lock = interprocess_file_lock(tmp_path / "workspace.lease.lock")
+    entered = threading.Event()
+    proceed = threading.Event()
+    original_try_acquire = process_lock.try_acquire
+
+    def delayed_try_acquire() -> bool:
+        entered.set()
+        assert proceed.wait(timeout=2)
+        return original_try_acquire()
+
+    monkeypatch.setattr(process_lock, "try_acquire", delayed_try_acquire)
+
+    async def scenario() -> None:
+        lock = AsyncInterprocessFileLock(process_lock)
+        attempt = asyncio.create_task(lock.try_acquire())
+        assert await asyncio.to_thread(entered.wait, 1)
+        attempt.cancel()
+        proceed.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(attempt, timeout=1)
+
+        assert await lock.try_acquire()
+        await lock.release()
+        await lock.aclose()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        proceed.set()
+
+
 def test_async_slot_pool_enforces_limit_across_supervisor_instances(
     tmp_path: Path,
 ) -> None:

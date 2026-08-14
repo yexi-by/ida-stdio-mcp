@@ -44,23 +44,30 @@ if ($llvmBin) {
     }
     $env:PATH = "$llvmBin;$env:PATH"
 }
+
+function Resolve-FirstApplication([string]$Name) {
+    $command = Get-Command $Name -CommandType Application -ErrorAction Stop |
+        Select-Object -First 1
+    return $command.Source
+}
+
 $clang = if ($llvmBin) {
     Join-Path $llvmBin "clang.exe"
 }
 else {
-    (Get-Command clang -CommandType Application -ErrorAction Stop).Source
+    Resolve-FirstApplication "clang"
 }
 $clangCpp = if ($llvmBin) {
     Join-Path $llvmBin "clang++.exe"
 }
 else {
-    (Get-Command clang++ -CommandType Application -ErrorAction Stop).Source
+    Resolve-FirstApplication "clang++"
 }
 $lldLink = if ($llvmBin) {
     Join-Path $llvmBin "lld-link.exe"
 }
 else {
-    (Get-Command lld-link -CommandType Application -ErrorAction Stop).Source
+    Resolve-FirstApplication "lld-link"
 }
 foreach ($tool in @($clang, $clangCpp, $lldLink)) {
     if (-not (Test-Path -LiteralPath $tool -PathType Leaf)) {

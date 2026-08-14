@@ -55,6 +55,8 @@ from ida_re_mcp.domain.tools import (
     WorkspaceGetOutput,
     WorkspaceListInput,
     WorkspaceListOutput,
+    WorkspaceRetryInput,
+    WorkspaceRetryOutput,
 )
 
 
@@ -382,6 +384,19 @@ _STANDARD_SPECS: Final = (
         WorkspaceListInput,
         WorkspaceListOutput,
         read_only=True,
+    ),
+    _spec(
+        "workspace.retry",
+        "重试首次分析",
+        (
+            "重新启动一个已有项目的首次 IDA 分析。仅当 workspace.list 显示 state 为 "
+            "failed 且尚无 revision 时调用；服务会重新校验保存的样本，不要再次导入同一文件。"
+            "把返回的 analysis_operation_id 传给 operation.wait，成功后取得首个 revision。"
+        ),
+        WorkspaceRetryInput,
+        WorkspaceRetryOutput,
+        read_only=False,
+        idempotent=False,
     ),
 )
 

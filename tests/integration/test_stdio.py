@@ -128,6 +128,7 @@ async def _official_client_scenario(data_root: Path) -> None:
                 assert names == sorted(names)
                 assert "operation.wait" in names
                 assert "workspace.list" in names
+                assert "workspace.retry" in names
                 assert "expert.execute" not in names
                 assert all(
                     tool.inputSchema.get("additionalProperties") is False for tool in tools.tools
@@ -361,6 +362,24 @@ def test_real_stdio_preserves_full_structured_data_beside_chinese_summary(
                     assert "a" * 64 not in summary.text
                     with pytest.raises(json.JSONDecodeError):
                         json.loads(summary.text)
+
+                    retry = await client.call_tool(
+                        "workspace.retry",
+                        {"workspace_id": "workspace_stdio"},
+                    )
+                    assert retry.isError is False
+                    assert retry.structuredContent == {
+                        "workspace_id": "workspace_stdio",
+                        "sample_sha256": "b" * 64,
+                        "analysis_operation_id": "operation_stdio_retry",
+                    }
+                    assert len(retry.content) == 1
+                    retry_summary = retry.content[0]
+                    assert isinstance(retry_summary, types.TextContent)
+                    assert "首次分析已重新开始" in retry_summary.text
+                    assert "operation_stdio_retry" in retry_summary.text
+                    assert "operation.wait" in retry_summary.text
+                    assert "structuredContent" in retry_summary.text
 
             error_log.seek(0)
             assert error_log.read() == ""

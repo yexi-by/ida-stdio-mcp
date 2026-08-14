@@ -74,6 +74,10 @@ def build_server_instructions(
             "作为 operation_id 调用 operation.wait，直到首次分析完成。"
         ),
         (
+            "workspace.list 显示 state=failed 且 revision 为空时，调用 workspace.retry "
+            "重新分析已有样本；不要再次调用 workspace.create 导入同一文件。"
+        ),
+        (
             "所有静态查询都必须提供 workspace_id 和 revision。修改分析数据库时，"
             "先调用 change.prepare 检查修改，再调用 change.apply 保存；"
             "保存后，后续查询必须改用返回的新 revision。"
@@ -298,6 +302,15 @@ def _workspace_create(result: JsonObject) -> str:
     )
 
 
+def _workspace_retry(result: JsonObject) -> str:
+    return (
+        f"分析项目 `{_text(result, 'workspace_id')}` 的首次分析已重新开始，"
+        f"样本 SHA-256 为 `{_text(result, 'sample_sha256')}`。"
+        f"后台任务是 `{_text(result, 'analysis_operation_id')}`；"
+        "现在调用 operation.wait 等待完成。"
+    )
+
+
 def _workspace_list(result: JsonObject) -> str:
     workspaces = _items(result, "workspaces")
     if not workspaces:
@@ -308,8 +321,8 @@ def _workspace_list(result: JsonObject) -> str:
         )
     return (
         f"本页找到 {len(workspaces)} 个已保存的分析项目。"
-        "请从 structuredContent.workspaces 读取完整列表并选择 workspace_id，"
-        "然后调用 workspace.get 读取 current_revision。"
+        "请从 structuredContent.workspaces 读取完整列表：ready 项目调用 workspace.get，"
+        "failed 且没有 revision 的项目调用 workspace.retry。"
         f"{_page_note(result, tool_name='workspace.list')}"
     )
 
@@ -685,6 +698,7 @@ _SUMMARY_BUILDERS: Final = MappingProxyType(
         "workspace.export": _workspace_export,
         "workspace.get": _workspace_get,
         "workspace.list": _workspace_list,
+        "workspace.retry": _workspace_retry,
     }
 )
 

@@ -90,6 +90,8 @@ from ida_re_mcp.domain.tools import (
     WorkspaceGetOutput,
     WorkspaceListInput,
     WorkspaceListOutput,
+    WorkspaceRetryInput,
+    WorkspaceRetryOutput,
     WorkspaceSummary,
 )
 from ida_re_mcp.il2cpp.models import NativeBinding
@@ -167,6 +169,7 @@ from ida_re_mcp.supervisor.debug_adapter import (
     prepare_debug_inspect,
 )
 from ida_re_mcp.supervisor.errors import (
+    AnalysisRetryUnavailableError,
     InvalidIdentifierError,
     OperationNotFoundError,
     OperationStateError,
@@ -554,6 +557,8 @@ class Application:
                 return await self._operation_cancel(cast(OperationCancelInput, arguments))
             if name == "workspace.create":
                 return await self._workspace_create(cast(WorkspaceCreateInput, arguments))
+            if name == "workspace.retry":
+                return await self._workspace_retry(cast(WorkspaceRetryInput, arguments))
             if name == "workspace.list":
                 return await self._workspace_list(cast(WorkspaceListInput, arguments))
             if name == "workspace.get":
@@ -1137,6 +1142,73 @@ class Application:
         )
         self._workspace_operations[workspace.workspace_id] = operation_id
         return operation_id
+
+    async def _workspace_retry(
+        self,
+        arguments: WorkspaceRetryInput,
+    ) -> WorkspaceRetryOutput:
+        workspace_lock = self._workspace_lock(arguments.workspace_id)
+        if not await workspace_lock.try_acquire():
+            raise ToolExecutionError(
+                BusinessErrorCode.PRECONDITION_FAILED,
+                (
+                    "这个分析项目正在执行其他操作，当前不能重试首次分析。"
+                    "请先等待现有 operation 完成，再调用 workspace.list 查看最新状态。"
+                ),
+            )
+        try:
+            workspace = await asyncio.to_thread(
+                self.storage.workspaces.get,
+                arguments.workspace_id,
+            )
+            if workspace.current_revision is not None:
+                raise ToolExecutionError(
+                    BusinessErrorCode.PRECONDITION_FAILED,
+                    (
+                        "这个分析项目已经产生 current_revision，不需要重试首次分析。"
+                        "请调用 workspace.get，并继续使用已有版本。"
+                    ),
+                    details={"current_revision": workspace.current_revision},
+                )
+            outcome = workspace.analysis_outcome
+            if outcome is None:
+                raise ToolExecutionError(
+                    BusinessErrorCode.PRECONDITION_FAILED,
+                    (
+                        "无法确认这个分析项目的首次分析已经失败或取消。"
+                        "它可能仍在运行；请先调用 workspace.list 或 operation.wait 查看状态。"
+                    ),
+                )
+            native_identity = await asyncio.to_thread(self._trusted_native_identity, workspace)
+            prepared = await _complete_thread_call(
+                lambda: self.storage.workspaces.prepare_analysis_retry(
+                    arguments.workspace_id,
+                    expected_outcome=outcome,
+                )
+            )
+            try:
+                operation_id = self._schedule_workspace_initialization(
+                    prepared,
+                    native_identity=native_identity,
+                )
+            except BaseException:
+                await _complete_thread_call(
+                    lambda: self.storage.workspaces.record_analysis_outcome(
+                        arguments.workspace_id,
+                        state="failed",
+                        reason=(
+                            "首次分析重试任务未能启动。请查看 logs 目录中的本次运行日志，然后重试。"
+                        ),
+                    )
+                )
+                raise
+        finally:
+            await workspace_lock.release()
+        return WorkspaceRetryOutput(
+            workspace_id=prepared.workspace_id,
+            sample_sha256=prepared.sample_sha256,
+            analysis_operation_id=operation_id,
+        )
 
     async def _workspace_list(
         self,
@@ -4010,6 +4082,14 @@ def _operation_failure(exc: Exception) -> tuple[str, str, JsonValue]:
 
 
 def _tool_error(exc: Exception) -> ToolExecutionError | None:
+    if isinstance(exc, AnalysisRetryUnavailableError):
+        return ToolExecutionError(
+            BusinessErrorCode.PRECONDITION_FAILED,
+            (
+                "这个分析项目的状态已经变化，不能按当前失败记录重试。"
+                "请重新调用 workspace.list，并根据最新 state 和 revision 决定下一步。"
+            ),
+        )
     if isinstance(exc, WorkspaceNotFoundError):
         return ToolExecutionError(
             BusinessErrorCode.WORKSPACE_NOT_FOUND,
