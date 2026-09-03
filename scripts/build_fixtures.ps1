@@ -96,15 +96,28 @@ New-Item -ItemType Directory -Force -Path $output | Out-Null
 $nativePeObject = Join-Path $output "native_pe_x64.obj"
 $nativePeBinary = Join-Path $output "native_pe_x64.dll"
 $nativePeImport = Join-Path $output "native_pe_x64.lib"
+$nativePeX86Object = Join-Path $output "native_pe_x86.obj"
+$nativePeX86Binary = Join-Path $output "native_pe_x86.dll"
+$nativePeX86Import = Join-Path $output "native_pe_x86.lib"
 $nativeElfX64 = Join-Path $output "native_elf_x64.so"
 $nativeElfArm64 = Join-Path $output "native_elf_arm64.so"
+$nativeElfX86 = Join-Path $output "native_elf_x86.so"
+$nativeElfArmv7 = Join-Path $output "native_elf_armv7.so"
 $debugObject = Join-Path $output "debug_target_x64.obj"
 $debugBinary = Join-Path $output "debug_target_x64.exe"
 $debugImport = Join-Path $output "debug_target_x64.lib"
+$debugX86Object = Join-Path $output "debug_target_x86.obj"
+$debugX86Binary = Join-Path $output "debug_target_x86.exe"
+$debugX86Import = Join-Path $output "debug_target_x86.lib"
 $il2cppPeObject = Join-Path $output "il2cpp_pe_x64.obj"
 $il2cppPeBinary = Join-Path $output "il2cpp_pe_x64.dll"
 $il2cppPeImport = Join-Path $output "il2cpp_pe_x64.lib"
+$il2cppPeX86Object = Join-Path $output "il2cpp_pe_x86.obj"
+$il2cppPeX86Binary = Join-Path $output "il2cpp_pe_x86.dll"
+$il2cppPeX86Import = Join-Path $output "il2cpp_pe_x86.lib"
 $il2cppElfBinary = Join-Path $output "il2cpp_elf_x64.so"
+$il2cppElfX86Binary = Join-Path $output "il2cpp_elf_x86.so"
+$il2cppElfArmv7Binary = Join-Path $output "il2cpp_elf_armv7.so"
 $il2cppMetadata = Join-Path $output "il2cpp_metadata_fingerprint.bin"
 
 $commonC = @(
@@ -124,6 +137,13 @@ if ($LASTEXITCODE -ne 0) { throw "编译 native PE fixture 失败" }
     "/implib:$nativePeImport" "/out:$nativePeBinary" $nativePeObject
 if ($LASTEXITCODE -ne 0) { throw "链接 native PE fixture 失败" }
 
+& $clang @commonC --target=i686-pc-windows-msvc -c `
+    (Join-Path $source "native_static.c") -o $nativePeX86Object
+if ($LASTEXITCODE -ne 0) { throw "编译 native PE x86 fixture 失败" }
+& $lldLink "/dll" "/noentry" "/nodefaultlib" "/machine:x86" "/brepro" "/dynamicbase" `
+    "/nxcompat" "/implib:$nativePeX86Import" "/out:$nativePeX86Binary" $nativePeX86Object
+if ($LASTEXITCODE -ne 0) { throw "链接 native PE x86 fixture 失败" }
+
 & $clang @commonC --target=x86_64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
     "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
     (Join-Path $source "native_static.c") -o $nativeElfX64
@@ -134,12 +154,30 @@ if ($LASTEXITCODE -ne 0) { throw "构建 native ELF x64 fixture 失败" }
     (Join-Path $source "native_static.c") -o $nativeElfArm64
 if ($LASTEXITCODE -ne 0) { throw "构建 native ELF AArch64 fixture 失败" }
 
+& $clang @commonC --target=i386-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
+    "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
+    (Join-Path $source "native_static.c") -o $nativeElfX86
+if ($LASTEXITCODE -ne 0) { throw "构建 native ELF x86 fixture 失败" }
+
+& $clang @commonC --target=armv7a-linux-gnueabihf -march=armv7-a -mfloat-abi=softfp `
+    -fPIC -fuse-ld=lld -nostdlib -shared "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
+    (Join-Path $source "native_static.c") -o $nativeElfArmv7
+if ($LASTEXITCODE -ne 0) { throw "构建 native ELF ARMv7 fixture 失败" }
+
 & $clang @commonC --target=x86_64-pc-windows-msvc -c `
     (Join-Path $source "debug_target.c") -o $debugObject
 if ($LASTEXITCODE -ne 0) { throw "编译 debugger fixture 失败" }
 & $lldLink "/entry:mainCRTStartup" "/subsystem:console" "/nodefaultlib" "/brepro" "/dynamicbase" `
     "/nxcompat" "/implib:$debugImport" "/out:$debugBinary" $debugObject "kernel32.lib"
 if ($LASTEXITCODE -ne 0) { throw "链接 debugger fixture 失败" }
+
+& $clang @commonC --target=i686-pc-windows-msvc -c `
+    (Join-Path $source "debug_target.c") -o $debugX86Object
+if ($LASTEXITCODE -ne 0) { throw "编译 debugger x86 fixture 失败" }
+& $lldLink "/entry:mainCRTStartup" "/subsystem:console" "/nodefaultlib" "/machine:x86" `
+    "/brepro" "/dynamicbase" "/nxcompat" "/implib:$debugX86Import" `
+    "/out:$debugX86Binary" $debugX86Object "kernel32.lib"
+if ($LASTEXITCODE -ne 0) { throw "链接 debugger x86 fixture 失败" }
 
 & $clangCpp @commonC --target=x86_64-pc-windows-msvc -fno-exceptions -fno-rtti -c `
     (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppPeObject
@@ -148,10 +186,28 @@ if ($LASTEXITCODE -ne 0) { throw "编译 IL2CPP PE fixture 失败" }
     "/implib:$il2cppPeImport" "/out:$il2cppPeBinary" $il2cppPeObject
 if ($LASTEXITCODE -ne 0) { throw "链接 IL2CPP PE fixture 失败" }
 
+& $clangCpp @commonC --target=i686-pc-windows-msvc -fno-exceptions -fno-rtti -c `
+    (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppPeX86Object
+if ($LASTEXITCODE -ne 0) { throw "编译 IL2CPP PE x86 fixture 失败" }
+& $lldLink "/dll" "/noentry" "/nodefaultlib" "/machine:x86" "/brepro" "/dynamicbase" `
+    "/nxcompat" "/implib:$il2cppPeX86Import" "/out:$il2cppPeX86Binary" $il2cppPeX86Object
+if ($LASTEXITCODE -ne 0) { throw "链接 IL2CPP PE x86 fixture 失败" }
+
 & $clangCpp @commonC --target=x86_64-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
     -fno-exceptions -fno-rtti "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
     (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppElfBinary
 if ($LASTEXITCODE -ne 0) { throw "构建 IL2CPP ELF fixture 失败" }
+
+& $clangCpp @commonC --target=i386-unknown-linux-gnu -fPIC -fuse-ld=lld -nostdlib -shared `
+    -fno-exceptions -fno-rtti "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
+    (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppElfX86Binary
+if ($LASTEXITCODE -ne 0) { throw "构建 IL2CPP ELF x86 fixture 失败" }
+
+& $clangCpp @commonC --target=armv7a-linux-gnueabihf -march=armv7-a -mfloat-abi=softfp `
+    -mthumb -fPIC -fuse-ld=lld -nostdlib -shared -fno-exceptions -fno-rtti `
+    "-Wl,--build-id=none" "-Wl,-z,noexecstack" `
+    (Join-Path $source "il2cpp_shaped.cpp") -o $il2cppElfArmv7Binary
+if ($LASTEXITCODE -ne 0) { throw "构建 IL2CPP ELF ARMv7 fixture 失败" }
 
 $metadataSource = Join-Path $source "il2cpp_metadata_fingerprint.json"
 $metadataBytes = [System.IO.File]::ReadAllBytes($metadataSource)
@@ -174,8 +230,11 @@ finally {
 }
 
 Remove-Item -Force -LiteralPath $nativePeImport
+Remove-Item -Force -LiteralPath $nativePeX86Import
 Remove-Item -Force -LiteralPath $debugImport
+Remove-Item -Force -LiteralPath $debugX86Import
 Remove-Item -Force -LiteralPath $il2cppPeImport
+Remove-Item -Force -LiteralPath $il2cppPeX86Import
 
 Get-ChildItem -LiteralPath $output -File |
     Where-Object { $_.Extension -ne ".obj" -and $_.Name -ne "SHA256SUMS" } |
@@ -187,5 +246,8 @@ Get-ChildItem -LiteralPath $output -File |
     Set-Content -Encoding utf8NoBOM -LiteralPath (Join-Path $output "SHA256SUMS")
 
 Remove-Item -Force -LiteralPath $nativePeObject
+Remove-Item -Force -LiteralPath $nativePeX86Object
 Remove-Item -Force -LiteralPath $debugObject
+Remove-Item -Force -LiteralPath $debugX86Object
 Remove-Item -Force -LiteralPath $il2cppPeObject
+Remove-Item -Force -LiteralPath $il2cppPeX86Object

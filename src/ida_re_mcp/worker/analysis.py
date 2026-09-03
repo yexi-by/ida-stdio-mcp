@@ -312,16 +312,25 @@ class AnalysisWorker(OwnerThreadBound):
     def _architecture(self, api: IdaModules) -> str:
         processor = str(api.ida_ida.inf_get_procname()).casefold()
         is_64_bit = bool(api.ida_ida.inf_is_64bit())
-        if processor == "metapc" and is_64_bit:
-            return "x86_64"
-        if processor in {"arm", "armb", "aarch64"} and is_64_bit:
+        is_32_bit = bool(api.ida_ida.inf_is_32bit_exactly())
+        if processor == "metapc":
+            if is_64_bit:
+                return "x86_64"
+            if is_32_bit:
+                return "x86"
+        if processor in {"arm", "armb"}:
+            if is_64_bit:
+                return "aarch64"
+            if is_32_bit:
+                return "arm"
+        if processor == "aarch64" and is_64_bit:
             return "aarch64"
         raise CapabilityError(
             "当前静态产品边界不支持该处理器架构",
             capability="native_architecture",
             details={
                 "processor": processor,
-                "bitness": 64 if is_64_bit else 32 if api.ida_ida.inf_is_32bit_exactly() else 16,
+                "bitness": 64 if is_64_bit else 32 if is_32_bit else 16,
             },
         )
 

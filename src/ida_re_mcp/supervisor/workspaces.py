@@ -57,10 +57,24 @@ class ImageIdentity(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
     container: Literal["elf", "pe"]
-    architecture: Literal["x86_64", "aarch64"]
-    bitness: Literal[64]
+    architecture: Literal["x86", "x86_64", "arm", "aarch64"]
+    bitness: Literal[32, 64]
     endian: Literal["little"]
     image_size: int = Field(ge=1)
+
+    @model_validator(mode="after")
+    def validate_architecture_bitness(self) -> Self:
+        expected = {
+            "x86": 32,
+            "x86_64": 64,
+            "arm": 32,
+            "aarch64": 64,
+        }
+        if self.bitness != expected[self.architecture]:
+            raise ValueError("architecture 与 bitness 不匹配")
+        if self.container == "pe" and self.architecture not in {"x86", "x86_64"}:
+            raise ValueError("PE architecture 必须是 x86 或 x86_64")
+        return self
 
 
 class _LegacyImageIdentity(BaseModel):

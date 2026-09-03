@@ -20,6 +20,7 @@ from ida_re_mcp.il2cpp.models import (
     PointerTypeRef,
     PrimitiveTypeRef,
     StructLayout,
+    SymbolRecord,
     TypeRecord,
     TypeRef,
     UnionLayout,
@@ -56,6 +57,13 @@ class _StorageField:
     name: str
     offset: int
     size: int
+
+
+def _il2cpp_symbol_ea(imagebase: int, bundle: Bundle, symbol: SymbolRecord) -> int:
+    rva = int(symbol.rva, 16)
+    if bundle.manifest.native.abi == "aapcs32" and symbol.symbol_kind == "function":
+        rva &= ~1
+    return imagebase + rva
 
 
 def _hex(value: int) -> str:
@@ -395,7 +403,7 @@ class MutationWorker(OwnerThreadBound):
                 )
         imagebase = int(api.ida_nalt.get_imagebase())
         for symbol in bundle.symbols:
-            ea = imagebase + int(symbol.rva, 16)
+            ea = _il2cpp_symbol_ea(imagebase, bundle, symbol)
             segment = api.ida_segment.getseg(ea)
             if segment is None:
                 raise WorkerError(
@@ -447,6 +455,7 @@ class MutationWorker(OwnerThreadBound):
         resolutions: Mapping[str, object],
     ) -> dict[str, object]:
         type_names = {record.id: _ida_type_name(record) for record in bundle.types}
+        pointer_width = bundle.manifest.native.pointer_width
         kept: list[str] = []
         replaced: list[str] = []
         for record in bundle.types:
@@ -470,7 +479,7 @@ class MutationWorker(OwnerThreadBound):
         for record in bundle.types:
             if record.id in kept:
                 continue
-            full_type = self._build_type(api, record, type_names)
+            full_type = self._build_type(api, record, type_names, pointer_width)
             if full_type.set_named_type(
                 api.ida_typeinf.get_idati(),
                 type_names[record.id],
@@ -489,7 +498,7 @@ class MutationWorker(OwnerThreadBound):
         typed = 0
         methods = bundle.method_by_id()
         for symbol in bundle.symbols:
-            ea = imagebase + int(symbol.rva, 16)
+            ea = _il2cpp_symbol_ea(imagebase, bundle, symbol)
             flags = int(api.ida_bytes.get_flags(ea))
             existing_name = str(api.ida_name.get_name(ea) or "")
             if api.ida_bytes.has_user_name(flags):
@@ -517,7 +526,10 @@ class MutationWorker(OwnerThreadBound):
                 method = methods[symbol.method_id]
                 if method.native_signature is not None:
                     function_type = self._build_function_type(
-                        api, method.native_signature, type_names
+                        api,
+                        method.native_signature,
+                        type_names,
+                        pointer_width,
                     )
                     if not api.ida_typeinf.apply_tinfo(
                         ea, function_type, api.ida_typeinf.TINFO_DEFINITE
@@ -529,7 +541,7 @@ class MutationWorker(OwnerThreadBound):
                         )
                     typed += 1
             elif symbol.type is not None:
-                symbol_type = self._type_ref(api, symbol.type, type_names)
+                symbol_type = self._type_ref(api, symbol.type, type_names, pointer_width)
                 if not api.ida_typeinf.apply_tinfo(ea, symbol_type, api.ida_typeinf.TINFO_DEFINITE):
                     raise WorkerError(
                         "mutation_rejected",
@@ -597,6 +609,7 @@ class MutationWorker(OwnerThreadBound):
         api: IdaModules,
         record: TypeRecord,
         type_names: Mapping[str, str],
+        pointer_width: int,
     ) -> object:
         layout = record.layout
         if isinstance(layout, EnumLayout):
@@ -604,7 +617,7 @@ class MutationWorker(OwnerThreadBound):
         members = api.ida_typeinf.udt_type_data_t()
         occupied_end = 0
         for item in layout.fields:
-            field_type = self._type_ref(api, item.type, type_names)
+            field_type = self._type_ref(api, item.type, type_names, pointer_width)
             field_size = int(field_type.get_size())
             member = api.ida_typeinf.udm_t()
             member.name = item.name
@@ -660,16 +673,17 @@ class MutationWorker(OwnerThreadBound):
         api: IdaModules,
         type_ref: TypeRef,
         type_names: Mapping[str, str],
+        pointer_width: int,
     ) -> object:
         if isinstance(type_ref, PrimitiveTypeRef):
-            return api.ida_typeinf.tinfo_t(_primitive_constant(api, type_ref.name))
+            return api.ida_typeinf.tinfo_t(_primitive_constant(api, type_ref.name, pointer_width))
         if isinstance(type_ref, NamedTypeRef):
             result = api.ida_typeinf.tinfo_t()
             if not result.get_named_type(api.ida_typeinf.get_idati(), type_names[type_ref.type_id]):
                 raise WorkerError("type_build_failed", "无法解析已发布 IL2CPP named type")
             return result
         if isinstance(type_ref, PointerTypeRef):
-            target = self._type_ref(api, type_ref.to, type_names)
+            target = self._type_ref(api, type_ref.to, type_names, pointer_width)
             if type_ref.const:
                 target.set_const()
             result = api.ida_typeinf.tinfo_t()
@@ -677,7 +691,7 @@ class MutationWorker(OwnerThreadBound):
                 raise WorkerError("type_build_failed", "无法构造 IL2CPP pointer type")
             return result
         if isinstance(type_ref, ArrayTypeRef):
-            element = self._type_ref(api, type_ref.element, type_names)
+            element = self._type_ref(api, type_ref.element, type_names, pointer_width)
             result = api.ida_typeinf.tinfo_t()
             if not result.create_array(element, type_ref.count):
                 raise WorkerError("type_build_failed", "无法构造 IL2CPP array type")
@@ -689,18 +703,25 @@ class MutationWorker(OwnerThreadBound):
         api: IdaModules,
         signature: NativeSignature,
         type_names: Mapping[str, str],
+        pointer_width: int,
     ) -> object:
         function_data = api.ida_typeinf.func_type_data_t()
-        function_data.set_cc(
-            api.ida_typeinf.CM_CC_FASTCALL
-            if signature.calling_convention == "win64"
-            else api.ida_typeinf.CM_CC_CDECL
+        function_data.set_cc(_calling_convention_constant(api, signature.calling_convention))
+        function_data.rettype = self._type_ref(
+            api,
+            signature.return_type,
+            type_names,
+            pointer_width,
         )
-        function_data.rettype = self._type_ref(api, signature.return_type, type_names)
         for parameter in signature.parameters:
             argument = api.ida_typeinf.funcarg_t()
             argument.name = parameter.name
-            argument.type = self._type_ref(api, parameter.type, type_names)
+            argument.type = self._type_ref(
+                api,
+                parameter.type,
+                type_names,
+                pointer_width,
+            )
             function_data.push_back(argument)
         result = api.ida_typeinf.tinfo_t()
         if not result.create_func(function_data):
@@ -712,11 +733,12 @@ class MutationWorker(OwnerThreadBound):
         api: IdaModules,
         record: TypeRecord,
         type_names: Mapping[str, str],
+        pointer_width: int,
     ) -> bool:
         actual = api.ida_typeinf.tinfo_t()
         if not actual.get_named_type(api.ida_typeinf.get_idati(), type_names[record.id]):
             return False
-        expected = self._build_type(api, record, type_names)
+        expected = self._build_type(api, record, type_names, pointer_width)
         layout = record.layout
         if isinstance(layout, EnumLayout):
             width, signed = _enum_storage(layout.underlying)
@@ -776,10 +798,11 @@ class MutationWorker(OwnerThreadBound):
         actual: object,
         signature: NativeSignature,
         type_names: Mapping[str, str],
+        pointer_width: int,
     ) -> bool:
         if not actual.is_func():
             return False
-        expected = self._build_function_type(api, signature, type_names)
+        expected = self._build_function_type(api, signature, type_names, pointer_width)
         actual_details = api.ida_typeinf.func_type_data_t()
         expected_details = api.ida_typeinf.func_type_data_t()
         if not actual.get_func_details(actual_details) or not expected.get_func_details(
@@ -806,6 +829,7 @@ class MutationWorker(OwnerThreadBound):
         resolutions: Mapping[str, object],
     ) -> bool:
         imagebase = int(api.ida_nalt.get_imagebase())
+        pointer_width = bundle.manifest.native.pointer_width
         methods = bundle.method_by_id()
         type_names = {record.id: _ida_type_name(record) for record in bundle.types}
         for record in bundle.types:
@@ -814,10 +838,10 @@ class MutationWorker(OwnerThreadBound):
                 if not type_info.get_named_type(api.ida_typeinf.get_idati(), type_names[record.id]):
                     return False
                 continue
-            if not self._verify_type_record(api, record, type_names):
+            if not self._verify_type_record(api, record, type_names, pointer_width):
                 return False
         for symbol in bundle.symbols:
-            ea = imagebase + int(symbol.rva, 16)
+            ea = _il2cpp_symbol_ea(imagebase, bundle, symbol)
             flags = int(api.ida_bytes.get_flags(ea))
             if not api.ida_bytes.has_user_name(flags) and api.ida_name.get_name(ea) != symbol.name:
                 return False
@@ -829,12 +853,16 @@ class MutationWorker(OwnerThreadBound):
                 signature = methods[symbol.method_id].native_signature
                 assert signature is not None
                 if not api.ida_nalt.get_tinfo(type_info, ea) or not self._verify_function_signature(
-                    api, type_info, signature, type_names
+                    api,
+                    type_info,
+                    signature,
+                    type_names,
+                    pointer_width,
                 ):
                     return False
             elif symbol.type is not None:
                 type_info = api.ida_typeinf.tinfo_t()
-                expected = self._type_ref(api, symbol.type, type_names)
+                expected = self._type_ref(api, symbol.type, type_names, pointer_width)
                 if not api.ida_nalt.get_tinfo(type_info, ea) or not type_info.equals_to(expected):
                     return False
         return True
@@ -858,7 +886,15 @@ def _storage_field(record: TypeRecord, occupied_end: int) -> _StorageField | Non
     return _StorageField(name=name, offset=0, size=layout.size)
 
 
-def _primitive_constant(api: IdaModules, name: str) -> int:
+def _primitive_constant(api: IdaModules, name: str, pointer_width: int) -> int:
+    native_int = {
+        32: api.ida_typeinf.BTF_INT32,
+        64: api.ida_typeinf.BTF_INT64,
+    }[pointer_width]
+    native_uint = {
+        32: api.ida_typeinf.BTF_UINT32,
+        64: api.ida_typeinf.BTF_UINT64,
+    }[pointer_width]
     constants = {
         "void": api.ida_typeinf.BTF_VOID,
         "bool": api.ida_typeinf.BTF_BOOL,
@@ -872,8 +908,19 @@ def _primitive_constant(api: IdaModules, name: str) -> int:
         "u64": api.ida_typeinf.BTF_UINT64,
         "f32": api.ida_typeinf.BTF_FLOAT,
         "f64": api.ida_typeinf.BTF_DOUBLE,
-        "native_int": api.ida_typeinf.BTF_INT64,
-        "native_uint": api.ida_typeinf.BTF_UINT64,
+        "native_int": native_int,
+        "native_uint": native_uint,
+    }
+    return int(constants[name])
+
+
+def _calling_convention_constant(api: IdaModules, name: str) -> int:
+    constants = {
+        "cdecl": api.ida_typeinf.CM_CC_CDECL,
+        "win64": api.ida_typeinf.CM_CC_FASTCALL,
+        "sysv": api.ida_typeinf.CM_CC_CDECL,
+        "aapcs32": api.ida_typeinf.CM_CC_CDECL,
+        "aapcs64": api.ida_typeinf.CM_CC_CDECL,
     }
     return int(constants[name])
 

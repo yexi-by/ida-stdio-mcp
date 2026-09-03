@@ -1,5 +1,5 @@
 # pyright: reportAny=false, reportUnknownArgumentType=false, reportUnknownMemberType=false, reportUnknownVariableType=false
-"""Windows 本机 x64 IDA debugger worker 与真实事件状态机。"""
+"""Windows 本机 x86/x64 IDA debugger worker 与真实事件状态机。"""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 from ida_re_mcp.constants import MAX_MEMORY_READ_BYTES, MAX_OPERATION_WAIT_MS, MAX_PAGE_SIZE
 from ida_re_mcp.worker._ida import IdaModules, OwnerThreadBound, require_ida
@@ -22,12 +22,12 @@ from ida_re_mcp.worker.errors import CapabilityError, WorkerError, WorkerInputEr
 from ida_re_mcp.worker.job import (
     WindowsJob,
     query_process_memory,
-    verify_x64_process,
+    verify_process_architecture,
 )
 
 _CANONICAL_HEX = re.compile(r"^0x(?:0|[1-9a-f][0-9a-f]*)$")
 _MAX_EVENTS = 4096
-_REGISTER_NAMES = (
+_X64_REGISTER_NAMES = (
     "RAX",
     "RBX",
     "RCX",
@@ -45,6 +45,18 @@ _REGISTER_NAMES = (
     "R14",
     "R15",
     "RIP",
+    "EFL",
+)
+_X86_REGISTER_NAMES = (
+    "EAX",
+    "EBX",
+    "ECX",
+    "EDX",
+    "ESI",
+    "EDI",
+    "EBP",
+    "ESP",
+    "EIP",
     "EFL",
 )
 _STOP_EVENT_KINDS = frozenset(
@@ -65,6 +77,20 @@ _TERMINAL_EVENT_KINDS = frozenset(
         "request_error",
     }
 )
+
+
+def _idb_bitness(api: IdaModules) -> int:
+    processor = str(api.ida_ida.inf_get_procname()).casefold()
+    is_64_bit = bool(api.ida_ida.inf_is_64bit())
+    is_32_bit = bool(api.ida_ida.inf_is_32bit_exactly())
+    bitness = 64 if is_64_bit else 32 if is_32_bit else 16
+    if processor != "metapc" or bitness not in {32, 64}:
+        raise CapabilityError(
+            "Windows 本机调试只支持 32 位 x86 和 64 位 x64 IDB，请打开对应 IDB 后重试",
+            capability="windows_local_debugger",
+            details={"processor": processor, "bitness": bitness},
+        )
+    return bitness
 
 
 class DebugState(StrEnum):
@@ -302,6 +328,7 @@ class DebugWorker(OwnerThreadBound):
         self.session_id = uuid.uuid4().hex
         self.machine = DebugStateMachine()
         self._api: IdaModules | None = None
+        self._checkout_bitness: Literal[32, 64] | None = None
         self._mode: str | None = None
         self._job: WindowsJob | None = None
         self._owned_pid: int | None = None
@@ -396,7 +423,7 @@ class DebugWorker(OwnerThreadBound):
     def _require_runtime(self) -> IdaModules:
         if os.name != "nt":
             raise CapabilityError(
-                "动态调试首版只支持 Windows 本机 x64",
+                "动态调试只支持 Windows 本机 x86 和 x64",
                 capability="windows_local_debugger",
             )
         if self._api is None:
@@ -417,12 +444,15 @@ class DebugWorker(OwnerThreadBound):
                     "checkout_mismatch",
                     "IDA 当前数据库不是 debug worker 私有 checkout",
                 )
-            if not self._api.ida_ida.inf_is_64bit():
-                raise CapabilityError(
-                    "首版动态调试只支持 x64 IDB",
-                    capability="windows_x64_debugger",
-                )
+        if self._checkout_bitness is None:
+            self._checkout_bitness = cast(Literal[32, 64], _idb_bitness(self._api))
         return self._api
+
+    def _bitness(self) -> Literal[32, 64]:
+        bitness = self._checkout_bitness
+        if bitness is None:
+            raise RuntimeError("debug worker 尚未固定 checkout IDB 位数")
+        return bitness
 
     def _ensure_backend(self, api: IdaModules) -> None:
         api.ida_dbg.set_remote_debugger("", "", -1)
@@ -513,6 +543,7 @@ class DebugWorker(OwnerThreadBound):
             )
             if observed.kind != "process_started":
                 raise WorkerError("debug_start_failed", "IDA 报告 launch 请求错误")
+            self._verify_established_target(api, observed)
             self._establish_event = observed
             if self.machine.state == DebugState.LOST:
                 raise WorkerError(
@@ -553,6 +584,7 @@ class DebugWorker(OwnerThreadBound):
             )
             if observed.kind != "process_attached":
                 raise WorkerError("debug_attach_failed", "IDA 报告 attach 请求错误")
+            self._verify_established_target(api, observed)
             self._establish_event = observed
             if self.machine.state == DebugState.LOST:
                 raise WorkerError(
@@ -560,6 +592,42 @@ class DebugWorker(OwnerThreadBound):
                     "PROCESS_ATTACHED 到达时 IDA 已无法确认目标状态",
                 )
         return self._session_result()
+
+    def _verify_established_target(self, api: IdaModules, event: DebugEvent) -> None:
+        pid = event.payload.get("pid")
+        if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+            raise WorkerError("debug_process_query_failed", "调试建立事件缺少有效目标 PID")
+        if self._verified_target_pid == pid:
+            return
+        try:
+            verify_process_architecture(pid, bitness=self._bitness())
+        except WorkerError:
+            if self._mode == "attach":
+                if api.ida_dbg.detach_process():
+                    try:
+                        self._wait_for(
+                            api,
+                            lambda item: item.kind == "process_detached",
+                            timeout_ms=3_000,
+                            allow_cancel=False,
+                        )
+                    except WorkerError:
+                        pass
+            elif self._mode == "launch":
+                job = self._job
+                self._job = None
+                if job is not None:
+                    try:
+                        job.close()
+                    except WorkerError:
+                        pass
+            self.machine.observe(
+                "request_error",
+                {"action": "verify_process_architecture", "pid": pid},
+                provenance=DebugEventProvenance.SERVICE_EVENT,
+            )
+            raise
+        self._verified_target_pid = pid
 
     def _control(self, api: IdaModules, input: Mapping[str, object]) -> dict[str, object]:
         action = _text(input.get("action"), "action")
@@ -778,15 +846,19 @@ class DebugWorker(OwnerThreadBound):
         if not api.ida_dbg.select_thread(tid):
             raise WorkerError("debug_thread_not_found", "指定 thread_id 不存在")
         if view == "registers":
-            raw_names = input.get("registers", list(_REGISTER_NAMES))
+            bitness = self._bitness()
+            register_names = _X64_REGISTER_NAMES if bitness == 64 else _X86_REGISTER_NAMES
+            raw_names = input.get("registers", list(register_names))
             if not isinstance(raw_names, list) or any(
                 not isinstance(item, str) for item in raw_names
             ):
                 raise WorkerInputError("registers 必须是字符串数组")
             names = cast(list[str], raw_names)
             normalized = [name.upper() for name in names]
-            if any(name not in _REGISTER_NAMES for name in normalized):
-                raise WorkerInputError("registers 仅允许 Windows x64 通用寄存器")
+            if any(name not in register_names for name in normalized):
+                raise WorkerInputError(
+                    f"registers 仅允许当前 {bitness} 位 IDB 的 Windows 通用寄存器"
+                )
             registers: dict[str, object] = {}
             for name in normalized:
                 try:
@@ -1199,27 +1271,6 @@ class DebugWorker(OwnerThreadBound):
                     provenance=DebugEventProvenance.SERVICE_EVENT,
                 )
                 raise
-        if kind in {"process_started", "process_attached"} and self._verified_target_pid != pid:
-            try:
-                verify_x64_process(pid)
-            except WorkerError:
-                if self._mode == "attach":
-                    api.ida_dbg.detach_process()
-                elif self._mode == "launch":
-                    job = self._job
-                    self._job = None
-                    if job is not None:
-                        try:
-                            job.close()
-                        except WorkerError:
-                            pass
-                self.machine.observe(
-                    "request_error",
-                    {"action": "verify_x64_process", "pid": pid},
-                    provenance=DebugEventProvenance.SERVICE_EVENT,
-                )
-                raise
-            self._verified_target_pid = pid
         if kind == "library_unloaded":
             self._forget_unloaded_module(api, payload)
         if kind in {"process_exited", "process_detached"}:

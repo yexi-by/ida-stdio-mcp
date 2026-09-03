@@ -401,7 +401,9 @@ class _ColdImageIdentity:
         overview: ProgramOverviewOutput,
     ) -> _ColdImageIdentity:
         container = {
+            "elf32": "elf",
             "elf64": "elf",
+            "pe32": "pe",
             "pe32+": "pe",
         }.get(overview.image.format)
         return cls(
@@ -1093,8 +1095,9 @@ class Application:
                 raise ToolExecutionError(
                     BusinessErrorCode.UNSUPPORTED,
                     (
-                        "无法导入这个文件。当前支持 64 位小端 ELF（x86-64 或 AArch64）"
-                        "和 64 位 PE（x86-64）。如果输入是脚本或压缩文件，请先提取实际程序。"
+                        "无法导入这个文件。当前支持小端 ELF（x86、x86-64、ARM 或 "
+                        "AArch64）和 PE（x86 或 x86-64）。如果输入是脚本或压缩文件，"
+                        "请先提取实际程序。"
                     ),
                     details=cast(dict[str, JsonValue], exc.details),
                 ) from exc
@@ -2549,10 +2552,15 @@ class Application:
             self.storage.workspaces.get,
             arguments.workspace_id,
         )
-        await asyncio.to_thread(
+        revision_snapshot = await asyncio.to_thread(
             self.storage.workspaces.get_revision,
             arguments.workspace_id,
             arguments.revision,
+        )
+        native_identity = await asyncio.to_thread(
+            self._trusted_native_identity,
+            workspace,
+            revision_snapshot,
         )
         target_kind = arguments.target.kind
         if target_kind == "launch" and not self.config.policy.debug_launch:
@@ -2612,6 +2620,7 @@ class Application:
                         cancellation.result,
                         sample_name=runtime_sample_name,
                         image_id=f"image~{workspace.sample_sha256}",
+                        bitness=native_identity.bitness,
                     )
                 raise
             adapted = adapt_debug_establish(
@@ -2619,6 +2628,7 @@ class Application:
                 raw,
                 sample_name=runtime_sample_name,
                 image_id=f"image~{workspace.sample_sha256}",
+                bitness=native_identity.bitness,
             )
             session = _DebugSession(
                 checkout=checkout,
@@ -3255,9 +3265,17 @@ class Application:
         container = image.get("container")
         if (
             container not in {"elf", "pe"}
-            or architecture not in {"x86_64", "aarch64"}
+            or not isinstance(architecture, str)
             or isinstance(bitness, bool)
-            or bitness != 64
+            or not isinstance(bitness, int)
+            or (architecture, bitness)
+            not in {
+                ("x86", 32),
+                ("x86_64", 64),
+                ("arm", 32),
+                ("aarch64", 64),
+            }
+            or (container == "pe" and architecture not in {"x86", "x86_64"})
             or endianness != "little"
             or isinstance(image_size, bool)
             or not isinstance(image_size, int)
@@ -3807,18 +3825,26 @@ def _native_binding(
     overview: ProgramOverviewOutput,
 ) -> NativeBinding | None:
     image = overview.image
-    if image.bitness != 64 or image.endian != "little":
+    if image.endian != "little":
         return None
     with workspace.sample_path.open("rb") as stream:
         header = stream.read(64)
     abi: str | None = None
-    if header.startswith(b"MZ") and image.architecture == "x86_64":
-        abi = "msvc-x64"
-    elif header.startswith(b"\x7fELF") and len(header) >= 20 and header[4] == 2 and header[5] == 1:
+    if header.startswith(b"MZ"):
+        if image.architecture == "x86" and image.bitness == 32:
+            abi = "msvc-x86"
+        elif image.architecture == "x86_64" and image.bitness == 64:
+            abi = "msvc-x64"
+    elif header.startswith(b"\x7fELF") and len(header) >= 20 and header[5] == 1:
+        elf_class = header[4]
         machine = int.from_bytes(header[18:20], "little")
-        if machine == 0x3E and image.architecture == "x86_64":
+        if elf_class == 1 and machine == 0x03 and image.architecture == "x86":
+            abi = "sysv-x86"
+        elif elf_class == 1 and machine == 0x28 and image.architecture == "arm":
+            abi = "aapcs32"
+        elif elf_class == 2 and machine == 0x3E and image.architecture == "x86_64":
             abi = "sysv-x64"
-        elif machine == 0xB7 and image.architecture == "aarch64":
+        elif elf_class == 2 and machine == 0xB7 and image.architecture == "aarch64":
             abi = "aapcs64"
     if abi is None:
         return None
@@ -3829,7 +3855,7 @@ def _native_binding(
             "image_size": image.image_size,
             "architecture": image.architecture,
             "abi": abi,
-            "pointer_width": 64,
+            "pointer_width": image.bitness,
             "endianness": "little",
         },
         strict=True,

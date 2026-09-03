@@ -2342,7 +2342,10 @@ def test_workspace_summary_requires_consistent_analysis_outcome() -> None:
     image_schema = ImageSummary.model_json_schema()
     format_schema = cast(dict[str, object], image_schema["properties"])["format"]
     assert isinstance(format_schema, dict)
-    assert format_schema["enum"] == ["elf64", "pe32+", "unknown"]
+    assert format_schema["enum"] == ["elf32", "elf64", "pe32", "pe32+", "unknown"]
+    architecture_schema = cast(dict[str, object], image_schema["properties"])["architecture"]
+    assert isinstance(architecture_schema, dict)
+    assert architecture_schema["enum"] == ["x86", "x86_64", "arm", "aarch64"]
 
 
 def test_workspace_create_queued_cancel_persists_public_outcome(tmp_path: Path) -> None:

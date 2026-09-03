@@ -47,6 +47,64 @@ def _invalid_image_identity() -> ImageIdentity:
     )
 
 
+@pytest.mark.parametrize(
+    ("container", "architecture", "bitness"),
+    [
+        ("pe", "x86", 32),
+        ("pe", "x86_64", 64),
+        ("elf", "x86", 32),
+        ("elf", "x86_64", 64),
+        ("elf", "arm", 32),
+        ("elf", "aarch64", 64),
+    ],
+)
+def test_image_identity_accepts_supported_architecture_bitness_pairs(
+    container: str,
+    architecture: str,
+    bitness: int,
+) -> None:
+    identity = ImageIdentity.model_validate(
+        {
+            "container": container,
+            "architecture": architecture,
+            "bitness": bitness,
+            "endian": "little",
+            "image_size": 0x4000,
+        },
+        strict=True,
+    )
+
+    assert identity.architecture == architecture
+    assert identity.bitness == bitness
+
+
+@pytest.mark.parametrize(
+    ("container", "architecture", "bitness"),
+    [
+        ("pe", "arm", 32),
+        ("pe", "aarch64", 64),
+        ("elf", "x86", 64),
+        ("elf", "x86_64", 32),
+    ],
+)
+def test_image_identity_rejects_invalid_architecture_bitness_pairs(
+    container: str,
+    architecture: str,
+    bitness: int,
+) -> None:
+    with pytest.raises(ValueError):
+        ImageIdentity.model_validate(
+            {
+                "container": container,
+                "architecture": architecture,
+                "bitness": bitness,
+                "endian": "little",
+                "image_size": 0x4000,
+            },
+            strict=True,
+        )
+
+
 _LOCK_PROBE = """
 from pathlib import Path
 import sys

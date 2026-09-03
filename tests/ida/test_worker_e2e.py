@@ -161,12 +161,22 @@ def test_runtime_probe_is_headless_and_current(
 
 
 @pytest.mark.ida
+@pytest.mark.parametrize(
+    ("fixture_name", "architecture", "bitness"),
+    [
+        ("native_pe_x86.dll", "x86", 32),
+        ("native_pe_x64.dll", "x86_64", 64),
+    ],
+)
 def test_bootstrap_and_static_analysis_leave_checkout_unchanged(
     tmp_path: Path,
     ida_environment: dict[str, str],
     fixture_directory: Path,
+    fixture_name: str,
+    architecture: str,
+    bitness: int,
 ) -> None:
-    sample = fixture_directory / "native_pe_x64.dll"
+    sample = fixture_directory / fixture_name
     checkout = _bootstrap(tmp_path, ida_environment, sample)
     before = _sha256(checkout)
     worker = _start_worker(tmp_path, ida_environment, "analysis", checkout=checkout)
@@ -174,8 +184,8 @@ def test_bootstrap_and_static_analysis_leave_checkout_unchanged(
         overview = worker.client.execute("program.overview", {"limit": 100})
         image = overview["image"]
         assert isinstance(image, dict)
-        assert image["bitness"] == 64
-        assert image["architecture"] == "x86_64"
+        assert image["bitness"] == bitness
+        assert image["architecture"] == architecture
         assert image["container"] == "pe"
         assert isinstance(image["image_size"], int)
         assert image["image_size"] > 0  # type: ignore[operator]
@@ -203,10 +213,12 @@ def test_bootstrap_and_static_analysis_leave_checkout_unchanged(
 
 @pytest.mark.ida
 @pytest.mark.parametrize(
-    ("fixture_name", "architecture"),
+    ("fixture_name", "architecture", "bitness"),
     [
-        ("native_elf_x64.so", "x86_64"),
-        ("native_elf_arm64.so", "aarch64"),
+        ("native_elf_x86.so", "x86", 32),
+        ("native_elf_x64.so", "x86_64", 64),
+        ("native_elf_armv7.so", "arm", 32),
+        ("native_elf_arm64.so", "aarch64", 64),
     ],
 )
 def test_overview_normalizes_supported_elf_architectures(
@@ -215,6 +227,7 @@ def test_overview_normalizes_supported_elf_architectures(
     fixture_directory: Path,
     fixture_name: str,
     architecture: str,
+    bitness: int,
 ) -> None:
     sample = fixture_directory / fixture_name
     checkout = _bootstrap(tmp_path, ida_environment, sample)
@@ -224,6 +237,7 @@ def test_overview_normalizes_supported_elf_architectures(
         image = overview["image"]
         assert isinstance(image, dict)
         assert image["architecture"] == architecture
+        assert image["bitness"] == bitness
         assert image["container"] == "elf"
         imagebase = image["imagebase"]
         maximum = image["maximum_address"]
@@ -1049,12 +1063,24 @@ def test_mutation_and_il2cpp_publish_only_the_staging_database(
 
 @pytest.mark.ida
 @pytest.mark.debugger
+@pytest.mark.parametrize(
+    ("fixture_name", "instruction_pointer_name", "stack_pointer_name", "result_name", "run_to_rva"),
+    [
+        ("debug_target_x86.exe", "EIP", "ESP", "EAX", "0x1020"),
+        ("debug_target_x64.exe", "RIP", "RSP", "RAX", "0x1013"),
+    ],
+)
 def test_windows_debugger_observes_real_breakpoint_and_registers(
     tmp_path: Path,
     ida_environment: dict[str, str],
     fixture_directory: Path,
+    fixture_name: str,
+    instruction_pointer_name: str,
+    stack_pointer_name: str,
+    result_name: str,
+    run_to_rva: str,
 ) -> None:
-    sample = fixture_directory / "debug_target_x64.exe"
+    sample = fixture_directory / fixture_name
     checkout = _bootstrap(tmp_path, ida_environment, sample)
     worker = _start_worker(
         tmp_path,
@@ -1126,12 +1152,12 @@ def test_windows_debugger_observes_real_breakpoint_and_registers(
             {
                 "view": "registers",
                 "stop_id": stop_id,
-                "registers": ["RIP", "RSP", "RAX"],
+                "registers": [instruction_pointer_name, stack_pointer_name, result_name],
             },
         )
         register_values = registers["registers"]
         assert isinstance(register_values, dict)
-        instruction_pointer = register_values["RIP"]
+        instruction_pointer = register_values[instruction_pointer_name]
         assert isinstance(instruction_pointer, str)
         assert instruction_pointer.startswith("0x")
         memory = worker.client.execute(
@@ -1193,7 +1219,7 @@ def test_windows_debugger_observes_real_breakpoint_and_registers(
                 "address": {
                     "space": "runtime_module",
                     "module": sample.name,
-                    "rva": "0x1013",
+                    "rva": run_to_rva,
                 },
                 "timeout_ms": 30_000,
             },

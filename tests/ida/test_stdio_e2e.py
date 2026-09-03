@@ -11,11 +11,14 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 from mcp import ClientSession, StdioServerParameters, types
 from mcp.client.stdio import stdio_client
+
+from ida_re_mcp.il2cpp import canonical_ndjson, compute_record_id
+from ida_re_mcp.il2cpp.canonical import JsonObject as CanonicalJsonObject
 
 JsonObject = dict[str, object]
 
@@ -35,6 +38,256 @@ def _tree_identity(root: Path) -> dict[str, str]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def _with_record_id(record: CanonicalJsonObject) -> CanonicalJsonObject:
+    identified = dict(record)
+    identified["id"] = compute_record_id(identified)
+    return identified
+
+
+def _write_il2cpp_bundle(
+    path: Path,
+    *,
+    sample: Path,
+    metadata: Path,
+    image_size: int,
+    architecture: Literal["x86", "x86_64", "arm", "aarch64"],
+    abi: Literal["msvc-x86", "msvc-x64", "sysv-x86", "sysv-x64", "aapcs32", "aapcs64"],
+    pointer_width: Literal[32, 64],
+    calling_convention: Literal["cdecl", "win64", "sysv", "aapcs32", "aapcs64"],
+    function_rva: str,
+) -> None:
+    pointer_size = pointer_width // 8
+    manifest: CanonicalJsonObject = {
+        "kind": "manifest",
+        "schema": "1",
+        "media_type": "application/vnd.ida-re.il2cpp-bundle+ndjson",
+        "native": {
+            "sha256": hashlib.sha256(sample.read_bytes()).hexdigest(),
+            "size": sample.stat().st_size,
+            "image_size": image_size,
+            "architecture": architecture,
+            "abi": abi,
+            "pointer_width": pointer_width,
+            "endianness": "little",
+        },
+        "metadata": {
+            "sha256": hashlib.sha256(metadata.read_bytes()).hexdigest(),
+            "size": metadata.stat().st_size,
+        },
+    }
+    image = _with_record_id(
+        {
+            "kind": "managed_image",
+            "name": "Assembly-CSharp",
+            "assembly_name": "Assembly-CSharp.dll",
+        }
+    )
+    vec3 = _with_record_id(
+        {
+            "kind": "type",
+            "image_id": image["id"],
+            "namespace": "Game",
+            "name": "Vec3",
+            "layout": {
+                "kind": "struct",
+                "size": 12,
+                "alignment": 4,
+                "fields": [
+                    {"name": "x", "offset": 0, "type": {"kind": "primitive", "name": "f32"}},
+                    {"name": "y", "offset": 4, "type": {"kind": "primitive", "name": "f32"}},
+                    {"name": "z", "offset": 8, "type": {"kind": "primitive", "name": "f32"}},
+                ],
+            },
+        }
+    )
+    metadata_type = _with_record_id(
+        {
+            "kind": "type",
+            "image_id": image["id"],
+            "namespace": "",
+            "name": "MethodMetadata",
+            "layout": {
+                "kind": "struct",
+                "size": pointer_size * 2,
+                "alignment": pointer_size,
+                "fields": [
+                    {
+                        "name": "name",
+                        "offset": 0,
+                        "type": {
+                            "kind": "pointer",
+                            "const": True,
+                            "to": {"kind": "primitive", "name": "i8"},
+                        },
+                    },
+                    {
+                        "name": "token",
+                        "offset": pointer_size,
+                        "type": {"kind": "primitive", "name": "u32"},
+                    },
+                ],
+            },
+        }
+    )
+    actor_size = 24 if pointer_width == 32 else 32
+    actor = _with_record_id(
+        {
+            "kind": "type",
+            "image_id": image["id"],
+            "namespace": "Game",
+            "name": "Actor",
+            "layout": {
+                "kind": "struct",
+                "size": actor_size,
+                "alignment": pointer_size,
+                "fields": [
+                    {
+                        "name": "klass",
+                        "offset": 0,
+                        "type": {
+                            "kind": "pointer",
+                            "const": False,
+                            "to": {"kind": "primitive", "name": "void"},
+                        },
+                    },
+                    {
+                        "name": "monitor",
+                        "offset": pointer_size,
+                        "type": {
+                            "kind": "pointer",
+                            "const": False,
+                            "to": {"kind": "primitive", "name": "void"},
+                        },
+                    },
+                    {
+                        "name": "instance_id",
+                        "offset": pointer_size * 2,
+                        "type": {"kind": "primitive", "name": "i32"},
+                    },
+                    {
+                        "name": "position",
+                        "offset": pointer_size * 2 + 4,
+                        "type": {"kind": "named", "type_id": vec3["id"]},
+                    },
+                ],
+            },
+        }
+    )
+    native_probe = _with_record_id(
+        {
+            "kind": "type",
+            "image_id": image["id"],
+            "namespace": "Game",
+            "name": "NativeProbe",
+            "layout": {
+                "kind": "struct",
+                "size": pointer_size * 2,
+                "alignment": pointer_size,
+                "fields": [
+                    {
+                        "name": "signed_value",
+                        "offset": 0,
+                        "type": {"kind": "primitive", "name": "native_int"},
+                    },
+                    {
+                        "name": "unsigned_value",
+                        "offset": pointer_size,
+                        "type": {"kind": "primitive", "name": "native_uint"},
+                    },
+                ],
+            },
+        }
+    )
+    wide_alignment = 4 if abi == "sysv-x86" else 8
+    wide_offset = wide_alignment
+    wide_probe = _with_record_id(
+        {
+            "kind": "type",
+            "image_id": image["id"],
+            "namespace": "Game",
+            "name": "WideProbe",
+            "layout": {
+                "kind": "struct",
+                "size": wide_offset + 8,
+                "alignment": wide_alignment,
+                "fields": [
+                    {"name": "tag", "offset": 0, "type": {"kind": "primitive", "name": "u32"}},
+                    {
+                        "name": "wide",
+                        "offset": wide_offset,
+                        "type": {"kind": "primitive", "name": "u64"},
+                    },
+                ],
+            },
+        }
+    )
+    method = _with_record_id(
+        {
+            "kind": "method",
+            "image_id": image["id"],
+            "declaring_type_id": actor["id"],
+            "name": "GetScore",
+            "rva": function_rva,
+            "managed_signature": {
+                "return_type": "System.Int32",
+                "parameters": [{"name": "bonus", "type": "System.Int32"}],
+            },
+            "native_signature": {
+                "calling_convention": calling_convention,
+                "return_type": {"kind": "primitive", "name": "i32"},
+                "parameters": [
+                    {
+                        "name": "self",
+                        "type": {
+                            "kind": "pointer",
+                            "const": False,
+                            "to": {"kind": "named", "type_id": actor["id"]},
+                        },
+                    },
+                    {
+                        "name": "bonus",
+                        "type": {"kind": "primitive", "name": "i32"},
+                    },
+                    {
+                        "name": "method",
+                        "type": {
+                            "kind": "pointer",
+                            "const": True,
+                            "to": {"kind": "named", "type_id": metadata_type["id"]},
+                        },
+                    },
+                ],
+                "variadic": False,
+            },
+        }
+    )
+    symbol = _with_record_id(
+        {
+            "kind": "symbol",
+            "name": "Actor_GetScore",
+            "rva": function_rva,
+            "symbol_kind": "function",
+            "method_id": method["id"],
+            "type": None,
+        }
+    )
+    path.write_bytes(
+        canonical_ndjson(
+            [
+                manifest,
+                image,
+                vec3,
+                metadata_type,
+                actor,
+                native_probe,
+                wide_probe,
+                method,
+                symbol,
+            ]
+        )
+    )
 
 
 def _environment(base: dict[str, str], runtime: Path) -> dict[str, str]:
@@ -100,6 +353,10 @@ async def _call_tool(
     )
     assert result.isError is False, result
     assert result.structuredContent is not None, result
+    summaries = [item for item in result.content if isinstance(item, types.TextContent)]
+    assert len(summaries) == 1, result
+    assert any("\u4e00" <= character <= "\u9fff" for character in summaries[0].text)
+    assert "structuredContent" in summaries[0].text
     return cast(JsonObject, result.structuredContent)
 
 
@@ -122,14 +379,28 @@ async def _wait_operation(
 
 
 @pytest.mark.ida
+@pytest.mark.parametrize(
+    ("fixture_name", "architecture", "bitness", "image_format", "container"),
+    [
+        ("native_pe_x86.dll", "x86", 32, "pe32", "pe"),
+        ("native_pe_x64.dll", "x86_64", 64, "pe32+", "pe"),
+        ("native_elf_x86.so", "x86", 32, "elf32", "elf"),
+        ("native_elf_armv7.so", "arm", 32, "elf32", "elf"),
+    ],
+)
 def test_real_stdio_static_and_transaction_chain(
     stdio_runtime_root: Path,
     ida_environment: dict[str, str],
     fixture_directory: Path,
+    fixture_name: str,
+    architecture: str,
+    bitness: int,
+    image_format: str,
+    container: str,
 ) -> None:
     async def scenario() -> None:
         fixture_before = _tree_identity(fixture_directory)
-        sample = stdio_runtime_root / "native_pe_x64.dll"
+        sample = stdio_runtime_root / fixture_name
         shutil.copyfile(fixture_directory / sample.name, sample)
         runtime = stdio_runtime_root / "runtime"
         async with _official_session(
@@ -156,7 +427,7 @@ def test_real_stdio_static_and_transaction_chain(
             summaries = cast(list[JsonObject], listed["workspaces"])
             summary = next(item for item in summaries if item["workspace_id"] == workspace_id)
             assert summary["state"] == "ready"
-            assert summary["architecture"] == "x86_64"
+            assert summary["architecture"] == architecture
             assert summary["analysis_outcome"] is None
 
             overview = await _call_tool(
@@ -169,7 +440,9 @@ def test_real_stdio_static_and_transaction_chain(
                 },
             )
             image = cast(JsonObject, overview["image"])
-            assert image["format"] == "pe32+"
+            assert image["format"] == image_format
+            assert image["architecture"] == architecture
+            assert image["bitness"] == bitness
             expected_image_size = cast(int, image["image_size"])
 
             searched = await _call_tool(
@@ -239,9 +512,9 @@ def test_real_stdio_static_and_transaction_chain(
         for manifest in revision_manifests:
             identity = cast(JsonObject, manifest["image_identity"])
             assert identity == {
-                "architecture": "x86_64",
-                "bitness": 64,
-                "container": "pe",
+                "architecture": architecture,
+                "bitness": bitness,
+                "container": container,
                 "endian": "little",
                 "image_size": expected_image_size,
             }
@@ -251,15 +524,46 @@ def test_real_stdio_static_and_transaction_chain(
 
 
 @pytest.mark.ida
+@pytest.mark.parametrize(
+    (
+        "fixture_name",
+        "architecture",
+        "abi",
+        "pointer_width",
+        "calling_convention",
+        "function_rva",
+        "container",
+    ),
+    [
+        ("il2cpp_pe_x86.dll", "x86", "msvc-x86", 32, "cdecl", "0x1000", "pe"),
+        ("il2cpp_pe_x64.dll", "x86_64", "msvc-x64", 64, "win64", "0x1000", "pe"),
+        ("il2cpp_elf_x86.so", "x86", "sysv-x86", 32, "sysv", "0x13a0", "elf"),
+        (
+            "il2cpp_elf_armv7.so",
+            "arm",
+            "aapcs32",
+            32,
+            "aapcs32",
+            "0x102d5",
+            "elf",
+        ),
+    ],
+)
 def test_real_stdio_il2cpp_bundle_prepare_apply_and_publish(
     stdio_runtime_root: Path,
     ida_environment: dict[str, str],
     fixture_directory: Path,
+    fixture_name: str,
+    architecture: Literal["x86", "x86_64", "arm", "aarch64"],
+    abi: Literal["msvc-x86", "msvc-x64", "sysv-x86", "sysv-x64", "aapcs32", "aapcs64"],
+    pointer_width: Literal[32, 64],
+    calling_convention: Literal["cdecl", "win64", "sysv", "aapcs32", "aapcs64"],
+    function_rva: str,
+    container: str,
 ) -> None:
     async def scenario() -> None:
-        sample = stdio_runtime_root / "il2cpp_pe_x64.dll"
+        sample = stdio_runtime_root / fixture_name
         shutil.copyfile(fixture_directory / sample.name, sample)
-        bundle = fixture_directory.parent / "src" / "il2cpp_bundle_example.ndjson"
         metadata = fixture_directory / "il2cpp_metadata_fingerprint.bin"
         runtime = stdio_runtime_root / "runtime"
         async with _official_session(
@@ -277,6 +581,29 @@ def test_real_stdio_il2cpp_bundle_prepare_apply_and_publish(
                 operation_id=cast(str, created["analysis_operation_id"]),
             )
             revision = cast(str, initialized["revision"])
+            overview = await _call_tool(
+                client,
+                name="program.overview",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": revision,
+                    "include": [],
+                },
+            )
+            overview_image = cast(JsonObject, overview["image"])
+            image_size = cast(int, overview_image["image_size"])
+            bundle = stdio_runtime_root / f"{sample.stem}.ndjson"
+            _write_il2cpp_bundle(
+                bundle,
+                sample=sample,
+                metadata=metadata,
+                image_size=image_size,
+                architecture=architecture,
+                abi=abi,
+                pointer_width=pointer_width,
+                calling_convention=calling_convention,
+                function_rva=function_rva,
+            )
 
             prepared = await _call_tool(
                 client,
@@ -321,7 +648,8 @@ def test_real_stdio_il2cpp_bundle_prepare_apply_and_publish(
                 },
             )
             assert actor["kind"] == "struct"
-            assert actor["size"] == 32
+            assert actor["size"] == (24 if pointer_width == 32 else 32)
+            pointer_bits = pointer_width
             assert [
                 (
                     field["name"],
@@ -330,11 +658,67 @@ def test_real_stdio_il2cpp_bundle_prepare_apply_and_publish(
                 )
                 for field in cast(list[JsonObject], actor["fields"])
             ] == [
-                ("klass", 0, 64),
-                ("monitor", 64, 64),
-                ("instance_id", 128, 32),
-                ("position", 160, 96),
+                ("klass", 0, pointer_bits),
+                ("monitor", pointer_bits, pointer_bits),
+                ("instance_id", pointer_bits * 2, 32),
+                ("position", pointer_bits * 2 + 32, 96),
             ]
+
+            native_probe = await _call_tool(
+                client,
+                name="type.inspect",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": next_revision,
+                    "type": {"kind": "name", "name": "Game::NativeProbe"},
+                },
+            )
+            assert native_probe["size"] == pointer_width // 4
+            assert [
+                field["size_bits"] for field in cast(list[JsonObject], native_probe["fields"])
+            ] == [
+                pointer_width,
+                pointer_width,
+            ]
+
+            wide_probe = await _call_tool(
+                client,
+                name="type.inspect",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": next_revision,
+                    "type": {"kind": "name", "name": "Game::WideProbe"},
+                },
+            )
+            expected_wide_offset_bits = 32 if abi == "sysv-x86" else 64
+            assert [
+                (field["offset_bits"], field["size_bits"])
+                for field in cast(list[JsonObject], wide_probe["fields"])
+            ] == [(0, 32), (expected_wide_offset_bits, 64)]
+
+            function = await _call_tool(
+                client,
+                name="function.inspect",
+                arguments={
+                    "workspace_id": workspace_id,
+                    "revision": next_revision,
+                    "function": {
+                        "kind": "address",
+                        "address": {
+                            "kind": "image",
+                            "image_id": f"image~{created['sample_sha256']}",
+                            "rva": function_rva,
+                        },
+                    },
+                    "views": ["types"],
+                },
+            )
+            prototype = cast(str, function["prototype"])
+            assert "signed __int32 bonus" in prototype
+            expected_calling_convention = (
+                "__fastcall" if calling_convention == "win64" else "__cdecl"
+            )
+            assert expected_calling_convention in prototype
 
         manifests = [
             cast(JsonObject, json.loads(path.read_text(encoding="utf-8")))
@@ -345,9 +729,9 @@ def test_real_stdio_il2cpp_bundle_prepare_apply_and_publish(
             manifest for manifest in manifests if manifest["parent_revision"] == revision
         )
         identity = cast(JsonObject, mutation_manifest["image_identity"])
-        assert identity["container"] == "pe"
-        assert identity["architecture"] == "x86_64"
-        assert identity["bitness"] == 64
+        assert identity["container"] == container
+        assert identity["architecture"] == architecture
+        assert identity["bitness"] == pointer_width
         assert identity["endian"] == "little"
         assert isinstance(identity["image_size"], int)
 
@@ -420,14 +804,24 @@ def test_real_stdio_elf_overview_reports_container_capability_boundary(
 
 @pytest.mark.ida
 @pytest.mark.debugger
+@pytest.mark.parametrize(
+    ("fixture_name", "instruction_pointer", "stack_pointer"),
+    [
+        ("debug_target_x86.exe", "EIP", "ESP"),
+        ("debug_target_x64.exe", "RIP", "RSP"),
+    ],
+)
 def test_real_stdio_debug_chain(
     stdio_runtime_root: Path,
     ida_environment: dict[str, str],
     fixture_directory: Path,
+    fixture_name: str,
+    instruction_pointer: str,
+    stack_pointer: str,
 ) -> None:
     async def scenario() -> None:
         fixture_before = _tree_identity(fixture_directory)
-        sample = stdio_runtime_root / "debug_target_x64.exe"
+        sample = stdio_runtime_root / fixture_name
         shutil.copyfile(fixture_directory / sample.name, sample)
         async with _official_session(
             environment=_environment(ida_environment, stdio_runtime_root / "runtime"),
@@ -553,7 +947,7 @@ def test_real_stdio_debug_chain(
                 cast(str, register["name"])
                 for register in cast(list[JsonObject], register_snapshot["registers"])
             }
-            assert {"RIP", "RSP"}.issubset(register_names)
+            assert {instruction_pointer, stack_pointer}.issubset(register_names)
             stack_snapshot = await _call_tool(
                 client,
                 name="debug.inspect",

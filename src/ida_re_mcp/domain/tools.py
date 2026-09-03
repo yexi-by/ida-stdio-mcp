@@ -312,8 +312,8 @@ class ProgramOverviewInput(StaticQuery):
 
 class ImageSummary(StrictModel):
     image_id: ImageId
-    format: Literal["elf64", "pe32+", "unknown"]
-    architecture: Literal["x86_64", "aarch64"]
+    format: Literal["elf32", "elf64", "pe32", "pe32+", "unknown"]
+    architecture: Literal["x86", "x86_64", "arm", "aarch64"]
     bitness: Literal[32, 64]
     endian: Literal["little", "big"]
     image_base: U64Hex

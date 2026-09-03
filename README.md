@@ -2,7 +2,7 @@
 
 IDA Pro 9.3+ 的 headless 逆向工程 MCP 服务。任何支持 MCP 的 AI Agent（Codex、
 Claude Code、Kimi CLI 等）都可以通过 stdio 接入，让 Agent 直接驱动 IDA 分析
-PE / ELF 文件。
+PE / ELF 文件。当前支持 PE x86/x86-64，以及小端 ELF x86/x86-64/ARM/AArch64。
 
 ## 功能
 
@@ -10,7 +10,7 @@ PE / ELF 文件。
   字符串、伪代码、数据流切片
 - **IDB 修改**：重命名、注释、改类型等，每次修改生成新的分析版本（revision），
   旧版本仍可读取
-- **动态调试**：Windows x64 本机调试，断点、寄存器、线程、调用栈、内存读写
+- **动态调试**：Windows x86/x64 本机调试，断点、寄存器、线程、调用栈、内存读写
 - **产物**：Markdown / JSON 报告、样本与分析结果导出、IL2CPP 元数据
 - **协作**：分析结果持久化在本机 `data/`，多个 Agent 可通过 `workspace_id` 接手
   同一份分析，不必重复导入样本
@@ -19,7 +19,7 @@ PE / ELF 文件。
 
 - IDA Pro 9.3+ 及有效许可证
 - [uv](https://docs.astral.sh/uv/)
-- 读取伪代码需要 Hex-Rays Decompiler；动态调试需要 Windows x64
+- 读取伪代码需要对应处理器的 Hex-Rays Decompiler；动态调试需要 Windows
 
 ## 快速开始
 

@@ -51,8 +51,6 @@ _PRIMITIVE_LAYOUTS: dict[str, tuple[int, int]] = {
     "i64": (8, 8),
     "u64": (8, 8),
     "f64": (8, 8),
-    "native_int": (8, 8),
-    "native_uint": (8, 8),
 }
 _ENUM_LAYOUTS: dict[str, tuple[int, int]] = {
     "i8": (1, 1),
@@ -119,7 +117,7 @@ class Bundle:
         size, _ = _type_ref_layout(
             type_ref,
             self.type_by_id(),
-            self.manifest.native.pointer_width // 8,
+            self.manifest.native,
         )
         return size
 
@@ -316,31 +314,48 @@ def _validate_type_ref_shape(type_ref: TypeRef, *, allow_void: bool) -> None:
         _validate_type_ref_shape(type_ref.element, allow_void=False)
 
 
-def _declared_type_layout(record: TypeRecord) -> tuple[int, int]:
+def _primitive_layout(name: str, native: NativeBinding) -> tuple[int, int]:
+    if name in {"native_int", "native_uint"}:
+        pointer_size = native.pointer_width // 8
+        return pointer_size, pointer_size
+    size, alignment = _PRIMITIVE_LAYOUTS[name]
+    if native.abi == "sysv-x86" and name in {"i64", "u64", "f64"}:
+        alignment = 4
+    return size, alignment
+
+
+def _declared_type_layout(
+    record: TypeRecord,
+    native: NativeBinding,
+) -> tuple[int, int]:
     layout = record.layout
     if isinstance(layout, EnumLayout):
-        return _ENUM_LAYOUTS[layout.underlying]
+        size, alignment = _ENUM_LAYOUTS[layout.underlying]
+        if native.abi == "sysv-x86" and layout.underlying in {"i64", "u64"}:
+            alignment = 4
+        return size, alignment
     return layout.size, layout.alignment
 
 
 def _type_ref_layout(
     type_ref: TypeRef,
     types_by_id: Mapping[str, TypeRecord],
-    pointer_size: int,
+    native: NativeBinding,
 ) -> tuple[int, int]:
     """计算一个可内嵌 native TypeRef 的字节宽度与自然对齐。"""
 
     _validate_type_ref_shape(type_ref, allow_void=False)
     if isinstance(type_ref, PrimitiveTypeRef):
-        return _PRIMITIVE_LAYOUTS[type_ref.name]
+        return _primitive_layout(type_ref.name, native)
     if isinstance(type_ref, NamedTypeRef):
-        return _declared_type_layout(types_by_id[type_ref.type_id])
+        return _declared_type_layout(types_by_id[type_ref.type_id], native)
     if isinstance(type_ref, PointerTypeRef):
+        pointer_size = native.pointer_width // 8
         return pointer_size, pointer_size
     element_size, element_alignment = _type_ref_layout(
         type_ref.element,
         types_by_id,
-        pointer_size,
+        native,
     )
     return element_size * type_ref.count, element_alignment
 
@@ -351,7 +366,6 @@ def _validate_type_layouts(
 ) -> None:
     _validate_value_type_cycles(types)
     types_by_id = {record.id: record for record in types}
-    pointer_size = native.pointer_width // 8
     for record in types:
         layout = record.layout
         if isinstance(layout, EnumLayout):
@@ -361,7 +375,7 @@ def _validate_type_layouts(
             field_size, field_alignment = _type_ref_layout(
                 field.type,
                 types_by_id,
-                pointer_size,
+                native,
             )
             field_end = field.offset + field_size
             if field_end > layout.size:
@@ -384,7 +398,7 @@ def _validate_type_layouts(
 def _validate_callable_type_refs(
     method: MethodRecord,
     types_by_id: Mapping[str, TypeRecord],
-    pointer_size: int,
+    native: NativeBinding,
 ) -> None:
     signature = method.native_signature
     if signature is None:
@@ -393,9 +407,9 @@ def _validate_callable_type_refs(
     if not (
         isinstance(signature.return_type, PrimitiveTypeRef) and signature.return_type.name == "void"
     ):
-        _type_ref_layout(signature.return_type, types_by_id, pointer_size)
+        _type_ref_layout(signature.return_type, types_by_id, native)
     for parameter in signature.parameters:
-        _type_ref_layout(parameter.type, types_by_id, pointer_size)
+        _type_ref_layout(parameter.type, types_by_id, native)
 
 
 def _parse_records(payload: bytes) -> list[tuple[int, JsonObject, BundleRecord]]:
@@ -453,6 +467,11 @@ def _validate_rva(rva: str, native: NativeBinding, label: str) -> None:
         raise BundleValidationError(f"{label} 超出 native image_size")
 
 
+def _code_rva_value(rva: str, native: NativeBinding) -> int:
+    value = int(rva, 16)
+    return value & ~1 if native.abi == "aapcs32" else value
+
+
 def _validate_graph(records: list[tuple[int, JsonObject, BundleRecord]]) -> Bundle:
     manifest = cast(ManifestRecord, records[0][2])
     images = tuple(record for _, _, record in records if isinstance(record, ManagedImageRecord))
@@ -480,8 +499,11 @@ def _validate_graph(records: list[tuple[int, JsonObject, BundleRecord]]) -> Bund
         if record.image_id not in image_ids:
             raise BundleValidationError(f"type 引用了未知 image_id: {record.id}")
     expected_cc = {
+        "msvc-x86": "cdecl",
         "msvc-x64": "win64",
+        "sysv-x86": "sysv",
         "sysv-x64": "sysv",
+        "aapcs32": "aapcs32",
         "aapcs64": "aapcs64",
     }[manifest.native.abi]
     for record in methods:
@@ -499,17 +521,25 @@ def _validate_graph(records: list[tuple[int, JsonObject, BundleRecord]]) -> Bund
             raise BundleValidationError(
                 f"method native calling convention 与 ABI 不一致: {record.id}"
             )
-    seen_symbol_rvas: set[str] = set()
+    seen_symbol_rvas: set[int] = set()
     for record in symbols:
         _validate_rva(record.rva, manifest.native, f"symbol {record.id} rva")
-        if record.rva in seen_symbol_rvas:
+        rva_value = (
+            _code_rva_value(record.rva, manifest.native)
+            if record.symbol_kind == "function"
+            else int(record.rva, 16)
+        )
+        if rva_value in seen_symbol_rvas:
             raise BundleValidationError("bundle 包含相同 RVA 的重复 symbol")
-        seen_symbol_rvas.add(record.rva)
+        seen_symbol_rvas.add(rva_value)
         if record.method_id is not None and record.method_id not in method_ids:
             raise BundleValidationError(f"symbol 引用了未知 method_id: {record.id}")
         if record.symbol_kind == "function":
             assert record.method_id is not None
-            if methods_by_id[record.method_id].rva != record.rva:
+            if _code_rva_value(
+                methods_by_id[record.method_id].rva,
+                manifest.native,
+            ) != _code_rva_value(record.rva, manifest.native):
                 raise BundleValidationError(
                     f"function symbol RVA 与 method binding 不一致: {record.id}"
                 )
@@ -518,13 +548,12 @@ def _validate_graph(records: list[tuple[int, JsonObject, BundleRecord]]) -> Bund
             if _is_named_ref(type_ref) and type_ref.type_id not in type_ids:
                 raise BundleValidationError(f"记录引用了未知 type_id: {type_ref.type_id}")
     _validate_type_layouts(types, manifest.native)
-    pointer_size = manifest.native.pointer_width // 8
     for method in methods:
-        _validate_callable_type_refs(method, types_by_id, pointer_size)
+        _validate_callable_type_refs(method, types_by_id, manifest.native)
     for symbol in symbols:
         if symbol.type is None:
             continue
-        symbol_size, _ = _type_ref_layout(symbol.type, types_by_id, pointer_size)
+        symbol_size, _ = _type_ref_layout(symbol.type, types_by_id, manifest.native)
         if int(symbol.rva, 16) + symbol_size > manifest.native.image_size:
             raise BundleValidationError(f"data symbol 范围超出 native image_size: {symbol.id}")
 

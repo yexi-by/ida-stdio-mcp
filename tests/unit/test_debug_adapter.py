@@ -1,6 +1,6 @@
 import json
 from collections.abc import Mapping
-from typing import cast
+from typing import Literal, cast
 
 import pytest
 from pydantic import ValidationError
@@ -46,7 +46,12 @@ STOP_ID = "stop_abcdef"
 MODULE_ID = "module_abcdef"
 
 
-def _context(*, state: str = "suspended", stop_id: str | None = STOP_ID) -> DebugContext:
+def _context(
+    *,
+    state: str = "suspended",
+    stop_id: str | None = STOP_ID,
+    bitness: Literal[32, 64] = 64,
+) -> DebugContext:
     return DebugContext(
         workspace_id=WORKSPACE_ID,
         revision=REVISION,
@@ -56,6 +61,7 @@ def _context(*, state: str = "suspended", stop_id: str | None = STOP_ID) -> Debu
         stop_id=stop_id,
         state=cast(DebugState, state),
         process_id=1234,
+        bitness=bitness,
         modules=(
             DebugModuleFact(
                 module_id=MODULE_ID,
@@ -129,6 +135,7 @@ def test_establish_launch_is_exact_and_builds_context() -> None:
         ),
         sample_name=r"C:\samples\target.exe",
         image_id=IMAGE_ID,
+        bitness=64,
     )
 
     assert command.operation == "debug.establish"
@@ -150,6 +157,7 @@ def test_establish_launch_is_exact_and_builds_context() -> None:
             _raw_session(owned_pid=1234),
             sample_name=r"C:\samples\target.exe",
             image_id=IMAGE_ID,
+            bitness=64,
         )
 
 
@@ -563,6 +571,44 @@ def test_multi_view_inspect_maps_runtime_module_and_aggregates() -> None:
     incomplete_registers[3] = _raw_session(registers={"RIP": "0x140002000", "RSP": "0x200000"})
     with pytest.raises(ValueError, match="完整且唯一"):
         adapt_debug_inspect(context, request, incomplete_registers)
+
+
+def test_x86_inspect_requires_and_returns_complete_x86_register_set() -> None:
+    context = _context(bitness=32)
+    request = DebugInspectInput(
+        debug_session_id=SESSION_ID,
+        stop_id=STOP_ID,
+        views=["registers"],
+    )
+    raw = _raw_session(
+        registers={
+            "EAX": "0x1",
+            "EBX": "0x2",
+            "ECX": "0x3",
+            "EDX": "0x4",
+            "ESI": "0x5",
+            "EDI": "0x6",
+            "EBP": "0x200100",
+            "ESP": "0x200000",
+            "EIP": "0x402000",
+            "EFL": "0x202",
+        }
+    )
+
+    adapted = adapt_debug_inspect(context, request, [raw])
+
+    assert {item.name for item in adapted.output.registers} == {
+        "EAX",
+        "EBX",
+        "ECX",
+        "EDX",
+        "ESI",
+        "EDI",
+        "EBP",
+        "ESP",
+        "EIP",
+        "EFL",
+    }
 
 
 def test_breakpoint_replacement_plan_and_rollback_preserve_old_state() -> None:

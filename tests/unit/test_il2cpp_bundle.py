@@ -20,6 +20,7 @@ from ida_re_mcp.il2cpp import (
     parse_il2cpp_bundle,
 )
 from ida_re_mcp.il2cpp.canonical import JsonObject, JsonValue, parse_canonical_json
+from ida_re_mcp.il2cpp.models import StructLayout
 
 NATIVE_SHA256 = "11" * 32
 METADATA_SHA256 = "22" * 32
@@ -145,6 +146,223 @@ def test_parse_valid_bundle(tmp_path: Path) -> None:
     assert bundle.methods[0].rva == "0x1000"
     assert bundle.symbols[0].name == "Actor_GetScore"
     assert len(bundle.sha256) == 64
+
+
+@pytest.mark.parametrize(
+    ("architecture", "abi", "calling_convention"),
+    [
+        ("x86", "msvc-x86", "cdecl"),
+        ("x86", "sysv-x86", "sysv"),
+        ("arm", "aapcs32", "aapcs32"),
+    ],
+)
+def test_parse_32_bit_bundle_uses_native_width_layouts(
+    tmp_path: Path,
+    architecture: str,
+    abi: str,
+    calling_convention: str,
+) -> None:
+    records = _records()
+    native = cast(JsonObject, records[0]["native"])
+    native.update(
+        {
+            "architecture": architecture,
+            "abi": abi,
+            "pointer_width": 32,
+        }
+    )
+    layout = cast(JsonObject, records[2]["layout"])
+    layout.update(
+        {
+            "size": 4,
+            "alignment": 4,
+            "fields": [
+                {
+                    "name": "handle",
+                    "offset": 0,
+                    "type": {"kind": "primitive", "name": "native_int"},
+                }
+            ],
+        }
+    )
+    signature = cast(JsonObject, records[3]["native_signature"])
+    signature["calling_convention"] = calling_convention
+    path = tmp_path / f"{abi}.ndjson"
+    _write_bundle(path, records)
+
+    bundle = parse_il2cpp_bundle(
+        path,
+        ExpectedNative(
+            NATIVE_SHA256,
+            size=4096,
+            image_size=0x5000,
+            architecture=architecture,
+            abi=abi,
+            pointer_width=32,
+            endianness="little",
+        ),
+        ExpectedMetadata(METADATA_SHA256, size=1024),
+    )
+
+    parsed_layout = bundle.types[0].layout
+    assert isinstance(parsed_layout, StructLayout)
+    assert bundle.type_ref_size(parsed_layout.fields[0].type) == 4
+
+
+def test_sysv_x86_accepts_four_byte_alignment_for_wide_scalars_and_enums(
+    tmp_path: Path,
+) -> None:
+    records = _records()
+    native = cast(JsonObject, records[0]["native"])
+    native.update(
+        {
+            "architecture": "x86",
+            "abi": "sysv-x86",
+            "pointer_width": 32,
+        }
+    )
+    actor = records[2]
+    state = _with_id(
+        {
+            "kind": "type",
+            "image_id": records[1]["id"],
+            "namespace": "Game",
+            "name": "WideState",
+            "layout": {
+                "kind": "enum",
+                "underlying": "u64",
+                "members": [{"name": "Ready", "value": 1}],
+            },
+        }
+    )
+    layout = cast(JsonObject, actor["layout"])
+    layout.update(
+        {
+            "size": 20,
+            "alignment": 4,
+            "fields": [
+                {
+                    "name": "tag",
+                    "offset": 0,
+                    "type": {"kind": "primitive", "name": "u32"},
+                },
+                {
+                    "name": "value",
+                    "offset": 4,
+                    "type": {"kind": "primitive", "name": "i64"},
+                },
+                {
+                    "name": "state",
+                    "offset": 12,
+                    "type": {"kind": "named", "type_id": state["id"]},
+                },
+            ],
+        }
+    )
+    records.insert(2, state)
+    signature = cast(JsonObject, records[4]["native_signature"])
+    signature["calling_convention"] = "sysv"
+    path = tmp_path / "sysv-x86-wide-alignment.ndjson"
+    _write_bundle(path, records)
+
+    bundle = parse_il2cpp_bundle(
+        path,
+        ExpectedNative(
+            NATIVE_SHA256,
+            size=4096,
+            image_size=0x5000,
+            architecture="x86",
+            abi="sysv-x86",
+            pointer_width=32,
+            endianness="little",
+        ),
+        ExpectedMetadata(METADATA_SHA256, size=1024),
+    )
+
+    actor_layout = next(record.layout for record in bundle.types if record.name == "Actor")
+    assert isinstance(actor_layout, StructLayout)
+    assert [field.offset for field in actor_layout.fields] == [0, 4, 12]
+
+
+def test_aapcs32_normalizes_thumb_function_rvas(tmp_path: Path) -> None:
+    records = _records()
+    native = cast(JsonObject, records[0]["native"])
+    native.update({"architecture": "arm", "abi": "aapcs32", "pointer_width": 32})
+    actor_layout = cast(JsonObject, records[2]["layout"])
+    actor_layout.update(
+        {
+            "size": 4,
+            "alignment": 4,
+            "fields": [
+                {
+                    "name": "score",
+                    "offset": 0,
+                    "type": {"kind": "primitive", "name": "i32"},
+                }
+            ],
+        }
+    )
+    method = records[3]
+    method["rva"] = "0x1001"
+    signature = cast(JsonObject, method["native_signature"])
+    signature["calling_convention"] = "aapcs32"
+    symbol = records[4]
+    symbol["rva"] = "0x1000"
+    symbol["id"] = compute_record_id(symbol)
+    path = tmp_path / "thumb.ndjson"
+    _write_bundle(path, records)
+
+    bundle = parse_il2cpp_bundle(path, NATIVE_SHA256, METADATA_SHA256)
+
+    assert bundle.methods[0].rva == "0x1001"
+    assert bundle.symbols[0].rva == "0x1000"
+
+    duplicate = _with_id(
+        {
+            "kind": "symbol",
+            "name": "Actor_GetScore_Thumb",
+            "rva": "0x1001",
+            "symbol_kind": "function",
+            "method_id": method["id"],
+            "type": None,
+        }
+    )
+    records.append(duplicate)
+    _write_bundle(path, records)
+    with pytest.raises(BundleValidationError, match="相同 RVA"):
+        parse_il2cpp_bundle(path, NATIVE_SHA256, METADATA_SHA256)
+
+
+@pytest.mark.parametrize(
+    ("architecture", "abi", "pointer_width", "message"),
+    [
+        ("x86", "msvc-x64", 32, "architecture 与 ABI"),
+        ("arm", "aapcs64", 32, "architecture 与 ABI"),
+        ("x86", "msvc-x86", 64, "pointer_width"),
+        ("aarch64", "aapcs64", 32, "pointer_width"),
+    ],
+)
+def test_rejects_inconsistent_native_binding(
+    tmp_path: Path,
+    architecture: str,
+    abi: str,
+    pointer_width: int,
+    message: str,
+) -> None:
+    records = _records()
+    native = cast(JsonObject, records[0]["native"])
+    native.update(
+        {
+            "architecture": architecture,
+            "abi": abi,
+            "pointer_width": pointer_width,
+        }
+    )
+    path = tmp_path / "inconsistent-native.ndjson"
+    _write_bundle(path, records)
+
+    with pytest.raises(BundleValidationError, match=message):
+        parse_il2cpp_bundle(path, NATIVE_SHA256, METADATA_SHA256)
 
 
 def test_record_ids_are_semantic_and_deterministic() -> None:

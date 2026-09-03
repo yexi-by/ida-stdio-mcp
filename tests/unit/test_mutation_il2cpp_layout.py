@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import ClassVar, cast
+from typing import ClassVar, Literal, cast
+
+import pytest
 
 from ida_re_mcp.il2cpp.models import (
     EnumLayout,
     EnumMember,
     FieldDefinition,
+    NativeSignature,
     PrimitiveTypeRef,
     StructLayout,
     TypeRecord,
@@ -48,6 +51,16 @@ class _FakeEnumData(_FakeVector):
         self.radix = (radix, signed)
 
 
+class _FakeFunctionData(_FakeVector):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calling_convention: int | None = None
+        self.rettype: _FakeTinfo | None = None
+
+    def set_cc(self, value: int) -> None:
+        self.calling_convention = value
+
+
 class _FakeMember:
     name = ""
     offset = 0
@@ -67,6 +80,7 @@ class _FakeTinfo:
         self.udt: _FakeUdtData | None = None
         self.enum: _FakeEnumData | None = None
         self.enum_sign: int | None = None
+        self.function: _FakeFunctionData | None = None
 
     def create_array(self, element: _FakeTinfo, count: int) -> bool:
         self.size_bytes = element.size_bytes * count
@@ -102,6 +116,10 @@ class _FakeTinfo:
         self.size_bytes = 4
         return True
 
+    def create_func(self, function: _FakeFunctionData) -> bool:
+        self.function = function
+        return True
+
     def set_enum_width(self, width: int) -> int:
         self.size_bytes = width
         return _FakeTypeinf.TERR_OK
@@ -133,6 +151,8 @@ class _FakeTypeinf:
     TERR_OK = 0
     type_signed = 21
     type_unsigned = 22
+    CM_CC_CDECL = 31
+    CM_CC_FASTCALL = 32
     PRIMITIVE_SIZES: ClassVar[dict[int, int]] = {
         BTF_VOID: 0,
         BTF_BOOL: 1,
@@ -168,14 +188,31 @@ class _FakeTypeinf:
     def edm_t() -> _FakeEnumMember:
         return _FakeEnumMember()
 
+    @staticmethod
+    def func_type_data_t() -> _FakeFunctionData:
+        return _FakeFunctionData()
+
 
 def _api() -> IdaModules:
     return cast(IdaModules, SimpleNamespace(ida_typeinf=_FakeTypeinf()))
 
 
 class _TestMutationWorker(MutationWorker):
-    def build_type(self, api: IdaModules, record: TypeRecord) -> object:
-        return self._build_type(api, record, {})
+    def build_type(
+        self,
+        api: IdaModules,
+        record: TypeRecord,
+        pointer_width: int,
+    ) -> object:
+        return self._build_type(api, record, {}, pointer_width)
+
+    def build_function_type(
+        self,
+        api: IdaModules,
+        signature: NativeSignature,
+        pointer_width: int,
+    ) -> object:
+        return self._build_function_type(api, signature, {}, pointer_width)
 
 
 def _record(
@@ -192,8 +229,11 @@ def _record(
     )
 
 
-def _build(record: TypeRecord) -> _FakeTinfo:
-    return cast(_FakeTinfo, _TestMutationWorker().build_type(_api(), record))
+def _build(record: TypeRecord, pointer_width: int = 64) -> _FakeTinfo:
+    return cast(
+        _FakeTinfo,
+        _TestMutationWorker().build_type(_api(), record, pointer_width),
+    )
 
 
 def test_struct_tail_padding_materializes_declared_size() -> None:
@@ -292,3 +332,71 @@ def test_enum_underlying_controls_width_sign_and_member_encoding() -> None:
         (cast(_FakeEnumMember, member).name, cast(_FakeEnumMember, member).value)
         for member in result.enum
     ] == [("Unknown", (1 << 64) - 1), ("Ready", 1)]
+
+
+@pytest.mark.parametrize(
+    ("name", "pointer_width", "expected_size"),
+    [
+        ("native_int", 32, 4),
+        ("native_uint", 32, 4),
+        ("native_int", 64, 8),
+        ("native_uint", 64, 8),
+    ],
+)
+def test_native_integer_materializes_pointer_width(
+    name: Literal["native_int", "native_uint"],
+    pointer_width: int,
+    expected_size: int,
+) -> None:
+    record = _record(
+        "6",
+        StructLayout(
+            kind="struct",
+            size=expected_size,
+            alignment=expected_size,
+            fields=(
+                FieldDefinition(
+                    name="value",
+                    offset=0,
+                    type=PrimitiveTypeRef(kind="primitive", name=name),
+                ),
+            ),
+        ),
+    )
+
+    result = _build(record, pointer_width)
+
+    assert result.get_size() == expected_size
+    assert result.udt is not None
+    value = cast(_FakeMember, result.udt[0])
+    assert value.type.get_size() == expected_size
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("cdecl", _FakeTypeinf.CM_CC_CDECL),
+        ("win64", _FakeTypeinf.CM_CC_FASTCALL),
+        ("sysv", _FakeTypeinf.CM_CC_CDECL),
+        ("aapcs32", _FakeTypeinf.CM_CC_CDECL),
+        ("aapcs64", _FakeTypeinf.CM_CC_CDECL),
+    ],
+)
+def test_native_calling_conventions_use_ida_constants(
+    name: Literal["cdecl", "win64", "sysv", "aapcs32", "aapcs64"],
+    expected: int,
+) -> None:
+    signature = NativeSignature(
+        calling_convention=name,
+        return_type=PrimitiveTypeRef(kind="primitive", name="void"),
+        parameters=(),
+        variadic=False,
+    )
+
+    result = cast(
+        _FakeTinfo,
+        _TestMutationWorker().build_function_type(_api(), signature, 64),
+    )
+
+    assert result.function is not None
+    assert result.function.calling_convention == expected

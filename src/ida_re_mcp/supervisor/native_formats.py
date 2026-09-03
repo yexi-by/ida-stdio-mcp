@@ -7,17 +7,21 @@ from pathlib import Path
 from typing import BinaryIO, Literal
 
 type NativeContainer = Literal["elf", "pe"]
-type NativeArchitecture = Literal["aarch64", "x86_64"]
+type NativeArchitecture = Literal["aarch64", "arm", "x86", "x86_64"]
 
-_ELF_HEADER_SIZE = 64
-_ELF_PROGRAM_HEADER_SIZE = 56
+_ELF32_HEADER_SIZE = 52
+_ELF64_HEADER_SIZE = 64
+_ELF32_PROGRAM_HEADER_SIZE = 32
+_ELF64_PROGRAM_HEADER_SIZE = 56
 _MAX_ELF_PROGRAM_HEADERS = 4_096
+_UINT32_MAX = (1 << 32) - 1
 _UINT64_MAX = (1 << 64) - 1
 _PE_DOS_HEADER_SIZE = 64
 _PE_COFF_PREFIX_SIZE = 24
 _PE_DATA_DIRECTORY_SIZE = 8
 _PE_MAX_DATA_DIRECTORIES = 16
-_PE_OPTIONAL_FIXED_SIZE = 112
+_PE32_OPTIONAL_FIXED_SIZE = 96
+_PE32_PLUS_OPTIONAL_FIXED_SIZE = 112
 _PE_SECURITY_DIRECTORY_INDEX = 4
 _PE_SECTION_HEADER_SIZE = 40
 _MAX_PE_OPTIONAL_HEADER_SIZE = 4_096
@@ -30,12 +34,12 @@ _PE_SECTION_EXECUTE = 0x2000_0000
 
 @dataclass(frozen=True, slots=True)
 class NativeImageIdentity:
-    """由文件头确定的、已经过硬门禁覆盖的原生镜像身份。"""
+    """由文件头确定并经过格式预检的原生镜像身份。"""
 
     container: NativeContainer
     architecture: NativeArchitecture
+    bitness: Literal[32, 64]
     endian: Literal["little"] = "little"
-    bitness: Literal[64] = 64
 
 
 class UnsupportedNativeImageError(ValueError):
@@ -50,8 +54,11 @@ class UnsupportedNativeImageError(ValueError):
         return {
             "detected": self.detected,
             "supported_images": [
+                "elf32-arm-little",
+                "elf32-x86-little",
                 "elf64-aarch64-little",
                 "elf64-x86_64-little",
+                "pe32-x86-little",
                 "pe32+-x86_64-little",
             ],
         }
@@ -65,7 +72,7 @@ def inspect_native_image(path: Path) -> NativeImageIdentity:
         raise UnsupportedNativeImageError("样本不是普通文件", detected="not_regular_file")
     size = resolved.stat().st_size
     with resolved.open("rb") as stream:
-        prefix = stream.read(_ELF_HEADER_SIZE)
+        prefix = stream.read(_ELF64_HEADER_SIZE)
         if prefix.startswith(b"\x7fELF"):
             return _inspect_elf(stream, prefix, size=size)
         if prefix.startswith(b"MZ"):
@@ -97,10 +104,23 @@ def inspect_native_image(path: Path) -> NativeImageIdentity:
 
 
 def _inspect_elf(stream: BinaryIO, header: bytes, *, size: int) -> NativeImageIdentity:
-    if len(header) < _ELF_HEADER_SIZE:
+    if len(header) < _ELF32_HEADER_SIZE:
         raise UnsupportedNativeImageError("ELF 文件头不完整", detected="truncated_elf")
-    if header[4] != 2:
-        raise UnsupportedNativeImageError("仅支持 ELF64 镜像", detected="elf32")
+    elf_class = header[4]
+    if elf_class == 1:
+        bitness: Literal[32, 64] = 32
+        header_size = _ELF32_HEADER_SIZE
+        program_entry_size = _ELF32_PROGRAM_HEADER_SIZE
+        integer_limit = _UINT32_MAX
+    elif elf_class == 2:
+        bitness = 64
+        header_size = _ELF64_HEADER_SIZE
+        program_entry_size = _ELF64_PROGRAM_HEADER_SIZE
+        integer_limit = _UINT64_MAX
+    else:
+        raise UnsupportedNativeImageError("ELF 位数标记无效", detected="invalid_elf")
+    if len(header) < header_size:
+        raise UnsupportedNativeImageError("ELF 文件头不完整", detected="truncated_elf")
     if header[5] != 1:
         detected = "elf_big_endian" if header[5] == 2 else "invalid_elf"
         raise UnsupportedNativeImageError("仅支持小端 ELF 镜像", detected=detected)
@@ -113,13 +133,20 @@ def _inspect_elf(stream: BinaryIO, header: bytes, *, size: int) -> NativeImageId
             detected="unsupported_elf_type",
         )
     machine = int.from_bytes(header[18:20], "little")
-    architecture = _elf_architecture(machine)
-    entry = int.from_bytes(header[24:32], "little")
-    header_size = int.from_bytes(header[52:54], "little")
-    program_offset = int.from_bytes(header[32:40], "little")
-    program_entry_size = int.from_bytes(header[54:56], "little")
-    program_count = int.from_bytes(header[56:58], "little")
-    if header_size != _ELF_HEADER_SIZE or program_entry_size != _ELF_PROGRAM_HEADER_SIZE:
+    architecture = _elf_architecture(machine, bitness=bitness)
+    if bitness == 32:
+        entry = int.from_bytes(header[24:28], "little")
+        program_offset = int.from_bytes(header[28:32], "little")
+        declared_header_size = int.from_bytes(header[40:42], "little")
+        declared_program_entry_size = int.from_bytes(header[42:44], "little")
+        program_count = int.from_bytes(header[44:46], "little")
+    else:
+        entry = int.from_bytes(header[24:32], "little")
+        program_offset = int.from_bytes(header[32:40], "little")
+        declared_header_size = int.from_bytes(header[52:54], "little")
+        declared_program_entry_size = int.from_bytes(header[54:56], "little")
+        program_count = int.from_bytes(header[56:58], "little")
+    if declared_header_size != header_size or declared_program_entry_size != program_entry_size:
         raise UnsupportedNativeImageError("ELF 头尺寸无效", detected="invalid_elf")
     if program_count == 0xFFFF:
         raise UnsupportedNativeImageError(
@@ -148,12 +175,20 @@ def _inspect_elf(stream: BinaryIO, header: bytes, *, size: int) -> NativeImageId
             )
         if int.from_bytes(program[:4], "little") != 1:
             continue
-        flags = int.from_bytes(program[4:8], "little")
-        file_offset = int.from_bytes(program[8:16], "little")
-        virtual_address = int.from_bytes(program[16:24], "little")
-        file_size = int.from_bytes(program[32:40], "little")
-        memory_size = int.from_bytes(program[40:48], "little")
-        alignment = int.from_bytes(program[48:56], "little")
+        if bitness == 32:
+            file_offset = int.from_bytes(program[4:8], "little")
+            virtual_address = int.from_bytes(program[8:12], "little")
+            file_size = int.from_bytes(program[16:20], "little")
+            memory_size = int.from_bytes(program[20:24], "little")
+            flags = int.from_bytes(program[24:28], "little")
+            alignment = int.from_bytes(program[28:32], "little")
+        else:
+            flags = int.from_bytes(program[4:8], "little")
+            file_offset = int.from_bytes(program[8:16], "little")
+            virtual_address = int.from_bytes(program[16:24], "little")
+            file_size = int.from_bytes(program[32:40], "little")
+            memory_size = int.from_bytes(program[40:48], "little")
+            alignment = int.from_bytes(program[48:56], "little")
         if memory_size == 0:
             raise UnsupportedNativeImageError(
                 "ELF PT_LOAD 不能为空",
@@ -172,7 +207,7 @@ def _inspect_elf(stream: BinaryIO, header: bytes, *, size: int) -> NativeImageId
                 "ELF PT_LOAD alignment 无效",
                 detected="invalid_elf",
             )
-        if memory_size > _UINT64_MAX - virtual_address:
+        if memory_size > integer_limit - virtual_address:
             raise UnsupportedNativeImageError(
                 "ELF PT_LOAD 虚拟区间溢出",
                 detected="invalid_elf",
@@ -193,7 +228,7 @@ def _inspect_elf(stream: BinaryIO, header: bytes, *, size: int) -> NativeImageId
             "ELF entry 不在可执行 PT_LOAD 内",
             detected="invalid_elf",
         )
-    return NativeImageIdentity("elf", architecture)
+    return NativeImageIdentity("elf", architecture, bitness=bitness)
 
 
 def _inspect_pe(stream: BinaryIO, dos_header: bytes, *, size: int) -> NativeImageIdentity:
@@ -207,9 +242,9 @@ def _inspect_pe(stream: BinaryIO, dos_header: bytes, *, size: int) -> NativeImag
     if len(coff) != _PE_COFF_PREFIX_SIZE or coff[:4] != b"PE\0\0":
         raise UnsupportedNativeImageError("PE 签名无效", detected="invalid_pe")
     machine = int.from_bytes(coff[4:6], "little")
-    if machine != 0x8664:
+    if machine not in {0x014C, 0x8664}:
         raise UnsupportedNativeImageError(
-            "当前版本仅硬门禁验证 PE x86_64",
+            "PE 架构不受支持",
             detected=f"pe_machine_0x{machine:x}",
         )
     section_count = int.from_bytes(coff[6:8], "little")
@@ -222,16 +257,32 @@ def _inspect_pe(stream: BinaryIO, dos_header: bytes, *, size: int) -> NativeImag
             "PE 不是 executable image",
             detected="unsupported_pe_type",
         )
-    if optional_size < _PE_OPTIONAL_FIXED_SIZE or optional_size > _MAX_PE_OPTIONAL_HEADER_SIZE:
+    if optional_size < 2 or optional_size > _MAX_PE_OPTIONAL_HEADER_SIZE:
         raise UnsupportedNativeImageError("PE 可选头尺寸无效", detected="invalid_pe")
     if pe_offset + _PE_COFF_PREFIX_SIZE + optional_size > size:
         raise UnsupportedNativeImageError("PE 可选头越界", detected="invalid_pe")
     optional = stream.read(optional_size)
     if len(optional) != optional_size:
         raise UnsupportedNativeImageError("PE 可选头不完整", detected="invalid_pe")
-    if optional[:2] != b"\x0b\x02":
-        detected = "pe32" if optional[:2] == b"\x0b\x01" else "invalid_pe"
-        raise UnsupportedNativeImageError("仅支持 PE32+ 镜像", detected=detected)
+    optional_magic = int.from_bytes(optional[:2], "little")
+    if optional_magic == 0x010B:
+        architecture: NativeArchitecture = "x86"
+        bitness: Literal[32, 64] = 32
+        expected_machine = 0x014C
+        optional_fixed_size = _PE32_OPTIONAL_FIXED_SIZE
+        directory_count_offset = 92
+    elif optional_magic == 0x020B:
+        architecture = "x86_64"
+        bitness = 64
+        expected_machine = 0x8664
+        optional_fixed_size = _PE32_PLUS_OPTIONAL_FIXED_SIZE
+        directory_count_offset = 108
+    else:
+        raise UnsupportedNativeImageError("PE 可选头标记无效", detected="invalid_pe")
+    if machine != expected_machine:
+        raise UnsupportedNativeImageError("PE 架构与位数不匹配", detected="invalid_pe")
+    if optional_size < optional_fixed_size:
+        raise UnsupportedNativeImageError("PE 可选头尺寸无效", detected="invalid_pe")
     entry = int.from_bytes(optional[16:20], "little")
     section_alignment = int.from_bytes(optional[32:36], "little")
     file_alignment = int.from_bytes(optional[36:40], "little")
@@ -250,18 +301,20 @@ def _inspect_pe(stream: BinaryIO, dos_header: bytes, *, size: int) -> NativeImag
         or size_of_image % section_alignment != 0
         or size_of_headers < section_table_end
         or size_of_headers > size
-        or size_of_headers % file_alignment != 0
         or size_of_image < _align_up(size_of_headers, section_alignment)
         or section_table_size > size - section_table_offset
     ):
         raise UnsupportedNativeImageError("PE image/header 尺寸无效", detected="invalid_pe")
-    directory_count = int.from_bytes(optional[108:112], "little")
-    directory_capacity = (optional_size - _PE_OPTIONAL_FIXED_SIZE) // _PE_DATA_DIRECTORY_SIZE
+    directory_count = int.from_bytes(
+        optional[directory_count_offset : directory_count_offset + 4],
+        "little",
+    )
+    directory_capacity = (optional_size - optional_fixed_size) // _PE_DATA_DIRECTORY_SIZE
     if directory_count > _PE_MAX_DATA_DIRECTORIES or directory_count > directory_capacity:
         raise UnsupportedNativeImageError("PE data directory 数量越界", detected="invalid_pe")
     directories: list[tuple[int, int]] = []
     for index in range(directory_count):
-        offset = _PE_OPTIONAL_FIXED_SIZE + index * _PE_DATA_DIRECTORY_SIZE
+        offset = optional_fixed_size + index * _PE_DATA_DIRECTORY_SIZE
         address = int.from_bytes(optional[offset : offset + 4], "little")
         directory_size = int.from_bytes(optional[offset + 4 : offset + 8], "little")
         directories.append((address, directory_size))
@@ -321,13 +374,21 @@ def _inspect_pe(stream: BinaryIO, dos_header: bytes, *, size: int) -> NativeImag
             "PE entry 不在可执行 section 内",
             detected="invalid_pe",
         )
-    return NativeImageIdentity("pe", "x86_64")
+    return NativeImageIdentity("pe", architecture, bitness=bitness)
 
 
-def _elf_architecture(machine: int) -> NativeArchitecture:
-    if machine == 0x3E:
+def _elf_architecture(
+    machine: int,
+    *,
+    bitness: Literal[32, 64],
+) -> NativeArchitecture:
+    if bitness == 32 and machine == 0x03:
+        return "x86"
+    if bitness == 32 and machine == 0x28:
+        return "arm"
+    if bitness == 64 and machine == 0x3E:
         return "x86_64"
-    if machine == 0xB7:
+    if bitness == 64 and machine == 0xB7:
         return "aarch64"
     raise UnsupportedNativeImageError(
         "ELF 架构不受支持",

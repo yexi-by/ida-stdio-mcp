@@ -60,7 +60,7 @@ addopts = "-ra --strict-config --strict-markers"
 testpaths = ["tests/unit"]
 markers = [
     "ida: requires a licensed IDA Pro 9.3+ headless runtime",
-    "debugger: requires the Windows x64 local debugger backend",
+    "debugger: requires the Windows x86/x64 local debugger backend",
 ]
 
 [tool.coverage.run]

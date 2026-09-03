@@ -27,6 +27,7 @@ _PROCESS_QUERY_INFORMATION = 0x0400
 _PROCESS_VM_READ = 0x0010
 _MEM_COMMIT = 0x1000
 _IMAGE_FILE_MACHINE_UNKNOWN = 0x0000
+_IMAGE_FILE_MACHINE_I386 = 0x014C
 _IMAGE_FILE_MACHINE_AMD64 = 0x8664
 
 
@@ -85,7 +86,7 @@ class WindowsJob:
     def __init__(self) -> None:
         if os.name != "nt":
             raise CapabilityError(
-                "动态调试首版只支持 Windows 本机 x64",
+                "动态调试只支持 Windows 本机 x86 和 x64",
                 capability="windows_local_debugger",
             )
         self._kernel32 = WinDLL("kernel32", use_last_error=True)
@@ -195,13 +196,23 @@ class WindowsJob:
         self.close()
 
 
-def verify_x64_process(pid: int) -> None:
-    """确认真实 launch/attach 目标的有效机器类型是 AMD64。"""
+def verify_process_architecture(pid: int, *, bitness: int) -> None:
+    """确认真实 launch/attach 目标与 x86/x64 IDB 的位数一致。"""
 
     if os.name != "nt":
         raise CapabilityError(
-            "动态调试首版只支持 Windows 本机 x64",
-            capability="windows_x64_debugger",
+            "动态调试只支持 Windows 本机 x86 和 x64",
+            capability="windows_local_debugger",
+        )
+    expected_machine = {
+        32: _IMAGE_FILE_MACHINE_I386,
+        64: _IMAGE_FILE_MACHINE_AMD64,
+    }.get(bitness)
+    if expected_machine is None or isinstance(bitness, bool):
+        raise CapabilityError(
+            "动态调试只支持 32 位 x86 和 64 位 x64 IDB",
+            capability="windows_local_debugger",
+            details={"bitness": bitness},
         )
     if isinstance(pid, bool) or pid <= 0:
         raise WorkerError("debug_process_query_failed", "目标进程 PID 无效")
@@ -211,7 +222,7 @@ def verify_x64_process(pid: int) -> None:
     except AttributeError as exc:
         raise CapabilityError(
             "当前 Windows 不提供 IsWow64Process2",
-            capability="windows_x64_debugger",
+            capability="windows_local_debugger",
         ) from exc
     kernel32.OpenProcess.argtypes = [DWORD, BOOL, DWORD]
     kernel32.OpenProcess.restype = HANDLE
@@ -223,7 +234,7 @@ def verify_x64_process(pid: int) -> None:
     if not process:
         raise WorkerError(
             "debug_process_query_failed",
-            "无法打开目标进程以验证 x64 架构",
+            "无法打开目标进程以验证架构",
             details={"pid": pid, "winerror": get_last_error()},
         )
     try:
@@ -246,12 +257,14 @@ def verify_x64_process(pid: int) -> None:
         if int(process_machine.value) == _IMAGE_FILE_MACHINE_UNKNOWN
         else int(process_machine.value)
     )
-    if effective_machine != _IMAGE_FILE_MACHINE_AMD64:
+    if effective_machine != expected_machine:
         raise CapabilityError(
-            "动态调试目标不是 Windows x64 进程",
-            capability="windows_x64_debugger",
+            "目标进程架构与 IDB 不一致，请使用位数相同的 Windows x86 或 x64 进程",
+            capability="windows_local_debugger",
             details={
                 "pid": pid,
+                "idb_bitness": bitness,
+                "expected_machine": f"0x{expected_machine:04x}",
                 "process_machine": f"0x{int(process_machine.value):04x}",
                 "native_machine": f"0x{int(native_machine.value):04x}",
             },

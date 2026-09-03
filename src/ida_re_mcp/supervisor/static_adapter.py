@@ -111,8 +111,13 @@ _OVERVIEW_SECTIONS: Final = frozenset(
         "strings",
     }
 )
-# 把 worker 报告的稳定容器族映射为公开格式串; 当前边界只接受 64 位镜像.
-_NATIVE_CONTAINER_FORMATS: Final = {"elf": "elf64", "pe": "pe32+"}
+# 把 worker 报告的稳定容器族与位数映射为公开格式串。
+_NATIVE_FORMATS: Final = {
+    ("elf", 32): "elf32",
+    ("elf", 64): "elf64",
+    ("pe", 32): "pe32",
+    ("pe", 64): "pe32+",
+}
 
 
 class StaticAdapterError(RuntimeError):
@@ -968,18 +973,21 @@ def _adapt_program_overview(
 
     counts = _mapping(raw.get("counts"), "program.overview.counts")
     bitness = _integer(image.get("bitness"), "program.overview.image.bitness")
-    if bitness != 64:
-        raise StaticAdapterCapabilityError("当前 Native 产品边界只支持 64 位镜像")
+    if bitness not in {32, 64}:
+        raise StaticAdapterCapabilityError("当前 Native 产品边界只支持 32 位或 64 位镜像")
     processor = _text(
         image.get("processor"),
         "program.overview.image.processor",
     ).casefold()
     expected_architecture = {
-        "metapc": "x86_64",
-        "arm": "aarch64",
-        "armb": "aarch64",
-        "aarch64": "aarch64",
-    }.get(processor)
+        ("metapc", 32): "x86",
+        ("metapc", 64): "x86_64",
+        ("arm", 32): "arm",
+        ("armb", 32): "arm",
+        ("arm", 64): "aarch64",
+        ("armb", 64): "aarch64",
+        ("aarch64", 64): "aarch64",
+    }.get((processor, bitness))
     if expected_architecture is None:
         raise StaticAdapterCapabilityError(f"当前 Native 产品边界不支持 IDA processor {processor}")
     architecture = _text(
@@ -1032,7 +1040,7 @@ def _adapt_program_overview(
         {
             "image": {
                 "image_id": f"image~{context.sample_sha256}",
-                "format": _NATIVE_CONTAINER_FORMATS.get(trusted_container, "unknown"),
+                "format": _NATIVE_FORMATS.get((trusted_container, bitness), "unknown"),
                 "architecture": architecture,
                 "bitness": bitness,
                 "endian": _text(

@@ -25,19 +25,24 @@ class NativeBinding(StrictModel):
     sha256: Sha256
     size: int = Field(ge=1)
     image_size: int = Field(ge=1)
-    architecture: Literal["x86_64", "aarch64"]
-    abi: Literal["msvc-x64", "sysv-x64", "aapcs64"]
-    pointer_width: Literal[64]
+    architecture: Literal["x86", "x86_64", "arm", "aarch64"]
+    abi: Literal["msvc-x86", "msvc-x64", "sysv-x86", "sysv-x64", "aapcs32", "aapcs64"]
+    pointer_width: Literal[32, 64]
     endianness: Literal["little"]
 
     @model_validator(mode="after")
     def validate_architecture_abi(self) -> NativeBinding:
         valid = {
-            "x86_64": {"msvc-x64", "sysv-x64"},
-            "aarch64": {"aapcs64"},
+            "x86": ({"msvc-x86", "sysv-x86"}, 32),
+            "x86_64": ({"msvc-x64", "sysv-x64"}, 64),
+            "arm": ({"aapcs32"}, 32),
+            "aarch64": ({"aapcs64"}, 64),
         }
-        if self.abi not in valid[self.architecture]:
+        abis, pointer_width = valid[self.architecture]
+        if self.abi not in abis:
             raise ValueError("architecture 与 ABI 不匹配")
+        if self.pointer_width != pointer_width:
+            raise ValueError("architecture 与 pointer_width 不匹配")
         return self
 
 
@@ -212,7 +217,7 @@ class NativeParameter(StrictModel):
 
 
 class NativeSignature(StrictModel):
-    calling_convention: Literal["win64", "sysv", "aapcs64"]
+    calling_convention: Literal["cdecl", "win64", "sysv", "aapcs32", "aapcs64"]
     return_type: TypeRef
     parameters: tuple[NativeParameter, ...] = Field(max_length=256)
     variadic: Literal[False] = False

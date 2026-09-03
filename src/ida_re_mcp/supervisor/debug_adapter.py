@@ -130,6 +130,20 @@ _WINDOWS_X64_GENERAL_REGISTERS: Final = frozenset(
         "EFL",
     }
 )
+_WINDOWS_X86_GENERAL_REGISTERS: Final = frozenset(
+    {
+        "EAX",
+        "EBX",
+        "ECX",
+        "EDX",
+        "ESI",
+        "EDI",
+        "EBP",
+        "ESP",
+        "EIP",
+        "EFL",
+    }
+)
 
 
 class DebugAdapterError(ValueError):
@@ -154,6 +168,7 @@ class DebugContext:
     stop_id: str | None
     state: DebugState
     process_id: int
+    bitness: Literal[32, 64]
     modules: tuple[DebugModuleFact, ...] = ()
 
 
@@ -406,6 +421,7 @@ def adapt_debug_establish(
     *,
     sample_name: str,
     image_id: str,
+    bitness: Literal[32, 64],
 ) -> DebugAdaptation[DebugEstablishOutput]:
     session = _session(raw)
     if session.state not in {"running", "suspended"}:
@@ -423,6 +439,7 @@ def adapt_debug_establish(
         stop_id=session.stop_id,
         state=session.state,
         process_id=process_id,
+        bitness=bitness,
     )
     raw_event = raw.get("establish_event")
     if raw_event is None:
@@ -873,10 +890,11 @@ def _adapt_threads(raw: object) -> list[DebugThread]:
     return threads
 
 
-def _adapt_registers(raw: object) -> list[RegisterValue]:
+def _adapt_registers(raw: object, *, bitness: Literal[32, 64]) -> list[RegisterValue]:
     values = _mapping(raw, "registers")
-    if set(values) != set(_WINDOWS_X64_GENERAL_REGISTERS):
-        raise DebugAdapterError("registers 未返回完整且唯一的 Windows x64 通用寄存器集")
+    expected = _WINDOWS_X86_GENERAL_REGISTERS if bitness == 32 else _WINDOWS_X64_GENERAL_REGISTERS
+    if set(values) != set(expected):
+        raise DebugAdapterError(f"registers 未返回完整且唯一的 Windows {bitness} 位通用寄存器集")
     registers: list[RegisterValue] = []
     for name in sorted(values):
         canonical, _ = _hex_value(values[name], f"registers.{name}")
@@ -1012,7 +1030,7 @@ def adapt_debug_inspect(
         if view == "threads":
             threads = _adapt_threads(raw.get("threads"))
         elif view == "registers":
-            registers = _adapt_registers(raw.get("registers"))
+            registers = _adapt_registers(raw.get("registers"), bitness=current.bitness)
         elif view == "stack":
             stack = _adapt_stack(current, request.stop_id, raw.get("frames"))
         elif view == "memory":

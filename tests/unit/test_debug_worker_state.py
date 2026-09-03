@@ -18,11 +18,52 @@ from ida_re_mcp.worker.debug import (
 )
 from ida_re_mcp.worker.errors import WorkerError
 
+_X86_REGISTERS = ("EAX", "EBX", "ECX", "EDX", "ESI", "EDI", "EBP", "ESP", "EIP", "EFL")
+_X64_REGISTERS = (
+    "RAX",
+    "RBX",
+    "RCX",
+    "RDX",
+    "RSI",
+    "RDI",
+    "RBP",
+    "RSP",
+    "R8",
+    "R9",
+    "R10",
+    "R11",
+    "R12",
+    "R13",
+    "R14",
+    "R15",
+    "RIP",
+    "EFL",
+)
+
 
 class _ModuleInfo:
     name = ""
     base = 0
     size = 0
+
+
+class _RegisterInfo:
+    pass
+
+
+class _FakeIda(ModuleType):
+    def __init__(self, bitness: int) -> None:
+        super().__init__("ida_ida")
+        self._bitness = bitness
+
+    def inf_get_procname(self) -> str:
+        return "metapc"
+
+    def inf_is_64bit(self) -> bool:
+        return self._bitness == 64
+
+    def inf_is_32bit_exactly(self) -> bool:
+        return self._bitness == 32
 
 
 class _FakeDebugEvent:
@@ -85,6 +126,9 @@ class _FakeDbg(ModuleType):
         self.wait_error = False
         self.forced_wait_code: int | None = None
         self.modules_available = True
+        self.register_values = {
+            name: index for index, name in enumerate((*_X64_REGISTERS, *_X86_REGISTERS), start=1)
+        }
 
     def get_first_module(self, module: object) -> bool:
         assert isinstance(module, _ModuleInfo)
@@ -123,6 +167,15 @@ class _FakeDbg(ModuleType):
 
     def select_thread(self, thread_id: int) -> bool:
         return thread_id == 7
+
+    def get_dbg_reg_info(self, name: str, _info: _RegisterInfo) -> bool:
+        return name in self.register_values
+
+    def is_reg_integer(self, name: str) -> bool:
+        return name in self.register_values
+
+    def get_reg_val(self, name: str) -> int:
+        return self.register_values[name]
 
     def step_into(self) -> bool:
         self.process_state = self.DSTATE_RUN
@@ -192,6 +245,7 @@ class _FakeIdd(ModuleType):
     def __init__(self, debugger: _FakeDbg) -> None:
         super().__init__("ida_idd")
         self.modinfo_t = _ModuleInfo
+        self.register_info_t = _RegisterInfo
         self._debugger = debugger
 
     def dbg_read_memory(self, _address: int, size: int) -> bytes:
@@ -204,7 +258,7 @@ class _InjectedDebugWorker(DebugWorker):
         self._api = api
 
 
-def _worker(tmp_path: Path) -> tuple[_InjectedDebugWorker, _FakeDbg]:
+def _worker(tmp_path: Path, *, bitness: int = 64) -> tuple[_InjectedDebugWorker, _FakeDbg]:
     checkout = tmp_path / "checkout.i64"
     sample = tmp_path / "debug_target_x64.exe"
     checkout.write_bytes(b"idb")
@@ -214,6 +268,7 @@ def _worker(tmp_path: Path) -> tuple[_InjectedDebugWorker, _FakeDbg]:
     api = IdaModules(
         {
             "ida_dbg": debugger,
+            "ida_ida": _FakeIda(bitness),
             "ida_idd": _FakeIdd(debugger),
         }
     )
@@ -225,6 +280,42 @@ def _worker(tmp_path: Path) -> tuple[_InjectedDebugWorker, _FakeDbg]:
         provenance=DebugEventProvenance.IDA_EVENT,
     )
     return worker, debugger
+
+
+@pytest.mark.parametrize(
+    ("bitness", "expected_names", "other_instruction_pointer"),
+    [
+        (32, list(_X86_REGISTERS), "RIP"),
+        (64, list(_X64_REGISTERS), "EIP"),
+    ],
+)
+def test_register_snapshot_uses_idb_bitness(
+    tmp_path: Path,
+    bitness: int,
+    expected_names: list[str],
+    other_instruction_pointer: str,
+) -> None:
+    worker, _debugger = _worker(tmp_path, bitness=bitness)
+    result = worker.execute(
+        "debug.inspect",
+        {"view": "registers", "stop_id": worker.machine.stop_id},
+    )
+
+    registers = result["registers"]
+    assert isinstance(registers, dict)
+    assert list(cast(dict[str, object], registers)) == expected_names
+
+    with pytest.raises(WorkerError) as rejected:
+        worker.execute(
+            "debug.inspect",
+            {
+                "view": "registers",
+                "stop_id": worker.machine.stop_id,
+                "registers": [other_instruction_pointer],
+            },
+        )
+
+    assert rejected.value.code == "invalid_worker_input"
 
 
 def test_control_acceptance_invalidates_old_stop_before_fast_stop() -> None:

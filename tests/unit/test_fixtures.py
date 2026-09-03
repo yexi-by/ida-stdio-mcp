@@ -27,11 +27,27 @@ def test_fixture_hash_manifest_matches_binaries() -> None:
 
 
 def test_fixture_formats_are_explicit() -> None:
-    for name in ("native_pe_x64.dll", "debug_target_x64.exe", "il2cpp_pe_x64.dll"):
-        assert (FIXTURE_ROOT / name).read_bytes().startswith(b"MZ")
+    pe32_names = ("native_pe_x86.dll", "debug_target_x86.exe", "il2cpp_pe_x86.dll")
+    pe32_plus_names = ("native_pe_x64.dll", "debug_target_x64.exe", "il2cpp_pe_x64.dll")
+    for name in (*pe32_names, *pe32_plus_names):
+        data = (FIXTURE_ROOT / name).read_bytes()
+        assert data.startswith(b"MZ")
+        pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+        machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
+        magic = struct.unpack_from("<H", data, pe_offset + 24)[0]
+        assert (machine, magic) == ((0x14C, 0x10B) if name in pe32_names else (0x8664, 0x20B))
 
-    for name in ("native_elf_x64.so", "native_elf_arm64.so", "il2cpp_elf_x64.so"):
-        assert (FIXTURE_ROOT / name).read_bytes().startswith(b"\x7fELF")
+    elf32_names = (
+        "native_elf_x86.so",
+        "native_elf_armv7.so",
+        "il2cpp_elf_x86.so",
+        "il2cpp_elf_armv7.so",
+    )
+    elf64_names = ("native_elf_x64.so", "native_elf_arm64.so", "il2cpp_elf_x64.so")
+    for name in (*elf32_names, *elf64_names):
+        data = (FIXTURE_ROOT / name).read_bytes()
+        assert data.startswith(b"\x7fELF")
+        assert data[4] == (1 if name in elf32_names else 2)
 
     metadata = (FIXTURE_ROOT / "il2cpp_metadata_fingerprint.bin").read_bytes()
     magic = b"IDA-RE-IL2CPP-METADATA\0"
@@ -49,8 +65,10 @@ def _pe_directory(path: Path, index: int) -> tuple[int, int]:
     pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
     assert data[pe_offset : pe_offset + 4] == b"PE\0\0"
     optional = pe_offset + 24
-    assert struct.unpack_from("<H", data, optional)[0] == 0x20B
-    return struct.unpack_from("<II", data, optional + 112 + index * 8)
+    magic = struct.unpack_from("<H", data, optional)[0]
+    assert magic in {0x10B, 0x20B}
+    directory_offset = 96 if magic == 0x10B else 112
+    return struct.unpack_from("<II", data, optional + directory_offset + index * 8)
 
 
 def test_pe_fixtures_contain_real_unwind_and_aslr_evidence() -> None:
@@ -59,21 +77,37 @@ def test_pe_fixtures_contain_real_unwind_and_aslr_evidence() -> None:
         FIXTURE_ROOT / "debug_target_x64.exe",
         5,
     )
+    x86_relocation_rva, x86_relocation_size = _pe_directory(
+        FIXTURE_ROOT / "debug_target_x86.exe",
+        5,
+    )
 
     assert exception_rva > 0
     assert exception_size > 0
     assert relocation_rva > 0
     assert relocation_size > 0
+    assert x86_relocation_rva > 0
+    assert x86_relocation_size > 0
 
 
 def test_native_elf_fixtures_contain_tls_program_header() -> None:
-    for name in ("native_elf_x64.so", "native_elf_arm64.so"):
+    for name in (
+        "native_elf_x86.so",
+        "native_elf_x64.so",
+        "native_elf_armv7.so",
+        "native_elf_arm64.so",
+    ):
         data = (FIXTURE_ROOT / name).read_bytes()
-        assert data[4] == 2
         byte_order = "<" if data[5] == 1 else ">"
-        program_offset = struct.unpack_from(f"{byte_order}Q", data, 32)[0]
-        entry_size = struct.unpack_from(f"{byte_order}H", data, 54)[0]
-        entry_count = struct.unpack_from(f"{byte_order}H", data, 56)[0]
+        if data[4] == 1:
+            program_offset = struct.unpack_from(f"{byte_order}I", data, 28)[0]
+            entry_size = struct.unpack_from(f"{byte_order}H", data, 42)[0]
+            entry_count = struct.unpack_from(f"{byte_order}H", data, 44)[0]
+        else:
+            assert data[4] == 2
+            program_offset = struct.unpack_from(f"{byte_order}Q", data, 32)[0]
+            entry_size = struct.unpack_from(f"{byte_order}H", data, 54)[0]
+            entry_count = struct.unpack_from(f"{byte_order}H", data, 56)[0]
         program_types = {
             struct.unpack_from(
                 f"{byte_order}I",

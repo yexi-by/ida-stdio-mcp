@@ -238,6 +238,34 @@ def test_program_overview_maps_identity_counts_and_coverage() -> None:
     assert isinstance(elf_output, ProgramOverviewOutput)
     assert elf_output.image.format == "elf64"
 
+    for processor, architecture, container, expected_format in (
+        ("metapc", "x86", "pe", "pe32"),
+        ("metapc", "x86", "elf", "elf32"),
+        ("ARM", "arm", "elf", "elf32"),
+    ):
+        result_32 = deepcopy(raw_result)
+        image_32 = cast(dict[str, object], result_32["image"])
+        image_32.update(
+            {
+                "processor": processor,
+                "architecture": architecture,
+                "bitness": 32,
+                "container": container,
+            }
+        )
+        segments_32 = cast(list[dict[str, object]], result_32["segments"])
+        segments_32[0]["bitness"] = 32
+        output_32 = adapt_worker_results(
+            "program.overview",
+            args,
+            [result_32],
+            _context(native_container=cast(Literal["elf", "pe"], container)),
+        )
+        assert isinstance(output_32, ProgramOverviewOutput)
+        assert output_32.image.architecture == architecture
+        assert output_32.image.bitness == 32
+        assert output_32.image.format == expected_format
+
     unknown_result = deepcopy(raw_result)
     unknown_image = cast(dict[str, object], unknown_result["image"])
     unknown_image["container"] = "unknown"

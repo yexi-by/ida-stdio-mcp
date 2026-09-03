@@ -1,5 +1,5 @@
 # pyright: reportAny=false, reportUnknownMemberType=false, reportUnknownVariableType=false
-"""Windows x64 headless debugger 的终态、取消与强清理门禁。"""
+"""Windows x86/x64 headless debugger 的终态、取消与强清理门禁。"""
 
 from __future__ import annotations
 
@@ -495,6 +495,59 @@ def test_attach_control_cancel_pause_and_detach_preserve_target(
         )
         assert detached["state"] == "detached"
         assert target.poll() is None
+    finally:
+        worker.close()
+        if target.poll() is None:
+            target.terminate()
+            target.wait(timeout=5)
+
+
+@pytest.mark.ida
+@pytest.mark.debugger
+def test_attach_rejects_target_with_different_bitness_and_detaches(
+    tmp_path: Path,
+    ida_environment: dict[str, str],
+    fixture_directory: Path,
+) -> None:
+    workspace_sample = fixture_directory / "debug_target_x86.exe"
+    target_sample = fixture_directory / "debug_target_x64.exe"
+    checkout = _bootstrap(tmp_path, ida_environment, workspace_sample)
+    target = subprocess.Popen(
+        [str(target_sample), "--ida-re-hold"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    worker = _start_worker(
+        tmp_path,
+        ida_environment,
+        "debug",
+        checkout=checkout,
+        sample=workspace_sample,
+        allow_attach=True,
+    )
+    try:
+        with pytest.raises(WorkerError) as mismatch:
+            worker.client.execute(
+                "debug.establish",
+                {"mode": "attach", "pid": target.pid, "timeout_ms": 30_000},
+            )
+
+        assert mismatch.value.code == "capability_unavailable"
+        assert mismatch.value.details["idb_bitness"] == 32
+        assert mismatch.value.details["process_machine"] == "0x0000"
+        assert mismatch.value.details["native_machine"] == "0x8664"
+        events = worker.client.execute(
+            "debug.events",
+            {"after_sequence": 0, "limit": 100, "wait_ms": 0},
+        )
+        event_kinds = {
+            cast(str, event["kind"]) for event in cast(list[JsonObject], events["events"])
+        }
+        assert {"process_attached", "process_detached", "request_error"}.issubset(event_kinds)
+        assert events["state"] in {"failed", "lost", "detached"}
+        assert _pid_is_running(target.pid)
     finally:
         worker.close()
         if target.poll() is None:
